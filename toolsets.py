@@ -116,6 +116,16 @@ TOOLSETS = {
         "tools": ["x_search"],
         "includes": []
     },
+
+    "cursor": {
+        "description": (
+            "Cursor Cloud Agent delegation: list Cursor models, create/follow up "
+            "on Cloud Agents, and poll/stream runs via the Cursor API. Requires "
+            "CURSOR_API_KEY."
+        ),
+        "tools": ["cursor_agent"],
+        "includes": []
+    },
     
     "vision": {
         "description": "Image analysis and vision tools",
