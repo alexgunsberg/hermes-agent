@@ -138,15 +138,13 @@ def _make_adapter():
 
 def test_non_forum_group_reply_thread_id_does_not_fork_session_key():
     """Reply-derived thread ids in ordinary groups must not create topic lanes."""
-    import plugins.platforms.telegram.adapter as telegram_mod
-
     adapter = _make_adapter()
     message = SimpleNamespace(
         text="Done",
         caption=None,
         chat=SimpleNamespace(
             id=-100123,
-            type=telegram_mod.ChatType.SUPERGROUP,
+            type="supergroup",
             is_forum=False,
             title="Regular group",
         ),
@@ -172,15 +170,13 @@ def test_non_forum_group_reply_thread_id_does_not_fork_session_key():
 
 def test_forum_group_topic_message_preserves_thread_session_key():
     """Real Telegram forum-topic messages should still route by topic id."""
-    import plugins.platforms.telegram.adapter as telegram_mod
-
     adapter = _make_adapter()
     message = SimpleNamespace(
         text="hello from topic",
         caption=None,
         chat=SimpleNamespace(
             id=-100123,
-            type=telegram_mod.ChatType.SUPERGROUP,
+            type="supergroup",
             is_forum=True,
             title="Forum group",
         ),
@@ -202,15 +198,13 @@ def test_forum_group_topic_message_preserves_thread_session_key():
 
 def test_forum_general_topic_without_message_thread_id_keeps_thread_context():
     """Forum General-topic messages should keep synthetic thread context."""
-    import plugins.platforms.telegram.adapter as telegram_mod
-
     adapter = _make_adapter()
     message = SimpleNamespace(
         text="hello from General",
         caption=None,
         chat=SimpleNamespace(
             id=-100123,
-            type=telegram_mod.ChatType.SUPERGROUP,
+            type="supergroup",
             is_forum=True,
             title="Forum group",
         ),

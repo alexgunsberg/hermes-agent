@@ -1415,11 +1415,15 @@ class TelegramAdapter(BasePlatformAdapter):
         return True
 
     def _rich_delivery_enabled(self, content: str) -> bool:
-        """Whether rich delivery is allowed for this payload."""
-        return bool(
-            getattr(self, "_rich_messages_enabled", True)
-            or self._content_is_pipe_table_primary(content)
-        )
+        """Whether rich delivery is allowed for this payload.
+
+        Fail closed. Telegram clients that do not understand Bot API rich
+        messages render a noisy "This message is not supported… update" bubble.
+        The old table auto-upgrade ignored ``rich_messages: false`` and could
+        therefore spam unsupported placeholders in normal chats. Rich delivery
+        must be an explicit operator opt-in only.
+        """
+        return bool(getattr(self, "_rich_messages_enabled", False))
 
     def _rich_eligible(self, content: str) -> bool:
         """Capability/content eligibility for rich, ignoring ``expect_edits``.
@@ -1477,7 +1481,7 @@ class TelegramAdapter(BasePlatformAdapter):
         streams split exactly as before.
         """
         if (
-            getattr(self, "_rich_messages_enabled", True)
+            getattr(self, "_rich_messages_enabled", False)
             and not getattr(self, "_rich_send_disabled", False)
             and self._bot_supports_rich()
         ):
@@ -1778,7 +1782,7 @@ class TelegramAdapter(BasePlatformAdapter):
 
     def _should_attempt_rich_draft(self, content: str) -> bool:
         return bool(
-            getattr(self, "_rich_messages_enabled", True)
+            getattr(self, "_rich_messages_enabled", False)
             and getattr(self, "_rich_drafts_enabled", False)
             and not getattr(self, "_rich_send_disabled", False)
             and not getattr(self, "_rich_draft_disabled", False)
@@ -4354,16 +4358,15 @@ class TelegramAdapter(BasePlatformAdapter):
         chat_type: Optional[str] = None,
         metadata: Optional[Dict[str, Any]] = None,
     ) -> bool:
-        """Telegram supports sendMessageDraft for private chats only.
+        """Telegram native drafts are opt-in only.
 
-        Bot API 9.5 (March 2026) opened ``sendMessageDraft`` to all bots
-        unconditionally for private (DM) chats.  Groups, supergroups, and
-        channels still rely on the edit-based path.
-
-        We additionally require ``self._bot`` to expose ``send_message_draft``
-        (added to python-telegram-bot in 22.6); older PTB installs gracefully
-        fall back to the edit path even on DMs.
+        Some Telegram clients render Bot API draft-streaming messages as
+        unsupported "please update" placeholders. Keep the legacy edit/send path
+        as the default and require explicit `platforms.telegram.extra.native_drafts: true`
+        before using sendMessageDraft.
         """
+        if not self._coerce_bool_extra("native_drafts", False):
+            return False
         if not self._bot or not hasattr(self._bot, "send_message_draft"):
             return False
         return (chat_type or "").lower() in {"dm", "private"}
