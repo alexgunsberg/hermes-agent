@@ -78,11 +78,11 @@ describe('sectionMode', () => {
     expect(sectionMode('subagents', 'hidden', {})).toBe('hidden')
   })
 
-  it('streams thinking + tools expanded by default for persisted config values', () => {
-    expect(sectionMode('thinking', 'collapsed', {})).toBe('expanded')
-    expect(sectionMode('thinking', 'hidden', undefined)).toBe('expanded')
-    expect(sectionMode('tools', 'collapsed', {})).toBe('expanded')
-    expect(sectionMode('tools', 'hidden', undefined)).toBe('expanded')
+  it('keeps thinking + tools collapsed by default for persisted config values', () => {
+    expect(sectionMode('thinking', 'collapsed', {})).toBe('collapsed')
+    expect(sectionMode('thinking', 'hidden', undefined)).toBe('collapsed')
+    expect(sectionMode('tools', 'collapsed', {})).toBe('collapsed')
+    expect(sectionMode('tools', 'hidden', undefined)).toBe('collapsed')
   })
 
   it('hides the activity panel by default for persisted config values', () => {
