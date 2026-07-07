@@ -517,6 +517,205 @@ def _run_tool(server, name, args=None):
     return json.loads(result) if isinstance(result, str) else result
 
 
+class TestE2EOrchestrationOptIn:
+    def test_default_mcp_surface_does_not_include_orchestration(self, mcp_server_e2e, _event_loop):
+        server, _ = mcp_server_e2e
+        names = {tool.name for tool in server._tool_manager.list_tools()}
+        assert "cursor_delegate" not in names
+        assert "task_status" not in names
+        assert "task_cancel" not in names
+
+    def test_cursor_orchestration_exposes_task_tools(self, populated_sessions_dir, mock_session_db, monkeypatch):
+        import mcp_serve
+        monkeypatch.setattr(mcp_serve, "_get_sessions_dir", lambda: populated_sessions_dir)
+        monkeypatch.setattr(mcp_serve, "_get_session_db", lambda: mock_session_db)
+        monkeypatch.setattr(mcp_serve, "_load_channel_directory", lambda: {})
+
+        bridge = mcp_serve.EventBridge()
+        server = mcp_serve.create_mcp_server(event_bridge=bridge, orchestration="cursor")
+        names = {tool.name for tool in server._tool_manager.list_tools()}
+        assert {"cursor_delegate", "task_status", "task_events_poll", "task_cancel"}.issubset(names)
+
+    def test_cursor_delegate_status_events_and_cancel(self, populated_sessions_dir, mock_session_db, monkeypatch, _event_loop):
+        import mcp_serve
+        from tools import cursor_agent_tool
+
+        monkeypatch.setattr(mcp_serve, "_get_sessions_dir", lambda: populated_sessions_dir)
+        monkeypatch.setattr(mcp_serve, "_get_session_db", lambda: mock_session_db)
+        monkeypatch.setattr(mcp_serve, "_load_channel_directory", lambda: {})
+
+        calls = []
+
+        def fake_cursor(args):
+            calls.append(args)
+            action = args.get("action")
+            if action == "create":
+                return {
+                    "agent": {"id": "bc-1"},
+                    "run": {"id": "run-1", "agentId": "bc-1", "status": "RUNNING"},
+                }
+            if action == "stream_run":
+                return {
+                    "events": [
+                        {"event": "assistant", "id": "e1", "data": {"text": "working"}},
+                    ],
+                    "last_event_id": "e1",
+                }
+            if action == "get_run":
+                return {
+                    "id": "run-1",
+                    "agentId": "bc-1",
+                    "status": "FINISHED",
+                    "result": "Done.\nChanged files:\n- README.md",
+                    "git": {"branches": [{"repoUrl": "github.com/org/repo", "branch": "cursor/demo"}]},
+                }
+            if action == "cancel_run":
+                return {"id": "run-1"}
+            raise AssertionError(action)
+
+        monkeypatch.setattr(cursor_agent_tool, "call_cursor_agent", fake_cursor)
+        bridge = mcp_serve.EventBridge()
+        server = mcp_serve.create_mcp_server(event_bridge=bridge, orchestration="cursor")
+
+        created = _run_tool(server, "cursor_delegate", {"prompt": "make a plan", "mode": "plan"})
+        assert created["backend"] == "cursor"
+        assert created["model"] == "composer-2.5"
+        assert created["agent_id"] == "bc-1"
+        task_id = created["task_id"]
+
+        status = _run_tool(server, "task_status", {"task_id": task_id, "wait_seconds": 1})
+        assert status["status"] == "FINISHED"
+        assert status["git_branches"][0]["branch"] == "cursor/demo"
+        assert "README.md" in status["changed_files"]
+
+        events = _run_tool(server, "task_events_poll", {"task_id": task_id})
+        assert events["events"]
+        assert events["next_cursor"] >= 1
+
+        cancelled = _run_tool(server, "task_cancel", {"task_id": task_id})
+        assert cancelled["status"] == "FINISHED"
+
+    def test_codex_orchestration_exposes_task_tools(self, populated_sessions_dir, mock_session_db, monkeypatch):
+        import mcp_serve
+        monkeypatch.setattr(mcp_serve, "_get_sessions_dir", lambda: populated_sessions_dir)
+        monkeypatch.setattr(mcp_serve, "_get_session_db", lambda: mock_session_db)
+        monkeypatch.setattr(mcp_serve, "_load_channel_directory", lambda: {})
+
+        bridge = mcp_serve.EventBridge()
+        server = mcp_serve.create_mcp_server(event_bridge=bridge, orchestration="codex")
+        names = {tool.name for tool in server._tool_manager.list_tools()}
+        assert {"codex_delegate", "task_status", "task_events_poll", "task_cancel"}.issubset(names)
+        assert "cursor_delegate" not in names
+
+    def test_all_orchestration_exposes_both_delegates(self, populated_sessions_dir, mock_session_db, monkeypatch):
+        import mcp_serve
+        monkeypatch.setattr(mcp_serve, "_get_sessions_dir", lambda: populated_sessions_dir)
+        monkeypatch.setattr(mcp_serve, "_get_session_db", lambda: mock_session_db)
+        monkeypatch.setattr(mcp_serve, "_load_channel_directory", lambda: {})
+
+        bridge = mcp_serve.EventBridge()
+        server = mcp_serve.create_mcp_server(event_bridge=bridge, orchestration="all")
+        names = {tool.name for tool in server._tool_manager.list_tools()}
+        assert {"cursor_delegate", "codex_delegate"}.issubset(names)
+
+    def _fake_codex(self, tmp_path, body):
+        """Write an executable fake `codex` CLI and return its path."""
+        script = tmp_path / "fake_codex"
+        script.write_text(body)
+        script.chmod(0o755)
+        return str(script)
+
+    def test_codex_delegate_runs_and_finishes(self, populated_sessions_dir, mock_session_db, monkeypatch, tmp_path, _event_loop):
+        import mcp_serve
+        import mcp_orchestration
+
+        monkeypatch.setattr(mcp_serve, "_get_sessions_dir", lambda: populated_sessions_dir)
+        monkeypatch.setattr(mcp_serve, "_get_session_db", lambda: mock_session_db)
+        monkeypatch.setattr(mcp_serve, "_load_channel_directory", lambda: {})
+
+        fake = self._fake_codex(tmp_path, (
+            "#!/usr/bin/env python3\n"
+            "import sys, json\n"
+            "argv = sys.argv\n"
+            "out = argv[argv.index('-o') + 1] if '-o' in argv else ''\n"
+            "try:\n"
+            "    prompt = sys.stdin.read()\n"
+            "except Exception:\n"
+            "    prompt = ''\n"
+            "print(json.dumps({'type': 'item.completed', 'item': {'text': 'working on it'}}))\n"
+            "if out:\n"
+            "    open(out, 'w').write('changed README.md')\n"
+            "sys.exit(0)\n"
+        ))
+        workdir = tmp_path / "work"
+        workdir.mkdir()
+        monkeypatch.setattr(mcp_orchestration, "_codex_config", lambda: {
+            "bin": fake, "allowed_models": [], "default_model": "", "allowed_dirs": [],
+            "allow_any_dir": True, "default_sandbox": "workspace-write",
+            "allow_danger_full_access": False, "timeout_seconds": 60,
+        })
+
+        bridge = mcp_serve.EventBridge()
+        server = mcp_serve.create_mcp_server(event_bridge=bridge, orchestration="codex")
+
+        created = _run_tool(server, "codex_delegate", {"prompt": "fix the readme", "cwd": str(workdir)})
+        assert created["backend"] == "codex"
+        assert created["cwd"] == str(workdir)
+        task_id = created["task_id"]
+
+        status = _run_tool(server, "task_status", {"task_id": task_id, "wait_seconds": 10})
+        assert status["status"] == "FINISHED"
+        assert status["summary"] == "changed README.md"
+
+        events = _run_tool(server, "task_events_poll", {"task_id": task_id})
+        assert events["events"]
+
+    def test_codex_delegate_cancel(self, populated_sessions_dir, mock_session_db, monkeypatch, tmp_path, _event_loop):
+        import mcp_serve
+        import mcp_orchestration
+
+        monkeypatch.setattr(mcp_serve, "_get_sessions_dir", lambda: populated_sessions_dir)
+        monkeypatch.setattr(mcp_serve, "_get_session_db", lambda: mock_session_db)
+        monkeypatch.setattr(mcp_serve, "_load_channel_directory", lambda: {})
+
+        fake = self._fake_codex(tmp_path, "#!/bin/sh\nsleep 30\n")
+        workdir = tmp_path / "work"
+        workdir.mkdir()
+        monkeypatch.setattr(mcp_orchestration, "_codex_config", lambda: {
+            "bin": fake, "allowed_models": [], "default_model": "", "allowed_dirs": [],
+            "allow_any_dir": True, "default_sandbox": "workspace-write",
+            "allow_danger_full_access": False, "timeout_seconds": 60,
+        })
+
+        bridge = mcp_serve.EventBridge()
+        server = mcp_serve.create_mcp_server(event_bridge=bridge, orchestration="codex")
+
+        created = _run_tool(server, "codex_delegate", {"prompt": "long job", "cwd": str(workdir)})
+        assert created["status"] == "RUNNING"
+        task_id = created["task_id"]
+
+        cancelled = _run_tool(server, "task_cancel", {"task_id": task_id})
+        assert cancelled["status"] == "CANCELLED"
+
+    def test_codex_delegate_rejects_bad_dir(self, populated_sessions_dir, mock_session_db, monkeypatch, tmp_path, _event_loop):
+        import mcp_serve
+        import mcp_orchestration
+
+        monkeypatch.setattr(mcp_serve, "_get_sessions_dir", lambda: populated_sessions_dir)
+        monkeypatch.setattr(mcp_serve, "_get_session_db", lambda: mock_session_db)
+        monkeypatch.setattr(mcp_serve, "_load_channel_directory", lambda: {})
+        monkeypatch.setattr(mcp_orchestration, "_codex_config", lambda: {
+            "bin": "codex", "allowed_models": [], "default_model": "", "allowed_dirs": [],
+            "allow_any_dir": True, "default_sandbox": "workspace-write",
+            "allow_danger_full_access": False, "timeout_seconds": 60,
+        })
+
+        bridge = mcp_serve.EventBridge()
+        server = mcp_serve.create_mcp_server(event_bridge=bridge, orchestration="codex")
+        result = _run_tool(server, "codex_delegate", {"prompt": "x", "cwd": str(tmp_path / "nope")})
+        assert result["error"] == "cwd_not_found"
+
+
 @pytest.fixture
 def _event_loop():
     """Ensure an event loop exists for sync tests calling async tools."""
@@ -1012,7 +1211,7 @@ class TestCliIntegration:
         args = argparse.Namespace(mcp_action="serve", verbose=True)
         from hermes_cli.mcp_config import mcp_command
         mcp_command(args)
-        mock_run.assert_called_once_with(verbose=True)
+        mock_run.assert_called_once_with(verbose=True, orchestration="none")
 
 
 # ---------------------------------------------------------------------------
