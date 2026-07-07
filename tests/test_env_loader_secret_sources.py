@@ -221,6 +221,71 @@ def test_apply_external_secret_sources_records_onepassword_origin(tmp_path, monk
     )
 
 
+def test_apply_external_secret_sources_discovers_plugin_sources_before_apply(
+    tmp_path, monkeypatch, caplog
+):
+    """A fresh process must register enabled plugin secret sources before
+    resolving ``secrets.sources`` so startup does not warn that the source is
+    unknown and skip it until a later manual refresh.
+    """
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.delenv("PLUGIN_TEST_API_KEY", raising=False)
+    (tmp_path / "config.yaml").write_text(
+        "plugins:\n"
+        "  enabled:\n"
+        "    - proton-pass-secret-source\n"
+        "secrets:\n"
+        "  sources:\n"
+        "    - protonpass\n"
+        "  protonpass:\n"
+        "    enabled: true\n"
+        "    env:\n"
+        "      PLUGIN_TEST_API_KEY: 'pass://Hermes/Dummy/api_key'\n",
+        encoding="utf-8",
+    )
+
+    plugin_dir = tmp_path / "plugins" / "proton-pass"
+    plugin_dir.mkdir(parents=True)
+    (plugin_dir / "plugin.yaml").write_text(
+        "name: proton-pass-secret-source\n"
+        "version: 0.1.0\n"
+        "description: test plugin secret source\n",
+        encoding="utf-8",
+    )
+    (plugin_dir / "__init__.py").write_text(
+        "from agent.secret_sources.base import FetchResult, SecretSource\n\n"
+        "class ProtonPassSource(SecretSource):\n"
+        "    name = 'protonpass'\n"
+        "    label = 'Proton Pass'\n"
+        "    shape = 'mapped'\n"
+        "    scheme = 'pass'\n\n"
+        "    def fetch(self, cfg, home_path):\n"
+        "        if not isinstance(cfg, dict) or not cfg.get('env'):\n"
+        "            result = FetchResult()\n"
+        "            result.error = 'not configured'\n"
+        "            return result\n"
+        "        return FetchResult(secrets={'PLUGIN_TEST_API_KEY': 'plugin-secret'})\n\n"
+        "def register(ctx):\n"
+        "    ctx.register_secret_source(ProtonPassSource())\n",
+        encoding="utf-8",
+    )
+
+    from agent.secret_sources import registry as reg_module
+    from hermes_cli import plugins as plugins_mod
+
+    reg_module._reset_registry_for_tests()
+    monkeypatch.setattr(plugins_mod, "_plugin_manager", plugins_mod.PluginManager())
+
+    caplog.set_level("WARNING", logger="agent.secret_sources.registry")
+
+    env_loader._apply_external_secret_sources(tmp_path)
+
+    assert "unknown source" not in caplog.text
+    assert env_loader.get_secret_source("PLUGIN_TEST_API_KEY") == "protonpass"
+    assert env_loader.format_secret_source_suffix("PLUGIN_TEST_API_KEY") == " (from Proton Pass)"
+
+
 def test_apply_external_secret_sources_survives_non_dict_section(tmp_path, monkeypatch):
     """A malformed `secrets:` section must not abort startup (fail-open).
 

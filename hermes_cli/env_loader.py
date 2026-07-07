@@ -302,6 +302,32 @@ def _apply_managed_env() -> None:
     _load_dotenv_with_fallback(managed_env, override=True)
 
 
+def _discover_plugin_secret_sources() -> None:
+    """Register plugin-provided secret sources before startup secret apply.
+
+    ``load_hermes_dotenv()`` is intentionally the first thing most Hermes
+    entrypoints do so credentials are available before provider/runtime setup.
+    Plugin discovery historically happened later, which meant a fresh process
+    saw ``secrets.sources: [plugin_source]`` as unknown and skipped it until a
+    manual ``discover_plugins(force=True)`` + cache reset.  Running idempotent
+    discovery here gives enabled plugins a chance to call
+    ``PluginContext.register_secret_source()`` before the registry resolves the
+    configured source order.
+
+    Discovery failures remain fail-open: a broken plugin must not block dotenv
+    loading or Hermes startup, and ``HERMES_SAFE_MODE`` is still honored by the
+    plugin manager.
+    """
+    try:
+        from hermes_cli.plugins import discover_plugins
+    except Exception:  # noqa: BLE001 — plugin import must not block startup
+        return
+    try:
+        discover_plugins()
+    except Exception:  # noqa: BLE001 — plugin discovery must not block startup
+        return
+
+
 def _apply_external_secret_sources(home_path: Path) -> None:
     """Pull secrets from every enabled external source into env.
 
@@ -336,6 +362,8 @@ def _apply_external_secret_sources(home_path: Path) -> None:
         return
     if not cfg:
         return
+
+    _discover_plugin_secret_sources()
 
     try:
         from agent.secret_sources.registry import apply_all

@@ -809,15 +809,13 @@ class PluginContext:
         ordering, mapped-vs-bulk precedence, conflict warnings, and
         provenance; the source only fetches.
 
-        NOTE ON TIMING: plugin discovery happens later in startup than
-        the first ``load_hermes_dotenv()`` call, so a plugin-registered
-        source is not consulted by the initial env load of the process
-        that discovers it.  It IS consulted by every subsequently
-        spawned Hermes process (gateway children, cron sessions,
-        subagents), and immediately after a
-        ``reset_secret_source_cache()`` re-pull.  Plugin sources are
-        therefore best for supplying credentials to the running fleet;
-        the bundled sources cover first-process bootstrap.
+        Plugin secret sources are discovered during ``load_hermes_dotenv()``
+        itself, after dotenv files load and before ``secrets.sources`` is
+        resolved.  That keeps fresh CLI/gateway/cron processes able to use
+        plugin-provided sources on their first startup pass.  Long-running
+        processes that change plugin/secret config in-place should still call
+        ``discover_plugins(force=True)`` plus ``reset_secret_source_cache()`` to
+        force a fresh pull.
 
         Contract requirements (rejected with a warning otherwise):
         inherit from ``SecretSource``, ``api_version`` matching
