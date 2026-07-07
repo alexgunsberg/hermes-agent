@@ -177,9 +177,14 @@ def _auto_sso_response(request: Request) -> Response | None:
 
     # list_session_providers() already filters on supports_session=True, so
     # token-only credentials (drain/service providers) are never candidates.
-    providers = list_session_providers()
+    providers = [
+        p for p in list_session_providers()
+        if not getattr(p, "supports_password", False)
+    ]
     if len(providers) != 1:
         # Zero → nothing to redirect to. Two+ → user must choose at /login.
+        # Password-only providers cannot use /auth/login's OAuth/PKCE flow;
+        # those must render the /login form and POST to /auth/password-login.
         return None
 
     from hermes_cli.dashboard_auth.prefix import prefix_from_request
