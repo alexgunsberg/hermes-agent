@@ -41,6 +41,84 @@ type MessageGroup = { id: string; weight: number } & (
 // WITHOUT a virtualizer — pure rendering, never touches scrollTop, so it can't
 // fight use-stick-to-bottom (the single scroll owner).
 const RENDER_BUDGET = 300
+const SCROLL_RESTORE_MAX_AGE_MS = 24 * 60 * 60 * 1000
+const NEAR_BOTTOM_PX = 80
+
+interface ThreadScrollSnapshot {
+  atBottom: boolean
+  capturedAt: number
+  distanceFromBottom: number
+}
+
+const scrollStorageKey = (sessionKey?: string | null) =>
+  sessionKey ? `hermes.desktop.thread-scroll.${sessionKey}` : null
+
+export function captureThreadScrollSnapshot(
+  sessionKey: string | null | undefined,
+  viewport: Pick<HTMLDivElement, 'clientHeight' | 'scrollHeight' | 'scrollTop'>,
+  atBottom: boolean
+): ThreadScrollSnapshot | null {
+  const key = scrollStorageKey(sessionKey)
+
+  if (!key || typeof window === 'undefined') {
+    return null
+  }
+
+  const snapshot: ThreadScrollSnapshot = {
+    atBottom,
+    capturedAt: Date.now(),
+    distanceFromBottom: Math.max(0, viewport.scrollHeight - viewport.clientHeight - viewport.scrollTop)
+  }
+
+  try {
+    window.sessionStorage.setItem(key, JSON.stringify(snapshot))
+  } catch {
+    // Best-effort UX cache only.
+  }
+
+  return snapshot
+}
+
+export function readThreadScrollSnapshot(sessionKey?: string | null): ThreadScrollSnapshot | null {
+  const key = scrollStorageKey(sessionKey)
+
+  if (!key || typeof window === 'undefined') {
+    return null
+  }
+
+  try {
+    const raw = window.sessionStorage.getItem(key)
+    const parsed = raw ? (JSON.parse(raw) as Partial<ThreadScrollSnapshot>) : null
+
+    if (
+      !parsed ||
+      typeof parsed.capturedAt !== 'number' ||
+      typeof parsed.distanceFromBottom !== 'number' ||
+      Date.now() - parsed.capturedAt > SCROLL_RESTORE_MAX_AGE_MS
+    ) {
+      return null
+    }
+
+    return {
+      atBottom: Boolean(parsed.atBottom),
+      capturedAt: parsed.capturedAt,
+      distanceFromBottom: Math.max(0, parsed.distanceFromBottom)
+    }
+  } catch {
+    return null
+  }
+}
+
+export function shouldRestoreThreadScroll(snapshot: ThreadScrollSnapshot | null): snapshot is ThreadScrollSnapshot {
+  return Boolean(snapshot && !snapshot.atBottom && snapshot.distanceFromBottom > NEAR_BOTTOM_PX)
+}
+
+export function restoreThreadScrollPosition(
+  viewport: Pick<HTMLDivElement, 'clientHeight' | 'scrollHeight' | 'scrollTop'>,
+  snapshot: ThreadScrollSnapshot
+) {
+  viewport.scrollTop = Math.max(0, viewport.scrollHeight - viewport.clientHeight - snapshot.distanceFromBottom)
+}
 
 interface ThreadMessageListProps {
   clampToComposer: boolean
@@ -134,6 +212,7 @@ const ThreadMessageListInner: FC<ThreadMessageListProps> = ({
   const hiddenCount = firstVisible
   const visibleGroups = hiddenCount > 0 ? groups.slice(hiddenCount) : groups
   const restoreFromBottomRef = useRef<number | null>(null)
+  const isAtBottomRef = useRef(isAtBottom)
   // Secondary windows (new-session scratch, subagent watch, cmd-click pop-out)
   // hide the titlebar tool cluster + session header, but the OS traffic lights
   // still sit in the top-left, so reserve the titlebar gap above the transcript.
@@ -150,8 +229,49 @@ const ThreadMessageListInner: FC<ThreadMessageListProps> = ({
     ? 'pt-[calc(var(--titlebar-height)+0.75rem)]'
     : 'pt-[calc(var(--titlebar-height)-0.5rem)]'
 
-  useEffect(() => setThreadAtBottom(isAtBottom), [isAtBottom])
+  useEffect(() => {
+    isAtBottomRef.current = isAtBottom
+    setThreadAtBottom(isAtBottom)
+  }, [isAtBottom])
   useEffect(() => () => resetThreadScroll(), [])
+
+  // Preserve the user's reading position per session. Reconnects, renderer
+  // remounts, and backend wake-ups must not turn into an implicit "jump to
+  // bottom" while the user is reading an earlier message.
+  useEffect(() => {
+    const el = scrollRef.current
+
+    if (!el || !sessionKey) {
+      return
+    }
+
+    let rafId: number | null = null
+
+    const capture = () => {
+      rafId = null
+      captureThreadScrollSnapshot(sessionKey, el, isAtBottomRef.current)
+    }
+
+    const onScroll = () => {
+      if (rafId !== null) {
+        return
+      }
+
+      rafId = requestAnimationFrame(capture)
+    }
+
+    el.addEventListener('scroll', onScroll, { passive: true })
+    captureThreadScrollSnapshot(sessionKey, el, isAtBottomRef.current)
+
+    return () => {
+      if (rafId !== null) {
+        cancelAnimationFrame(rafId)
+      }
+
+      captureThreadScrollSnapshot(sessionKey, el, isAtBottomRef.current)
+      el.removeEventListener('scroll', onScroll)
+    }
+  }, [scrollRef, sessionKey])
 
   // Floating jump button (outside this subtree) → return to the bottom.
   useEffect(() => onScrollToBottomRequest(() => void scrollToBottom()), [scrollToBottom])
@@ -180,12 +300,11 @@ const ThreadMessageListInner: FC<ThreadMessageListProps> = ({
   // New run → snap to the latest turn.
   useAuiEvent('thread.runStart', () => void scrollToBottom())
 
-  // Reset the cap and pin to bottom on mount + every session switch (messages
-  // swap in place on a long-lived runtime, so sessionKey is the only signal).
-  // The swap is multi-step and lays out over many frames; letting the library
-  // follow re-pins every frame to a moving target — visible as ~10 scroll jumps.
-  // Instead: quiet it, glue to the true bottom until the height holds steady,
-  // then hand back locked. Live streaming afterward uses the normal resize follow.
+  // Reset the cap and pin to bottom on mount + every session switch unless the
+  // user had intentionally scrolled up in this same session. Session swaps and
+  // reconnect remounts are multi-step and lay out over many frames; either way
+  // we quiet the sticky library until height settles, then restore the explicit
+  // reading position or hand back locked at bottom.
   useLayoutEffect(() => {
     setRenderBudget(RENDER_BUDGET)
 
@@ -195,8 +314,16 @@ const ThreadMessageListInner: FC<ThreadMessageListProps> = ({
       return
     }
 
+    const savedSnapshot = readThreadScrollSnapshot(sessionKey)
+    const restoreSnapshot = shouldRestoreThreadScroll(savedSnapshot) ? savedSnapshot : null
+
     stopScroll()
-    el.scrollTop = el.scrollHeight
+
+    if (restoreSnapshot) {
+      restoreThreadScrollPosition(el, restoreSnapshot)
+    } else {
+      el.scrollTop = el.scrollHeight
+    }
 
     let frame = 0
     let stableFrames = 0
@@ -213,11 +340,20 @@ const ThreadMessageListInner: FC<ThreadMessageListProps> = ({
 
       stableFrames = height === lastHeight ? stableFrames + 1 : 0
       lastHeight = height
-      node.scrollTop = height
+
+      if (restoreSnapshot) {
+        restoreThreadScrollPosition(node, restoreSnapshot)
+      } else {
+        node.scrollTop = height
+      }
 
       // ~5 steady frames ≈ layout has settled; the frame cap bounds slow loads.
       if (stableFrames >= 5 || ++frame > 90) {
-        void scrollToBottom('instant')
+        if (restoreSnapshot) {
+          captureThreadScrollSnapshot(sessionKey, node, false)
+        } else {
+          void scrollToBottom('instant')
+        }
 
         return
       }
