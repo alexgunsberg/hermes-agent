@@ -39,7 +39,7 @@ import time
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Any, Dict, List, Optional
 
 logger = logging.getLogger("hermes.mcp_serve")
 
@@ -540,7 +540,10 @@ class EventBridge:
 # MCP Server
 # ---------------------------------------------------------------------------
 
-def create_mcp_server(event_bridge: Optional[EventBridge] = None) -> "FastMCP":
+def create_mcp_server(
+    event_bridge: Optional[EventBridge] = None,
+    orchestration: str = "none",
+) -> Any:
     """Create and return the Hermes MCP server with all tools registered."""
     if not _MCP_SERVER_AVAILABLE:
         raise ImportError(
@@ -949,6 +952,14 @@ def create_mcp_server(event_bridge: Optional[EventBridge] = None) -> "FastMCP":
         result = bridge.respond_to_approval(id, decision)
         return json.dumps(result, indent=2)
 
+    if orchestration and orchestration != "none":
+        try:
+            from mcp_orchestration import register_orchestration_tools
+
+            register_orchestration_tools(mcp, mode=orchestration)
+        except Exception as e:
+            logger.warning("Failed to register MCP orchestration tools: %s", e)
+
     return mcp
 
 
@@ -956,7 +967,7 @@ def create_mcp_server(event_bridge: Optional[EventBridge] = None) -> "FastMCP":
 # Entry point
 # ---------------------------------------------------------------------------
 
-def run_mcp_server(verbose: bool = False) -> None:
+def run_mcp_server(verbose: bool = False, orchestration: str = "none") -> None:
     """Start the Hermes MCP server on stdio."""
     if not _MCP_SERVER_AVAILABLE:
         print(
@@ -974,7 +985,7 @@ def run_mcp_server(verbose: bool = False) -> None:
     bridge = EventBridge()
     bridge.start()
 
-    server = create_mcp_server(event_bridge=bridge)
+    server = create_mcp_server(event_bridge=bridge, orchestration=orchestration)
 
     import asyncio
 
