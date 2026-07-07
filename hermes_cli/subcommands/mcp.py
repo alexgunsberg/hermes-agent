@@ -36,6 +36,16 @@ def build_mcp_parser(subparsers, *, cmd_mcp: Callable) -> None:
         action="store_true",
         help="Enable verbose logging on stderr",
     )
+    mcp_serve_p.add_argument(
+        "--orchestration",
+        choices=["none", "cursor", "codex", "all"],
+        default="none",
+        help=(
+            "Opt-in task orchestration tools to expose over MCP: "
+            "'cursor' (remote Cursor Cloud Agent), 'codex' (local Codex CLI), "
+            "or 'all' for both"
+        ),
+    )
     add_accept_hooks_flag(mcp_serve_p)
 
     mcp_add_p = mcp_sub.add_parser(
