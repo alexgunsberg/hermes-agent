@@ -512,6 +512,22 @@ def _get_dialog_policy_config() -> Tuple[str, float]:
         return DEFAULT_DIALOG_POLICY, DEFAULT_DIALOG_TIMEOUT_S
 
 
+def _cdp_supervisor_enabled() -> bool:
+    """Return whether the optional CDP supervisor should attach.
+
+    The supervisor adds dialog/frame introspection by holding a second CDP
+    connection and injecting a dialog bridge. That is useful for most sites,
+    but some anti-bot systems treat any extra DevTools/instrumentation signal as
+    suspicious. Keep it enabled by default and allow privacy/stealth workflows to
+    opt out with ``browser.supervisor_enabled: false``.
+    """
+    try:
+        from hermes_cli.config import cfg_get, read_raw_config
+        return bool(cfg_get(read_raw_config(), "browser", "supervisor_enabled", default=True))
+    except Exception:
+        return True
+
+
 def _ensure_cdp_supervisor(task_id: str) -> None:
     """Start a CDP supervisor for ``task_id`` if an endpoint is reachable.
 
@@ -531,6 +547,9 @@ def _ensure_cdp_supervisor(task_id: str) -> None:
     the browser session itself.  The agent simply won't see
     ``pending_dialogs`` / ``frame_tree`` fields in snapshots.
     """
+    if not _cdp_supervisor_enabled():
+        logger.debug("CDP supervisor disabled by browser.supervisor_enabled=false")
+        return
     cdp_url = _get_cdp_override()
     if not cdp_url:
         # Fallback: active session may carry a per-session CDP URL from a
