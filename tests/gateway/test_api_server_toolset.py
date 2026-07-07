@@ -114,6 +114,20 @@ class TestApiServerPlatformConfig:
         assert "discord" not in enabled
         assert "discord_admin" not in enabled
         assert "x_search" not in enabled
+        assert "cursor" not in enabled
+
+    def test_cursor_toolset_is_configurable_but_default_off(self):
+        """Cursor Cloud Agent delegation should be opt-in via `hermes tools`.
+
+        Regression guard: the runtime toolset existed but the tools configurator
+        did not expose it, so users could not enable it without hand-editing
+        config.yaml.
+        """
+        from hermes_cli.tools_config import CONFIGURABLE_TOOLSETS, _DEFAULT_OFF_TOOLSETS
+
+        keys = {key for key, _label, _description in CONFIGURABLE_TOOLSETS}
+        assert "cursor" in keys
+        assert "cursor" in _DEFAULT_OFF_TOOLSETS
 
 
 class TestApiServerAdapterToolset:

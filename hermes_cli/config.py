@@ -965,6 +965,17 @@ DEFAULT_CONFIG = {
     "fallback_providers": [],
     "credential_pool_strategies": {},
     "toolsets": ["hermes-cli"],
+    "mcp_orchestration": {
+        "cursor": {
+            # Claude Code/Fable delegation defaults: cheap model only, no arbitrary repos.
+            # Repos are allowed if listed here or if they match the local git remote
+            # from which `hermes mcp serve --orchestration cursor` was launched.
+            "allowed_models": ["composer-2.5"],
+            "allowed_repos": [],
+            "allow_local_git_remotes": True,
+            "reject_unpushed_current_ref": True,
+        },
+    },
     # Global active chat session cap across CLI, TUI/dashboard, and messaging.
     # None/0 = unbounded.
     "max_concurrent_sessions": None,
@@ -4369,7 +4380,7 @@ OPTIONAL_ENV_VARS = {
         "advanced": True,
     },
     "API_SERVER_MODEL_NAME": {
-        "description": "Model name advertised on /v1/models. Defaults to the profile name (or 'hermes-agent' for the default profile). Useful for multi-user setups with OpenWebUI.",
+        "description": "Model name advertised on /v1/models. Defaults to the profile name (or 'hermes-agent' for the default profile). Useful for Desktop and other API clients.",
         "prompt": "API server model name",
         "url": None,
         "password": False,
@@ -5188,7 +5199,7 @@ _KNOWN_ROOT_KEYS = {
     "fallback_providers", "credential_pool_strategies", "toolsets",
     "agent", "terminal", "display", "compression", "delegation",
     "auxiliary", "moa", "custom_providers", "context", "memory", "gateway",
-    "sessions", "streaming", "updates", "mcp_servers",
+    "sessions", "streaming", "updates", "mcp_servers", "mcp_orchestration",
 }
 
 # Valid fields inside a custom_providers list entry
