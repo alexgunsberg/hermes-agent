@@ -19,6 +19,15 @@ The board has two front doors, both backed by the same `~/.hermes/kanban.db`:
 
 Both surfaces route through the same `kanban_db` layer, so reads see a consistent view and writes can't drift. The rest of this page shows CLI examples because they're easy to copy-paste, but every CLI verb has a tool-call equivalent the model uses.
 
+Telegram gateway users can also bind a dedicated topic as a **zero-prefix Kanban inbox**: after `/kanban inbox bind <board>` in that topic, ordinary non-slash messages are captured as triage cards immediately, without waiting for the current chat agent turn to finish. The binding is exact to the Telegram chat/topic and profile-scoped under that gateway's `HERMES_HOME`, so one profile or topic does not silently hijack another. Slash commands and unauthorized senders still take the normal gateway path.
+
+```text
+/kanban inbox bind general
+/kanban inbox bind forgewod --assignee forgewod --project forgewod --workspace worktree
+/kanban inbox status
+/kanban inbox unbind
+```
+
 This is the shape that covers the workloads `delegate_task` can't:
 
 - **Research triage** — parallel researchers + analyst + writer, human-in-the-loop.
