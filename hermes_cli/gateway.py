@@ -7052,6 +7052,11 @@ def _gateway_command_inner(args):
     elif subcmd == "list":
         _gateway_list()
 
+    elif subcmd == "incidents":
+        from hermes_cli.gateway_stability_incidents import cmd_gateway_incidents
+
+        return cmd_gateway_incidents(args)
+
     elif subcmd == "migrate-legacy":
         # Stop, disable, and remove legacy Hermes gateway unit files from
         # pre-rename installs (e.g. hermes.service). Profile units and

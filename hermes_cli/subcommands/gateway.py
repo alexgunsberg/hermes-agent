@@ -210,6 +210,44 @@ def build_gateway_parser(
     # gateway list
     gateway_subparsers.add_parser("list", help="List all profiles and their gateway status")
 
+    # gateway incidents
+    gateway_incidents = gateway_subparsers.add_parser(
+        "incidents",
+        help="Detect repeated/significant gateway stability incidents from logs (read-only)",
+        description=(
+            "Read gateway logs/state across profiles and emit only repeated or "
+            "significant stability incidents. This is a no-agent detector: it "
+            "does not stop or restart gateways."
+        ),
+    )
+    gateway_incidents.add_argument(
+        "--profile-name",
+        dest="profile_name",
+        help="Scan only this Hermes profile name (default: all discovered profiles)",
+    )
+    gateway_incidents.add_argument(
+        "--max-lines",
+        type=int,
+        default=2000,
+        help="Tail this many lines per log file (default: 2000)",
+    )
+    gateway_incidents.add_argument(
+        "--since-minutes",
+        type=int,
+        default=None,
+        help="Ignore timestamped log lines older than this many minutes",
+    )
+    gateway_incidents.add_argument(
+        "--json",
+        action="store_true",
+        help="Emit structured JSON instead of human-readable text",
+    )
+    gateway_incidents.add_argument(
+        "--quiet",
+        action="store_true",
+        help="Print nothing when no incidents are detected (useful for no-agent cron)",
+    )
+
     # gateway setup
     gateway_subparsers.add_parser("setup", help="Configure messaging platforms")
 
