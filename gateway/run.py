@@ -9613,6 +9613,55 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         if canonical == "skills":
             return await self._handle_skills_command(event)
 
+        if canonical == "skill":
+            raw_args = event.get_command_args().strip()
+            if not raw_args:
+                return "Usage: `/skill <name> [instruction]`"
+            skill_token, user_instruction = (raw_args.split(maxsplit=1) + [""])[:2]
+            skill_command = skill_token.lstrip("/")
+            try:
+                from agent.skill_commands import (
+                    build_skill_invocation_message,
+                    get_skill_commands,
+                    resolve_skill_command_key,
+                )
+
+                cmd_key = resolve_skill_command_key(skill_command)
+                if cmd_key is None:
+                    _unavail_msg = _check_unavailable_skill(skill_command)
+                    if _unavail_msg:
+                        return _unavail_msg
+                    return (
+                        f"Skill `{skill_command}` not found. "
+                        "Type /commands to see available skills, or use the "
+                        "skill's direct slash command like `/cursor-workflows`."
+                    )
+
+                skill_cmds = get_skill_commands()
+                _skill_name = skill_cmds[cmd_key].get("name", "")
+                _plat = source.platform.value if source.platform else None
+                if _plat and _skill_name:
+                    from agent.skill_utils import get_disabled_skill_names as _get_plat_disabled
+
+                    if _skill_name in _get_plat_disabled(platform=_plat):
+                        return (
+                            f"The **{_skill_name}** skill is disabled for {_plat}.\n"
+                            f"Enable it with: `hermes skills config`"
+                        )
+
+                msg = build_skill_invocation_message(
+                    cmd_key, user_instruction, task_id=_quick_key
+                )
+                if not msg:
+                    return f"Failed to load skill `{skill_command}`."
+                event.text = msg
+                # Fall through to normal message processing with skill content.
+                command = None
+                canonical = None
+            except Exception as e:
+                logger.warning("/skill command dispatch failed: %s", e)
+                return f"Failed to load skill `{skill_command}`: {e}"
+
         if canonical == "learn":
             # Open-ended: rewrite the turn to a standards-guided prompt and fall
             # through to normal agent processing. The live agent gathers the

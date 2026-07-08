@@ -179,6 +179,8 @@ COMMAND_REGISTRY: list[CommandDef] = [
                gateway_config_gate="skills.write_approval",
                subcommands=("search", "browse", "inspect", "install", "audit",
                             "pending", "approve", "reject", "diff", "approval")),
+    CommandDef("skill", "Load a skill by name into this session",
+               "Tools & Skills", args_hint="<name> [instruction]"),
     CommandDef("memory", "Review pending memory writes / toggle the approval gate",
                "Tools & Skills",
                args_hint="[pending|approve|reject|approval] [id|on|off]",

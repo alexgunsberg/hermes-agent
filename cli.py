@@ -8609,6 +8609,27 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
         elif canonical == "skills":
             with self._busy_command(self._slow_command_status(cmd_original)):
                 self._handle_skills_command(cmd_original)
+        elif canonical == "skill":
+            from agent import skill_commands as _skill_cmds
+
+            raw_args = cmd_original.split(maxsplit=1)[1].strip() if len(cmd_original.split(maxsplit=1)) > 1 else ""
+            if not raw_args:
+                ChatConsole().print("[yellow]Usage: /skill <name> [instruction][/]")
+                return True
+            skill_token, user_instruction = (raw_args.split(maxsplit=1) + [""])[:2]
+            skill_command = skill_token.lstrip("/")
+            cmd_key = _skill_cmds.resolve_skill_command_key(skill_command)
+            if cmd_key is None:
+                ChatConsole().print(f"[bold red]Skill not found: {skill_command}[/]")
+                ChatConsole().print("[dim]Try /skills or use the skill's direct slash command, e.g. /cursor-workflows[/]")
+                return True
+            msg = _skill_cmds.build_skill_invocation_message(cmd_key, user_instruction, task_id=self.session_id)
+            if msg and hasattr(self, '_pending_input'):
+                skill_name = _skill_cmds.get_skill_commands().get(cmd_key, {}).get("name", skill_command)
+                print(f"\n⚡ Loading skill: {skill_name}")
+                self._pending_input.put(msg)
+            elif not msg:
+                ChatConsole().print(f"[bold red]Failed to load skill: {skill_command}[/]")
         elif canonical == "learn":
             self._handle_learn_command(cmd_original)
         elif canonical == "memory":

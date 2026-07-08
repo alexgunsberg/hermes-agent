@@ -133,6 +133,44 @@ async def test_unknown_slash_command_underscored_form_also_guarded(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_skill_command_loads_named_skill_in_gateway(monkeypatch):
+    """`/skill <name>` should load the named skill instead of being treated
+    as an unknown slash command. This preserves the documented form while the
+    direct `/skill-name` commands remain supported."""
+    import gateway.run as gateway_run
+    from agent import skill_commands as skill_commands_mod
+
+    runner = _make_runner()
+    runner._run_agent = AsyncMock(return_value={"final_response": "skill turn queued"})
+
+    monkeypatch.setattr(
+        gateway_run, "_resolve_runtime_agent_kwargs", lambda: {"api_key": "***"}
+    )
+    monkeypatch.setattr(
+        skill_commands_mod,
+        "resolve_skill_command_key",
+        lambda name: "/cursor-workflows" if name == "cursor-workflows" else None,
+    )
+    monkeypatch.setattr(
+        skill_commands_mod,
+        "get_skill_commands",
+        lambda: {"/cursor-workflows": {"name": "cursor-workflows"}},
+    )
+    monkeypatch.setattr(
+        skill_commands_mod,
+        "build_skill_invocation_message",
+        lambda cmd_key, user_instruction, task_id=None: f"LOADED {cmd_key}: {user_instruction}",
+    )
+
+    result = await runner._handle_message(_make_event("/skill cursor-workflows use cursor"))
+
+    assert result == "skill turn queued"
+    runner._run_agent.assert_awaited_once()
+    assert runner._run_agent.await_args is not None
+    assert runner._run_agent.await_args.kwargs["message"] == "LOADED /cursor-workflows: use cursor"
+
+
+@pytest.mark.asyncio
 async def test_known_slash_command_not_flagged_as_unknown(monkeypatch):
     """A real built-in like /status must NOT hit the unknown-command guard."""
     runner = _make_runner()
