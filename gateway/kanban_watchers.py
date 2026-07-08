@@ -13,6 +13,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import re
 import sqlite3
 import time
 from pathlib import Path
@@ -23,6 +24,34 @@ from agent.i18n import t
 # Match the logger run.py uses (logging.getLogger(__name__) where __name__ ==
 # "gateway.run") so extracted log records keep their original logger name.
 logger = logging.getLogger("gateway.run")
+
+
+_TASK_ID_RE = re.compile(r"\bt_[0-9a-f]+\b")
+
+
+def _short_mobile_line(text: Any, *, limit: int = 180) -> str:
+    """Return one Telegram-safe semantic line without raw Kanban IDs/tables."""
+    if not text:
+        return ""
+    for raw_line in str(text).replace("\r", "\n").splitlines():
+        line = raw_line.strip().lstrip("-•* ").strip()
+        if not line or line.startswith("|"):
+            continue
+        line = _TASK_ID_RE.sub("Kanban follow-up", line)
+        line = re.sub(r"\s+", " ", line).strip()
+        if len(line) > limit:
+            line = line[: limit - 3].rstrip() + "..."
+        return line
+    return ""
+
+
+def _minutes_or_seconds(seconds: int) -> str:
+    if seconds <= 0:
+        return "the runtime limit"
+    if seconds % 60 == 0 and seconds >= 60:
+        minutes = seconds // 60
+        return f"{minutes}m"
+    return f"{seconds}s"
 
 
 def _resolve_auto_decompose_settings(
@@ -334,68 +363,47 @@ class GatewayKanbanWatchersMixin:
                             board_slug,
                         )
                         continue
-                    title = (task.title if task else sub["task_id"])[:120]
-                    board_tag = f"[{board_slug}] " if board_slug else ""
+                    title = _short_mobile_line(task.title if task else "Kanban task", limit=120)
                     for ev in d["events"]:
                         kind = ev.kind
-                        # Identity prefix: attribute terminal pings to the
-                        # worker that did the work. Makes fleets (where one
-                        # chat subscribes to many tasks) legible at a glance.
-                        who = (task.assignee if task and task.assignee else None)
-                        tag = f"@{who} " if who else ""
                         if kind == "completed":
-                            # Prefer the run's summary (the worker's
-                            # intentional human-facing handoff, carried
-                            # in the event payload), then fall back to
-                            # task.result for legacy rows written before
-                            # runs shipped.
-                            handoff = ""
+                            # Mobile-facing notifications are semantic summaries,
+                            # not Kanban log rows. Keep board/profile/task IDs in
+                            # Kanban itself unless the user asks for internals.
                             payload_summary = None
                             if ev.payload and ev.payload.get("summary"):
                                 payload_summary = str(ev.payload["summary"])
-                            if payload_summary:
-                                lines = payload_summary.strip().splitlines()
-                                h = lines[0][:200] if lines else payload_summary[:200]
-                                handoff = f"\n{h}"
-                            elif task and task.result:
-                                lines = task.result.strip().splitlines()
-                                r = lines[0][:160] if lines else task.result[:160]
-                                handoff = f"\n{r}"
-                            msg = (
-                                f"✔ {board_tag}{tag}Kanban {sub['task_id']} done"
-                                f" — {title}{handoff}"
-                            )
+                            h = _short_mobile_line(payload_summary, limit=180)
+                            if not h and task and task.result:
+                                h = _short_mobile_line(task.result, limit=180)
+                            outcome = h or title
+                            msg = f"Done: {outcome}"
                         elif kind == "blocked":
                             reason = ""
                             if ev.payload and ev.payload.get("reason"):
-                                reason = f": {str(ev.payload['reason'])[:160]}"
-                            msg = f"⏸ {board_tag}{tag}Kanban {sub['task_id']} blocked{reason}"
+                                reason_text = _short_mobile_line(ev.payload["reason"], limit=160)
+                                if reason_text:
+                                    reason = f"\n- Need: {reason_text}"
+                            msg = f"Needs input: {title}{reason}"
                         elif kind == "gave_up":
                             err = ""
                             if ev.payload and ev.payload.get("error"):
-                                err = f"\n{str(ev.payload['error'])[:200]}"
-                            msg = (
-                                f"✖ {board_tag}{tag}Kanban {sub['task_id']} gave up "
-                                f"after repeated spawn failures{err}"
-                            )
+                                err_text = _short_mobile_line(ev.payload["error"], limit=180)
+                                if err_text:
+                                    err = f"\n- Need: inspect worker spawn failure — {err_text}"
+                            msg = f"Could not start: {title}{err}"
                         elif kind == "crashed":
-                            msg = (
-                                f"✖ {board_tag}{tag}Kanban {sub['task_id']} worker crashed "
-                                f"(pid gone); dispatcher will retry"
-                            )
+                            msg = f"Issue: {title} crashed; dispatcher will retry."
                         elif kind == "timed_out":
                             limit = 0
                             if ev.payload and ev.payload.get("limit_seconds"):
                                 limit = int(ev.payload["limit_seconds"])
-                            msg = (
-                                f"⏱ {board_tag}{tag}Kanban {sub['task_id']} timed out "
-                                f"(max_runtime={limit}s); will retry"
-                            )
+                            msg = f"Issue: {title} timed out after {_minutes_or_seconds(limit)}; dispatcher will retry."
                         elif kind == "status":
                             new_status = ""
                             if ev.payload and ev.payload.get("status"):
-                                new_status = str(ev.payload["status"])
-                            msg = f"🔄 {board_tag}{tag}Kanban {sub['task_id']} → {new_status}"
+                                new_status = str(ev.payload["status"]).replace("_", "-")
+                            msg = f"Update: {title} is now {new_status}."
                         else:
                             # archived / unblocked are claimed by TERMINAL_KINDS
                             # (so the cursor advances past them and they can't

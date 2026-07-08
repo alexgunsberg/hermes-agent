@@ -348,6 +348,7 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
                                "kanban.failure_limit config "
                                f"(default {kb.DEFAULT_FAILURE_LIMIT}).")
     p_create.add_argument("--goal", action="store_true", dest="goal_mode",
+                          default=None,
                           help="Run the worker in a goal loop: after each "
                                "turn a judge checks the response against the "
                                "card title/body and, if not done, the worker "
@@ -356,6 +357,11 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
                                "budget runs out, which blocks the card for "
                                "review). Best for open-ended cards one shot "
                                "rarely finishes.")
+    p_create.add_argument("--no-goal", action="store_false", dest="goal_mode",
+                          help="Opt out of the goal loop. Intended only for "
+                               "triage cards or explicit human gates; normal "
+                               "implementation/review/orchestration cards "
+                               "default to --goal.")
     p_create.add_argument("--goal-max-turns", type=int, default=None,
                           metavar="N", dest="goal_max_turns",
                           help="Turn budget for --goal workers (default 20). "
@@ -494,6 +500,99 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
     p_diag.add_argument(
         "--json", action="store_true",
         help="Emit JSON (structured) instead of the default human table",
+    )
+    p_diag.add_argument(
+        "--ownership", action="store_true",
+        help="Also audit three-level ownership ledgers and non-goal work cards",
+    )
+    p_diag.add_argument(
+        "--all-boards",
+        action="store_true",
+        help="Scan every non-archived board discovered on disk.",
+    )
+
+    # --- audit-report (no-LLM timers + ownership metrics) ---
+    p_audit = sub.add_parser(
+        "audit-report",
+        aliases=["audit"],
+        help="Write a timestamped no-LLM timer/ownership audit report",
+    )
+    p_audit.add_argument(
+        "--boards",
+        nargs="+",
+        default=None,
+        metavar="SLUG",
+        help="Board slug(s) to include. Defaults to the current board.",
+    )
+    p_audit.add_argument(
+        "--all-boards",
+        action="store_true",
+        help="Include every non-archived board discovered on disk.",
+    )
+    p_audit.add_argument(
+        "--include-archived",
+        action="store_true",
+        help="Include archived tasks in duration summaries.",
+    )
+    p_audit.add_argument(
+        "--output-dir",
+        default=None,
+        help="Directory for JSON/Markdown output (default: ~/.hermes/reports).",
+    )
+    p_audit.add_argument(
+        "--json",
+        action="store_true",
+        help="Print structured report metadata after writing files.",
+    )
+
+    # --- done-summary (no-LLM terminal project/board closeout summaries) ---
+    p_done_summary = sub.add_parser(
+        "done-summary",
+        aliases=["done-summaries", "closeout-summary"],
+        help="Emit newly-terminal project/board summaries without duplicate spam",
+    )
+    p_done_summary.add_argument(
+        "--boards",
+        nargs="+",
+        default=None,
+        metavar="SLUG",
+        help="Board slug(s) to scan. Defaults to the current board.",
+    )
+    p_done_summary.add_argument(
+        "--all-boards",
+        action="store_true",
+        help="Scan every non-archived board discovered on disk.",
+    )
+    p_done_summary.add_argument(
+        "--scope",
+        choices=["all", "board", "project"],
+        default="all",
+        help="Terminal entities to summarize (default: all).",
+    )
+    p_done_summary.add_argument(
+        "--state-file",
+        default=None,
+        help="State JSON path for emitted fingerprints (default: <kanban-home>/kanban/done_project_summaries.json).",
+    )
+    p_done_summary.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Do not update the emitted-summary state file.",
+    )
+    p_done_summary.add_argument(
+        "--write-report",
+        action="store_true",
+        help="Also write JSON/Markdown local report files when summaries are emitted.",
+    )
+    p_done_summary.add_argument(
+        "--output-dir",
+        default=None,
+        help="Directory for optional JSON/Markdown reports (default: ~/.hermes/reports).",
+    )
+    p_done_summary.add_argument(
+        "--json",
+        action="store_true",
+        help="Print structured summary metadata instead of the default text blocks.",
     )
 
     # --- link / unlink ---
@@ -947,6 +1046,11 @@ def kanban_command(args: argparse.Namespace) -> int:
             "reassign": _cmd_reassign,
             "diagnostics": _cmd_diagnostics,
             "diag":     _cmd_diagnostics,
+            "audit-report": _cmd_audit_report,
+            "audit":    _cmd_audit_report,
+            "done-summary": _cmd_done_summary,
+            "done-summaries": _cmd_done_summary,
+            "closeout-summary": _cmd_done_summary,
             "link":     _cmd_link,
             "unlink":   _cmd_unlink,
             "claim":    _cmd_claim,
@@ -1325,6 +1429,14 @@ def _cmd_create(args: argparse.Namespace) -> int:
             file=sys.stderr,
         )
         return 2
+    explicit_goal = getattr(args, "goal_mode", None)
+    initial_status = getattr(args, "initial_status", "running")
+    triage = bool(getattr(args, "triage", False))
+    goal_mode = (
+        explicit_goal
+        if explicit_goal is not None
+        else not (triage or initial_status == "blocked")
+    )
     with kb.connect_closing() as conn:
         task_id = kb.create_task(
             conn,
@@ -1339,14 +1451,14 @@ def _cmd_create(args: argparse.Namespace) -> int:
             tenant=args.tenant,
             priority=args.priority,
             parents=tuple(args.parent or ()),
-            triage=bool(getattr(args, "triage", False)),
+            triage=triage,
             idempotency_key=getattr(args, "idempotency_key", None),
             max_runtime_seconds=max_runtime,
             skills=getattr(args, "skills", None) or None,
             max_retries=max_retries,
-            goal_mode=bool(getattr(args, "goal_mode", False)),
+            goal_mode=bool(goal_mode),
             goal_max_turns=getattr(args, "goal_max_turns", None),
-            initial_status=getattr(args, "initial_status", "running"),
+            initial_status=initial_status,
         )
         task = kb.get_task(conn, task_id)
     if getattr(args, "json", False):
@@ -1365,6 +1477,13 @@ def _cmd_create(args: argparse.Namespace) -> int:
             running, message = _check_dispatcher_presence()
             if not running and message:
                 print(f"\n⚠  {message}", file=sys.stderr)
+        if explicit_goal is False and not (triage or initial_status == "blocked"):
+            print(
+                "\n⚠  Created a non-goal work card. Use --no-goal only for "
+                "explicit human gates/triage or record the exception in the "
+                "card body.",
+                file=sys.stderr,
+            )
     return 0
 
 
@@ -1673,110 +1792,145 @@ def _cmd_diagnostics(args: argparse.Namespace) -> int:
     from hermes_cli.config import load_config
 
     diag_config = kd.config_from_runtime_config(load_config())
+    if getattr(args, "ownership", False):
+        diag_config["ownership_audit"] = True
 
-    with kb.connect_closing() as conn:
-        # Either one-task mode or fleet mode.
-        if getattr(args, "task", None):
-            task = kb.get_task(conn, args.task)
-            if task is None:
-                print(f"no such task: {args.task}", file=sys.stderr)
-                return 1
-            diags_by_task = {
-                args.task: kd.compute_task_diagnostics(
-                    task,
-                    kb.list_events(conn, args.task),
-                    kb.list_runs(conn, args.task),
+    def _db_path_for_board(slug: str) -> Path:
+        """Resolve a board DB while ignoring worker-scoped HERMES_KANBAN_DB.
+
+        Diagnostics with ``--all-boards`` must see sibling boards even when
+        invoked from inside a worker whose environment pins normal kanban
+        operations to one board.
+        """
+        normed = kb._normalize_board_slug(slug) or kb.DEFAULT_BOARD
+        if normed == kb.DEFAULT_BOARD:
+            return kb.kanban_home() / "kanban.db"
+        return kb.board_dir(normed) / "kanban.db"
+
+    def _row_get(row, field: str):
+        return row[field] if hasattr(row, "keys") else getattr(row, field)
+
+    def _collect_board(slug: str) -> tuple[list[dict], bool]:
+        entries: list[dict] = []
+        found_task = False
+        with kb.connect_closing(db_path=_db_path_for_board(slug)) as conn:
+            # Either one-task mode or fleet mode.
+            if getattr(args, "task", None):
+                task = kb.get_task(conn, args.task)
+                if task is None:
+                    return [], False
+                found_task = True
+                rows = [task]
+            else:
+                # Fleet mode: pull all non-archived tasks + their events/runs.
+                rows = list(conn.execute(
+                    "SELECT * FROM tasks WHERE status != 'archived'"
+                ).fetchall())
+
+            ids = [_row_get(r, "id") for r in rows]
+            if not ids:
+                return [], found_task
+            placeholders = ",".join(["?"] * len(ids))
+            ev_by = {i: [] for i in ids}
+            for row in conn.execute(
+                f"SELECT * FROM task_events WHERE task_id IN ({placeholders}) ORDER BY id",
+                tuple(ids),
+            ):
+                ev_by.setdefault(row["task_id"], []).append(row)
+            run_by = {i: [] for i in ids}
+            for row in conn.execute(
+                f"SELECT * FROM task_runs WHERE task_id IN ({placeholders}) ORDER BY id",
+                tuple(ids),
+            ):
+                run_by.setdefault(row["task_id"], []).append(row)
+            for row in rows:
+                tid = _row_get(row, "id")
+                diagnostics = kd.compute_task_diagnostics(
+                    row,
+                    ev_by.get(tid, []),
+                    run_by.get(tid, []),
                     config=diag_config,
                 )
-            }
-        else:
-            # Fleet mode: pull all non-archived tasks + their events/runs.
-            rows = list(conn.execute(
-                "SELECT * FROM tasks WHERE status != 'archived'"
-            ).fetchall())
-            ids = [r["id"] for r in rows]
-            if not ids:
-                diags_by_task = {}
-            else:
-                placeholders = ",".join(["?"] * len(ids))
-                ev_by = {i: [] for i in ids}
-                for row in conn.execute(
-                    f"SELECT * FROM task_events WHERE task_id IN ({placeholders}) ORDER BY id",
-                    tuple(ids),
-                ):
-                    ev_by.setdefault(row["task_id"], []).append(row)
-                run_by = {i: [] for i in ids}
-                for row in conn.execute(
-                    f"SELECT * FROM task_runs WHERE task_id IN ({placeholders}) ORDER BY id",
-                    tuple(ids),
-                ):
-                    run_by.setdefault(row["task_id"], []).append(row)
-                diags_by_task = {}
-                for r in rows:
-                    tid = r["id"]
-                    dl = kd.compute_task_diagnostics(
-                        r,
-                        ev_by.get(tid, []),
-                        run_by.get(tid, []),
-                        config=diag_config,
-                    )
-                    if dl:
-                        diags_by_task[tid] = dl
+                if diagnostics:
+                    entries.append({
+                        "board": slug,
+                        "task_id": tid,
+                        "title": _row_get(row, "title"),
+                        "status": _row_get(row, "status"),
+                        "assignee": _row_get(row, "assignee"),
+                        "diagnostics": diagnostics,
+                    })
+        return entries, found_task
 
-        # Severity filter.
-        sev = getattr(args, "severity", None)
-        if sev:
-            for tid in list(diags_by_task.keys()):
-                kept = [d for d in diags_by_task[tid] if kd.SEVERITY_ORDER.index(d.severity) >= kd.SEVERITY_ORDER.index(sev)]
-                if kept:
-                    diags_by_task[tid] = kept
-                else:
-                    del diags_by_task[tid]
+    if getattr(args, "all_boards", False):
+        board_slugs = [b["slug"] for b in kb.list_boards(include_archived=False)]
+    else:
+        board_slugs = [kb.get_current_board()]
 
-        # Map task_id → title/status/assignee for the table output.
-        meta: dict[str, dict] = {}
-        if diags_by_task:
-            placeholders = ",".join(["?"] * len(diags_by_task))
-            for r in conn.execute(
-                f"SELECT id, title, status, assignee FROM tasks WHERE id IN ({placeholders})",
-                tuple(diags_by_task.keys()),
-            ):
-                meta[r["id"]] = {
-                    "title": r["title"], "status": r["status"],
-                    "assignee": r["assignee"],
-                }
+    entries: list[dict] = []
+    task_seen = False
+    for slug in board_slugs:
+        board_entries, found_task = _collect_board(slug)
+        entries.extend(board_entries)
+        task_seen = task_seen or found_task
+
+    if getattr(args, "task", None) and not task_seen:
+        scope = "any active board" if getattr(args, "all_boards", False) else "this board"
+        print(f"no such task on {scope}: {args.task}", file=sys.stderr)
+        return 1
+
+    # Severity filter.
+    sev = getattr(args, "severity", None)
+    if sev:
+        filtered: list[dict] = []
+        for entry in entries:
+            kept = [
+                d for d in entry["diagnostics"]
+                if kd.SEVERITY_ORDER.index(d.severity) >= kd.SEVERITY_ORDER.index(sev)
+            ]
+            if kept:
+                new_entry = dict(entry)
+                new_entry["diagnostics"] = kept
+                filtered.append(new_entry)
+        entries = filtered
 
     if getattr(args, "json", False):
         out_json = [
             {
-                "task_id": tid,
-                **meta.get(tid, {}),
-                "diagnostics": [d.to_dict() for d in dl],
+                "board": entry["board"],
+                "task_id": entry["task_id"],
+                "title": entry["title"],
+                "status": entry["status"],
+                "assignee": entry["assignee"],
+                "diagnostics": [d.to_dict() for d in entry["diagnostics"]],
             }
-            for tid, dl in diags_by_task.items()
+            for entry in entries
         ]
         print(json.dumps(out_json, indent=2, ensure_ascii=False))
         return 0
 
-    if not diags_by_task:
-        print("No active diagnostics on this board.")
+    if not entries:
+        if getattr(args, "all_boards", False):
+            print(f"No active diagnostics across {len(board_slugs)} board(s).")
+        else:
+            print("No active diagnostics on this board.")
         return 0
 
     # Human-readable summary: grouped by task, severity-marked, with
     # suggested actions inline.
     sev_marker = {"warning": "⚠", "error": "!!", "critical": "!!!"}
-    total = sum(len(dl) for dl in diags_by_task.values())
+    total = sum(len(entry["diagnostics"]) for entry in entries)
     print(
         f"{total} active diagnostic(s) across "
-        f"{len(diags_by_task)} task(s):\n"
+        f"{len(entries)} task(s) on {len(board_slugs)} board(s):\n"
     )
-    for tid, dl in diags_by_task.items():
-        m = meta.get(tid, {})
-        title = m.get("title") or "(untitled)"
-        status = m.get("status") or "?"
-        assignee = m.get("assignee") or "(unassigned)"
-        print(f"  {tid}  {status:8s}  @{assignee:18s}  {title}")
-        for d in dl:
+    for entry in entries:
+        title = entry.get("title") or "(untitled)"
+        status = entry.get("status") or "?"
+        assignee = entry.get("assignee") or "(unassigned)"
+        board = entry.get("board") or kb.DEFAULT_BOARD
+        print(f"  [{board}] {entry['task_id']}  {status:8s}  @{assignee:18s}  {title}")
+        for d in entry["diagnostics"]:
             print(f"    {sev_marker.get(d.severity, '?')} [{d.severity}] {d.kind}: {d.title}")
             if d.data:
                 # Compact key:value pairs on one line.
@@ -1793,6 +1947,74 @@ def _cmd_diagnostics(args: argparse.Namespace) -> int:
                 if a.suggested:
                     print(f"       → {a.label}")
         print()
+    return 0
+
+
+def _cmd_audit_report(args: argparse.Namespace) -> int:
+    """Write a no-LLM Kanban timer/ownership audit report to disk."""
+    from hermes_cli import kanban_audit
+
+    report, json_path, md_path = kanban_audit.write_report(
+        boards=getattr(args, "boards", None),
+        all_boards=bool(getattr(args, "all_boards", False)),
+        include_archived=bool(getattr(args, "include_archived", False)),
+        output_dir=getattr(args, "output_dir", None),
+    )
+    if getattr(args, "json", False):
+        print(json.dumps({
+            "json_path": str(json_path),
+            "markdown_path": str(md_path),
+            "summary": report["summary"],
+            "boards": [b["slug"] for b in report["boards"]],
+        }, indent=2, ensure_ascii=False))
+        return 0
+    print("Kanban timer/audit report written:")
+    print(f"  JSON:     {json_path}")
+    print(f"  Markdown: {md_path}")
+    summary = report["summary"]
+    print(
+        "  Summary: "
+        f"boards={summary['boards_count']} tasks={summary['task_count']} "
+        f"ownership_gaps={summary['ownership_gap_count']} "
+        f"handoff_gaps={summary['handoff_contract_gap_count']} "
+        f"non_goal={summary['non_goal_card_count']} "
+        f"cursor_gaps={summary['cursor_workflow_gap_count']} "
+        f"blocked={summary['blocked_count']} "
+        f"review_required={summary['review_required_count']}"
+    )
+    return 0
+
+
+def _cmd_done_summary(args: argparse.Namespace) -> int:
+    """Emit no-LLM closeout summaries for newly-terminal projects/boards."""
+    from hermes_cli import kanban_done_summary as kds
+
+    summaries, state_path = kds.due_summaries(
+        boards=getattr(args, "boards", None),
+        all_boards=bool(getattr(args, "all_boards", False)),
+        scope=getattr(args, "scope", "all"),
+        state_path=getattr(args, "state_file", None),
+        update_state=not bool(getattr(args, "dry_run", False)),
+    )
+    json_path = md_path = None
+    if summaries and getattr(args, "write_report", False):
+        json_path, md_path = kds.write_report(
+            summaries,
+            output_dir=getattr(args, "output_dir", None),
+        )
+    if getattr(args, "json", False):
+        print(json.dumps({
+            "state_path": str(state_path),
+            "updated_state": bool(summaries) and not bool(getattr(args, "dry_run", False)),
+            "json_path": str(json_path) if json_path else None,
+            "markdown_path": str(md_path) if md_path else None,
+            "summaries": [s.to_dict() for s in summaries],
+        }, indent=2, ensure_ascii=False))
+        return 0
+    rendered = kds.render_text(summaries)
+    if rendered:
+        print(rendered)
+    # No output when nothing is due: this lets no-agent cron jobs stay silent.
     return 0
 
 
@@ -2751,6 +2973,7 @@ Common subcommands:
   `list` (alias `ls`)   List tasks on the current board
   `show <id>`           Task details + comments + events
   `stats`               Per-status / per-assignee counts
+  `audit-report`        Write no-LLM timer/ownership JSON+Markdown report
   `create <title>…`     Create a task (auto-subscribes you to events)
   `comment <id> <msg>`  Append a comment
   `complete <id>…`      Mark task(s) done

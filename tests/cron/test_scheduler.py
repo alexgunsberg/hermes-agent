@@ -566,8 +566,8 @@ class TestDeliverResultWrapping:
         )
         return media_file.resolve()
 
-    def test_delivery_wraps_content_with_header_and_footer(self):
-        """Delivered content should include task name header and agent-invisible note."""
+    def test_delivery_wraps_content_without_header_or_footer(self):
+        """Delivered content should be the human-facing output only."""
         from gateway.config import Platform
 
         pconfig = MagicMock()
@@ -587,14 +587,14 @@ class TestDeliverResultWrapping:
 
         send_mock.assert_called_once()
         sent_content = send_mock.call_args.kwargs.get("content") or send_mock.call_args[0][-1]
-        assert "Cronjob Response: daily-report" in sent_content
-        assert "(job_id: test-job)" in sent_content
-        assert "-------------" in sent_content
-        assert "Here is today's summary." in sent_content
-        assert "To stop or manage this job" in sent_content
+        assert sent_content == "Here is today's summary."
+        assert "⏰ Cron:" not in sent_content
+        assert "test-job" not in sent_content
+        assert "-------------" not in sent_content
+        assert "Manage:" not in sent_content
 
-    def test_delivery_uses_job_id_when_no_name(self):
-        """When a job has no name, the wrapper should fall back to job id."""
+    def test_delivery_uses_job_name_only_for_empty_output(self):
+        """When wrapped empty content reaches delivery, use a compact semantic fallback."""
         from gateway.config import Platform
 
         pconfig = MagicMock()
@@ -606,13 +606,16 @@ class TestDeliverResultWrapping:
              patch("tools.send_message_tool._send_to_platform", new=AsyncMock(return_value={"success": True})) as send_mock:
             job = {
                 "id": "abc-123",
+                "name": "daily-report",
                 "deliver": "origin",
                 "origin": {"platform": "telegram", "chat_id": "123"},
             }
-            _deliver_result(job, "Output.")
+            _deliver_result(job, "")
 
         sent_content = send_mock.call_args.kwargs.get("content") or send_mock.call_args[0][-1]
-        assert "Cronjob Response: abc-123" in sent_content
+        assert sent_content == "daily-report ran.\n\n- Action: none"
+        assert "abc-123" not in sent_content
+        assert "Job ID" not in sent_content
 
     def test_delivery_skips_wrapping_when_config_disabled(self):
         """When cron.wrap_response is false, deliver raw content without header/footer."""

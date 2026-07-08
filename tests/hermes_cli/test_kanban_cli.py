@@ -91,6 +91,73 @@ def test_run_slash_create_and_list(kanban_home):
     assert "alice" in out
 
 
+def test_run_slash_diagnostics_all_boards_ignores_worker_db_env(kanban_home, monkeypatch):
+    monkeypatch.delenv("HERMES_KANBAN_DB", raising=False)
+    kb.init_db()
+    kb.create_board("sibling-board")
+    for slug, task_id, title in [
+        (kb.DEFAULT_BOARD, "t_aaaabbbb", "default missing owner ledger"),
+        ("sibling-board", "t_ccccdddd", "sibling board missing owner ledger"),
+    ]:
+        db_path = kanban_home / "kanban.db" if slug == kb.DEFAULT_BOARD else kb.board_dir(slug) / "kanban.db"
+        with kb.connect_closing(db_path=db_path) as conn:
+            conn.execute(
+                """
+                INSERT INTO tasks (
+                    id, title, body, assignee, status, created_by,
+                    created_at, workspace_kind, goal_mode
+                ) VALUES (?, ?, 'missing ownership', 'default', 'ready', 'test', 100, 'scratch', 1)
+                """,
+                (task_id, title),
+            )
+            conn.commit()
+
+    # Simulate a dispatched worker pinned to one board. All-board diagnostics
+    # must still inspect sibling boards.
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(kanban_home / "kanban.db"))
+
+    out = kc.run_slash("diagnostics --ownership --all-boards --json")
+    payload = json.loads(out)
+    by_id = {item["task_id"]: item for item in payload}
+
+    assert by_id["t_aaaabbbb"]["board"] == kb.DEFAULT_BOARD
+    assert by_id["t_ccccdddd"]["board"] == "sibling-board"
+    assert any(d["kind"] == "missing_ownership_ledger" for d in by_id["t_ccccdddd"]["diagnostics"])
+
+
+def test_run_slash_create_defaults_work_cards_to_goal_mode(kanban_home):
+    out = kc.run_slash("create 'implement feature' --assignee alice")
+    import re
+    m = re.search(r"(t_[a-f0-9]+)", out)
+    assert m
+    tid = m.group(1)
+    with kb.connect() as conn:
+        task = kb.get_task(conn, tid)
+    assert task is not None
+    assert task.goal_mode is True
+
+
+def test_run_slash_create_no_goal_and_human_gates(kanban_home):
+    out = kc.run_slash("create 'human gate' --assignee alice --initial-status blocked")
+    import re
+    m = re.search(r"(t_[a-f0-9]+)", out)
+    assert m
+    tid = m.group(1)
+    with kb.connect() as conn:
+        task = kb.get_task(conn, tid)
+    assert task is not None
+    assert task.goal_mode is False
+
+    out = kc.run_slash("create 'manual one-shot' --assignee alice --no-goal")
+    m = re.search(r"(t_[a-f0-9]+)", out)
+    assert m
+    tid = m.group(1)
+    with kb.connect() as conn:
+        task = kb.get_task(conn, tid)
+    assert task is not None
+    assert task.goal_mode is False
+
+
 def test_run_slash_create_worktree_path_and_branch(kanban_home, tmp_path):
     target = tmp_path / ".worktrees" / "t6-wire"
     target_arg = target.as_posix()

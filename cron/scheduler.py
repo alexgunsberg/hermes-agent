@@ -1401,6 +1401,22 @@ def _is_channel_dm_topic(
     return is_channel
 
 
+def _format_cron_delivery_content(job: dict, content: str) -> str:
+    """Format cron output for chat without operational wrapper noise.
+
+    Cron run IDs, schedules, prompts, and full stdout are already persisted in
+    the cron output directory. Delivery channels — especially mobile chat — get
+    only the job's human-facing output. Individual scripts/agents are expected
+    to emit semantic summaries; raw metrics and manage/stop boilerplate stay in
+    logs/reports unless explicitly requested.
+    """
+    body = str(content or "").strip()
+    if body:
+        return body
+    task_name = str(job.get("name") or "cron job").strip()
+    return f"{task_name} ran.\n\n- Action: none"
+
+
 def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Optional[str]:
     """
     Deliver job output to the configured target(s) (origin chat, specific platform, etc.).
@@ -1437,9 +1453,9 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
     from tools.send_message_tool import _send_to_platform
     from gateway.config import load_gateway_config, Platform
 
-    # Optionally wrap the content with a header/footer so the user knows this
-    # is a cron delivery.  Wrapping is on by default; set cron.wrap_response: false
-    # in config.yaml for clean output.
+    # Historically this gate added an operational header/footer.  Keep the
+    # config branch for compatibility, but the default formatter now emits only
+    # mobile-safe human-facing content and leaves run/job details in cron logs.
     wrap_response = True
     user_cfg = None
     try:
@@ -1449,15 +1465,7 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
         pass
 
     if wrap_response:
-        task_name = job.get("name", job["id"])
-        job_id = job.get("id", "")
-        delivery_content = (
-            f"Cronjob Response: {task_name}\n"
-            f"(job_id: {job_id})\n"
-            f"-------------\n\n"
-            f"{content}\n\n"
-            f"To stop or manage this job, send me a new message (e.g. \"stop reminder {task_name}\")."
-        )
+        delivery_content = _format_cron_delivery_content(job, content)
     else:
         delivery_content = content
 

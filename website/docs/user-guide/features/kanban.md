@@ -69,6 +69,87 @@ They coexist: a kanban worker may call `delegate_task` internally during its run
 - **Dispatcher** — a long-lived loop that, every N seconds (default 60): reclaims stale claims, reclaims crashed workers (PID gone but TTL not yet expired), promotes ready tasks, atomically claims, spawns assigned profiles. Runs **inside the gateway** by default (`kanban.dispatch_in_gateway: true`). One dispatcher sweeps all boards per tick; workers are spawned with `HERMES_KANBAN_BOARD` pinned so they can't see other boards. After `kanban.failure_limit` consecutive spawn failures on the same task (default: 2) the dispatcher auto-blocks it with the last error as the reason — prevents thrashing on tasks whose profile doesn't exist, workspace can't mount, etc.
 - **Tenant** — optional string namespace *within* a board. One specialist fleet can serve multiple businesses (`--tenant business-a`) with data isolation by workspace path and memory key prefix. Tenants are a soft filter; boards are the hard isolation boundary.
 
+## Three-level ownership and goal-mode defaults
+
+Every non-trivial Kanban mission should make ownership explicit at three levels:
+
+```text
+Ownership:
+- Task owner: <profile/person>; responsibility: <specific card outcome>
+- Project owner: <profile/person>; responsibility: <project graph terminality>
+- Kanban owner: <profile/person>; responsibility: <board health and stale-state cleanup>
+- Stage owner: <profile/person>; responsibility: <current stage/handoff acceptance>
+- Escalation target: <human only for login/CAPTCHA/secrets/destructive consent/taste/product decision>
+- Completion mode: /goal required
+```
+
+The ledger belongs in parent/project card bodies and in child card bodies or comments. It lets workers know whether they own one card, the whole project graph, or board hygiene; it also prevents the failure mode where a review is approved but no authorized owner closes the reviewed sibling card.
+
+`hermes kanban create` now defaults normal work cards to goal mode. Use `--no-goal` only for explicit human gates or triage-style one-shot cards, and record the exception in the card body. Human gates should normally be created as `--initial-status blocked`; triage intake should use `--triage`.
+
+Run the ownership audit with:
+
+```bash
+hermes kanban diagnostics --ownership
+# Scan every active board instead of only the current board.
+hermes kanban diagnostics --ownership --all-boards
+```
+
+That check flags active cards missing the ownership ledger, incomplete accepting-owner handoffs, and implementation/review/orchestration/Cursor cards that are not in goal mode. `--all-boards` intentionally ignores worker-scoped board DB pins so an ownership watchdog can audit every active board from inside a dispatched worker. Project owners should use the normal authorized CLI, slash-command, or dashboard path to close reviewed sibling cards, for example `hermes kanban complete <task_id> --summary "review accepted: ..." --metadata '{"reviewed_by":"project-owner"}'`. Task-scoped workers that cannot mutate a sibling should comment evidence on that sibling and block their own card with a `review-required:` reason; the project owner, not the worker, owns final closeout.
+
+### Done-project summaries
+
+Project owners should close terminal projects/boards with the canonical short semantic summary:
+
+```text
+✅ <Project/board> done
+- Project: <plain-English name of the thing that finished>
+- Measured return:
+  • <metric before → after, multiplier, time/cost saved, or other measured gain>
+- Delivered:
+  • <high-signal unmeasured outcome, only when important>
+- Follow-ups created — <shared status, e.g. all done / waiting / none>:
+  • <plain-English follow-up title, no internal task code>
+- Improvement ideas captured:
+  • <new backlog/PMB idea, only when one was captured>
+- State: <terminal board/project stats or remaining owner/unblock condition>
+```
+
+Put measurable return first when it exists. Do not include raw task tables, task IDs,
+assignee/status dumps, repeated per-row status words, or filler sections whose only
+content is "none"; durable details belong in Kanban/PMB artifacts and local reports.
+
+Use the deterministic scanner when you want that emitted automatically without an LLM loop:
+
+```bash
+hermes kanban done-summary --all-boards
+```
+
+The command stays silent unless it finds a terminal project/board whose fingerprint is not already in `<kanban-home>/kanban/done_project_summaries.json`. Use `--dry-run` to inspect without updating state, `--json` for machine-readable output, and `--write-report` to also save a local Markdown/JSON report under `~/.hermes/reports/`. In a no-agent cron job, stdout is the delivery surface: route it to the originating chat or home channel only when a gateway delivery target is configured; otherwise the saved local report is the audit trail.
+
+### Accepting-owner handoff contract
+
+Any handoff in a card body or durable comment should be written in a structured block that a human, dashboard, or diagnostics script can audit without guessing:
+
+```text
+Handoff:
+- from: <profile/task/person handing off>
+- to: <accepting owner profile/person/task>
+- accepted_by: <project owner/stage owner, or pending:<owner>>
+- next_action: <specific closeout, unblock, review, or dispatch step>
+- stale_after: <ISO timestamp or duration, e.g. 24h>
+- evidence: <diff, test output, report path, task/comment id, URL, or reason none exists>
+```
+
+Invalid handoffs are:
+
+- `review-required:` without an explicit `accepted_by:` project/stage owner. Review closeout belongs to the project owner; Alex is only the escalation target for truly human-only decisions.
+- `blocked` without an explicit accepting owner (`accepted_by:`), concrete `next_action:`, `stale_after:`, and `evidence:`.
+- `ready` without both an executable assignee and a named project owner.
+- A partial `Handoff:` block missing `from`, `to`, `accepted_by`, `next_action`, `stale_after`, or `evidence`.
+
+Recovery for old cards: run `hermes kanban diagnostics --ownership`, open each `invalid_handoff_contract` card with `hermes kanban show <task_id>`, add a comment containing the full `Handoff:` block above, and then use the authorized owner surface to move it forward. If it is a `review-required` coding card, the project owner should inspect the evidence and either complete it with `--summary "review accepted: ..."`, unblock/reassign it with exact requested changes, or leave it blocked with `accepted_by: pending:<project owner>`, a concrete `next_action`, `stale_after`, and `evidence`. Do not leave legacy blocked/ready cards as implicit handoffs to nobody.
+
 ## Boards (multi-project)
 
 Boards let you separate unrelated streams of work — one per project, repo,
