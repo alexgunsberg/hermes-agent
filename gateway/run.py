@@ -8845,6 +8845,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     # Record rate limit so subsequent messages are silently ignored
                     self.pairing_store._record_rate_limit(platform_name, source.user_id)
             return None
+
+        # Zero-prefix Telegram Kanban inbox. Bound topics/threads turn plain
+        # messages into native Kanban triage cards immediately, before the
+        # running-agent guard, so task dumping never waits behind an active
+        # conversation. Slash commands still pass through normally.
+        _kanban_inbox_reply = await self._maybe_handle_kanban_inbox_message(event)
+        if _kanban_inbox_reply is not None:
+            return _kanban_inbox_reply
         
         # Intercept messages that are responses to a pending /update prompt.
         # The update process (detached) wrote .update_prompt.json; the watcher

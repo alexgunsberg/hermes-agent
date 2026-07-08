@@ -19,6 +19,7 @@ import asyncio
 import dataclasses
 import hashlib
 import inspect
+import json
 import logging
 import os
 import re
@@ -85,6 +86,315 @@ def _model_switch_skew_guard() -> Optional[str]:
 
 class GatewaySlashCommandsMixin:
     """In-session slash-command handlers for GatewayRunner."""
+
+    # ------------------------------------------------------------------
+    # Zero-prefix Telegram → native Kanban inbox
+    # ------------------------------------------------------------------
+
+    def _kanban_inbox_bindings_path(self) -> Path:
+        """Profile-aware JSON store for topic/thread → Kanban inbox bindings."""
+        try:
+            from hermes_constants import get_hermes_home
+            return get_hermes_home() / "kanban_inbox_bindings.json"
+        except Exception:
+            return Path.home() / ".hermes" / "kanban_inbox_bindings.json"
+
+    def _load_kanban_inbox_bindings(self) -> dict[str, Any]:
+        path = self._kanban_inbox_bindings_path()
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except FileNotFoundError:
+            return {"version": 1, "bindings": []}
+        except Exception:
+            logger.warning("Failed to read kanban inbox bindings from %s", path, exc_info=True)
+            return {"version": 1, "bindings": []}
+        if not isinstance(data, dict):
+            return {"version": 1, "bindings": []}
+        bindings = data.get("bindings")
+        if not isinstance(bindings, list):
+            data["bindings"] = []
+        data.setdefault("version", 1)
+        return data
+
+    def _save_kanban_inbox_bindings(self, data: dict[str, Any]) -> None:
+        path = self._kanban_inbox_bindings_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_suffix(path.suffix + ".tmp")
+        tmp.write_text(json.dumps(data, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+        tmp.replace(path)
+
+    def _kanban_inbox_source_key(self, source) -> tuple[str, str, Optional[str]]:
+        platform = getattr(source, "platform", None)
+        platform_value = getattr(platform, "value", platform)
+        platform_str = str(platform_value or "").lower()
+        chat_id = str(getattr(source, "chat_id", "") or "")
+        thread_raw = getattr(source, "thread_id", None)
+        thread_id = str(thread_raw) if thread_raw not in (None, "") else None
+        return platform_str, chat_id, thread_id
+
+    def _find_kanban_inbox_binding(self, source) -> Optional[dict[str, Any]]:
+        platform_str, chat_id, thread_id = self._kanban_inbox_source_key(source)
+        if not platform_str or not chat_id:
+            return None
+        data = self._load_kanban_inbox_bindings()
+        for raw in data.get("bindings", []):
+            if not isinstance(raw, dict) or raw.get("enabled") is False:
+                continue
+            if str(raw.get("platform", "")).lower() != platform_str:
+                continue
+            if str(raw.get("chat_id", "")) != chat_id:
+                continue
+            raw_thread = raw.get("thread_id")
+            binding_thread = str(raw_thread) if raw_thread not in (None, "") else None
+            # Thread bindings are exact. Whole-chat bindings are possible but
+            # intentionally opt-in via thread_id=null; do not let a typo in one
+            # topic hijack every other topic.
+            if binding_thread != thread_id:
+                continue
+            return dict(raw)
+        return None
+
+    def _infer_kanban_inbox_kind_and_title(self, event: MessageEvent) -> tuple[str, str]:
+        text = (event.text or "").strip()
+        first_line = next((ln.strip() for ln in text.splitlines() if ln.strip()), "")
+        kind = "triage"
+        title_source = first_line
+        m = re.match(r"^(bug|issue|regression|task|todo|idea|someday|urgent)\s*[:\-–—]?\s*(.+)$", first_line, re.IGNORECASE)
+        if m:
+            raw_kind = m.group(1).lower()
+            title_source = m.group(2).strip()
+            kind = "task" if raw_kind in {"todo"} else raw_kind
+        elif re.search(r"\b(crash|crashes|freezes|broken|bug|error|fails|failure|regression)\b", text, re.IGNORECASE):
+            kind = "bug"
+        elif re.search(r"\b(add|create|implement|test|fix|make|update)\b", text, re.IGNORECASE):
+            kind = "task"
+        elif re.search(r"\b(idea|maybe|could|nice to have)\b", text, re.IGNORECASE):
+            kind = "idea"
+        if not title_source:
+            media_count = len(getattr(event, "media_urls", None) or [])
+            title_source = "Telegram media item" if media_count else "Telegram inbox item"
+        title = re.sub(r"\s+", " ", title_source).strip()
+        if len(title) > 110:
+            title = title[:107].rstrip() + "..."
+        return kind, title or "Telegram inbox item"
+
+    def _kanban_inbox_body(self, event: MessageEvent, binding: dict[str, Any], kind: str) -> str:
+        source = event.source
+        platform_str, chat_id, thread_id = self._kanban_inbox_source_key(source)
+        lines = [
+            "Captured from Telegram Kanban inbox.",
+            f"Kind: {kind}",
+            f"Board: {binding.get('board')}",
+            f"Chat: {chat_id}",
+        ]
+        if thread_id:
+            lines.append(f"Thread/topic: {thread_id}")
+        if getattr(event, "message_id", None):
+            lines.append(f"Message id: {event.message_id}")
+        if getattr(source, "user_name", None):
+            lines.append(f"Sender: {source.user_name}")
+        text = (event.text or "").strip()
+        if text:
+            lines.extend(["", "Message:", text])
+        if getattr(event, "reply_to_text", None):
+            lines.extend(["", "Replied-to context:", str(event.reply_to_text).strip()])
+        media_urls = list(getattr(event, "media_urls", None) or [])
+        media_types = list(getattr(event, "media_types", None) or [])
+        if media_urls:
+            lines.append("")
+            lines.append("Attachments:")
+            for i, url in enumerate(media_urls, 1):
+                typ = media_types[i - 1] if i - 1 < len(media_types) else "media"
+                lines.append(f"- {typ}: {url}")
+        return "\n".join(lines).strip()
+
+    async def _maybe_handle_kanban_inbox_message(self, event: MessageEvent) -> Optional[str]:
+        """Turn plain messages in bound Telegram topics into native Kanban cards.
+
+        This is the zero-prefix mobile path: in a mapped topic/thread, ordinary
+        text/voice/photo messages are control-plane intake, not conversational
+        prompts. Creating the card happens before the running-agent guard, so a
+        gym bug dump never waits behind a long active Hermes turn.
+        """
+        if getattr(event, "internal", False) or event.is_command():
+            return None
+        source = event.source
+        platform_str, chat_id, thread_id = self._kanban_inbox_source_key(source)
+        if platform_str != "telegram" or not chat_id:
+            return None
+        binding = self._find_kanban_inbox_binding(source)
+        if not binding:
+            return None
+        text = (event.text or "").strip()
+        media_urls = list(getattr(event, "media_urls", None) or [])
+        if not text and not media_urls:
+            return None
+        board = str(binding.get("board") or "general").strip().lower()
+        assignee = str(binding.get("assignee") or ("default" if board == "general" else board)).strip() or None
+        project = str(binding.get("project") or "").strip() or None
+        workspace = str(binding.get("workspace") or ("scratch" if board == "general" else "worktree")).strip() or "scratch"
+        if workspace not in {"scratch", "worktree", "dir"}:
+            workspace = "scratch"
+        kind, title = self._infer_kanban_inbox_kind_and_title(event)
+        body = self._kanban_inbox_body(event, binding, kind)
+        idem_parts = [platform_str, chat_id, thread_id or "", str(getattr(event, "message_id", "") or "")]
+        idempotency_key = "telegram-inbox:" + ":".join(idem_parts)
+
+        def _create() -> str:
+            from hermes_cli import kanban_db as _kb
+            conn = _kb.connect(board=board)
+            try:
+                task_id = _kb.create_task(
+                    conn,
+                    title=title,
+                    body=body,
+                    assignee=assignee,
+                    created_by="telegram-inbox",
+                    workspace_kind=workspace,
+                    project_id=project,
+                    triage=True,
+                    idempotency_key=idempotency_key,
+                    board=board,
+                )
+                user_id = str(getattr(source, "user_id", "") or "") or None
+                _kb.add_notify_sub(
+                    conn,
+                    task_id=task_id,
+                    platform=platform_str,
+                    chat_id=chat_id,
+                    thread_id=thread_id,
+                    user_id=user_id,
+                    notifier_profile=(
+                        getattr(self, "_kanban_notifier_profile", None)
+                        or getattr(self, "_active_profile_name", lambda: "default")()
+                    ),
+                )
+                return task_id
+            finally:
+                conn.close()
+
+        try:
+            task_id = await asyncio.to_thread(_create)
+        except Exception as exc:
+            logger.warning("Kanban inbox create failed", exc_info=True)
+            return f"⚠️ Kanban inbox failed to queue this message: {exc}"
+        return f"Queued `{task_id}` → `{board}` · `{kind}` · triage\n{title}"
+
+    async def _handle_kanban_inbox_command(self, event: MessageEvent, raw_args: str) -> str:
+        """Handle `/kanban inbox ...` management commands."""
+        tokens = shlex.split(raw_args) if raw_args else []
+        if not tokens or tokens[0] in {"help", "-h", "--help"}:
+            return (
+                "Kanban inbox maps this Telegram topic to zero-prefix card capture.\n\n"
+                "Usage:\n"
+                "`/kanban inbox bind general`\n"
+                "`/kanban inbox bind forgewod --assignee forgewod --project forgewod --workspace worktree`\n"
+                "`/kanban inbox status`\n"
+                "`/kanban inbox unbind`"
+            )
+        action = tokens[0]
+        source = event.source
+        platform_str, chat_id, thread_id = self._kanban_inbox_source_key(source)
+        if platform_str != "telegram" or not chat_id:
+            return "Kanban inbox binding is currently implemented for Telegram chats/topics."
+        if action in {"status", "list"}:
+            current = self._find_kanban_inbox_binding(source)
+            data = self._load_kanban_inbox_bindings()
+            lines = ["**Kanban inbox bindings**"]
+            lines.append(f"Current topic: `{chat_id}` / `{thread_id or 'whole-chat'}`")
+            if current:
+                lines.append(
+                    f"Current binding: `{current.get('board')}` → assignee `{current.get('assignee')}` "
+                    f"project `{current.get('project') or '-'}` workspace `{current.get('workspace') or '-'}`"
+                )
+            else:
+                lines.append("Current binding: none")
+            all_bindings = [b for b in data.get("bindings", []) if isinstance(b, dict)]
+            if all_bindings:
+                lines.append("")
+                lines.append("All bindings:")
+                for b in all_bindings:
+                    enabled = "on" if b.get("enabled") is not False else "off"
+                    lines.append(
+                        f"- `{enabled}` {b.get('platform')}:{b.get('chat_id')}:{b.get('thread_id') or '*'} "
+                        f"→ `{b.get('board')}` / `{b.get('assignee')}`"
+                    )
+            return "\n".join(lines)
+        if action == "unbind":
+            data = self._load_kanban_inbox_bindings()
+            before = len(data.get("bindings", []))
+            data["bindings"] = [
+                b for b in data.get("bindings", [])
+                if not (
+                    isinstance(b, dict)
+                    and str(b.get("platform", "")).lower() == platform_str
+                    and str(b.get("chat_id", "")) == chat_id
+                    and ((str(b.get("thread_id")) if b.get("thread_id") not in (None, "") else None) == thread_id)
+                )
+            ]
+            self._save_kanban_inbox_bindings(data)
+            removed = before - len(data.get("bindings", []))
+            return f"Removed {removed} Kanban inbox binding(s) for this topic."
+        if action != "bind":
+            return "Usage: `/kanban inbox bind <board>` or `/kanban inbox status`."
+        if len(tokens) < 2:
+            return "Usage: `/kanban inbox bind <board>`"
+        board = tokens[1].strip().lower()
+        try:
+            from hermes_cli import kanban_db as _kb
+            if not _kb.board_exists(board):
+                return f"Kanban board `{board}` does not exist. Create it first with `hermes kanban boards create {board}`."
+        except Exception:
+            logger.debug("kanban inbox board existence check skipped", exc_info=True)
+        opts: dict[str, str] = {}
+        i = 2
+        while i < len(tokens):
+            tok = tokens[i]
+            if tok.startswith("--"):
+                key = tok[2:].replace("-", "_")
+                if i + 1 < len(tokens) and not tokens[i + 1].startswith("--"):
+                    opts[key] = tokens[i + 1]
+                    i += 2
+                else:
+                    opts[key] = "true"
+                    i += 1
+            else:
+                i += 1
+        assignee = opts.get("assignee") or ("default" if board in {"general", "default"} else board)
+        project = opts.get("project") or (None if board in {"general", "default"} else board)
+        workspace = opts.get("workspace") or ("scratch" if board in {"general", "default"} else "worktree")
+        name = opts.get("name") or f"{board} inbox"
+        data = self._load_kanban_inbox_bindings()
+        bindings = [b for b in data.get("bindings", []) if isinstance(b, dict)]
+        new_binding = {
+            "platform": platform_str,
+            "chat_id": chat_id,
+            "thread_id": thread_id,
+            "board": board,
+            "assignee": assignee,
+            "project": project,
+            "workspace": workspace,
+            "name": name,
+            "enabled": True,
+            "created_at": int(time.time()),
+        }
+        replaced = False
+        for idx, b in enumerate(bindings):
+            b_thread = str(b.get("thread_id")) if b.get("thread_id") not in (None, "") else None
+            if str(b.get("platform", "")).lower() == platform_str and str(b.get("chat_id", "")) == chat_id and b_thread == thread_id:
+                bindings[idx] = new_binding
+                replaced = True
+                break
+        if not replaced:
+            bindings.append(new_binding)
+        data["bindings"] = bindings
+        self._save_kanban_inbox_bindings(data)
+        verb = "Updated" if replaced else "Bound"
+        return (
+            f"{verb} this Telegram topic as Kanban inbox → `{board}`.\n"
+            f"Plain messages here now queue triage cards immediately.\n"
+            f"Assignee: `{assignee}` · project: `{project or '-'}` · workspace: `{workspace}`"
+        )
 
     def _typed_command_prefix_for(self, platform) -> str:
         """Return the prefix users can always type to reach Hermes commands.
@@ -400,6 +710,9 @@ class GatewaySlashCommandsMixin:
         if text.startswith("kanban"):
             text = text[len("kanban"):].lstrip()
 
+        if text == "inbox" or text.startswith("inbox "):
+            return await self._handle_kanban_inbox_command(event, text[len("inbox"):].strip())
+
         tokens = shlex.split(text) if text else []
         requested_board = None
         action = None
@@ -453,7 +766,10 @@ class GatewaySlashCommandsMixin:
                                     platform=platform_str, chat_id=chat_id,
                                     thread_id=thread_id or None,
                                     user_id=user_id,
-                                    notifier_profile=getattr(self, "_kanban_notifier_profile", None) or self._active_profile_name(),
+                                    notifier_profile=(
+                                        getattr(self, "_kanban_notifier_profile", None)
+                                        or getattr(self, "_active_profile_name", lambda: "default")()
+                                    ),
                                 )
                             finally:
                                 conn.close()
