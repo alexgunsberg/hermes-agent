@@ -7,6 +7,8 @@ don't see an unexplained "credentials ✓" line when their .env is empty.
 
 from __future__ import annotations
 
+import logging
+import os
 import sys
 from pathlib import Path
 
@@ -219,6 +221,70 @@ def test_apply_external_secret_sources_records_onepassword_origin(tmp_path, monk
         env_loader.format_secret_source_suffix("ANTHROPIC_API_KEY")
         == " (from 1Password)"
     )
+
+
+def test_apply_external_secret_sources_discovers_plugin_source_before_apply(
+    tmp_path, monkeypatch, caplog
+):
+    """A plugin source named in secrets.sources is available on first load."""
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.delenv("PLUGIN_SECRET_API_KEY", raising=False)
+    plugin_dir = tmp_path / "plugins" / "fake-secret"
+    plugin_dir.mkdir(parents=True)
+    (plugin_dir / "plugin.yaml").write_text(
+        "name: fake-secret-source\n"
+        "version: '0.1.0'\n"
+        "kind: standalone\n",
+        encoding="utf-8",
+    )
+    (plugin_dir / "__init__.py").write_text(
+        "from agent.secret_sources.base import FetchResult, SecretSource\n"
+        "\n"
+        "class FakeSecretSource(SecretSource):\n"
+        "    name = 'plugsecret'\n"
+        "    label = 'Plugin Secret'\n"
+        "    shape = 'mapped'\n"
+        "    scheme = 'plug'\n"
+        "\n"
+        "    def fetch(self, cfg, home_path):\n"
+        "        result = FetchResult()\n"
+        "        result.secrets = {'PLUGIN_SECRET_API_KEY': 'plugin-secret-value'}\n"
+        "        return result\n"
+        "\n"
+        "def register(ctx):\n"
+        "    ctx.register_secret_source(FakeSecretSource())\n",
+        encoding="utf-8",
+    )
+    (tmp_path / "config.yaml").write_text(
+        "plugins:\n"
+        "  enabled:\n"
+        "    - fake-secret\n"
+        "    - fake-secret-source\n"
+        "secrets:\n"
+        "  sources:\n"
+        "    - plugsecret\n"
+        "  plugsecret:\n"
+        "    enabled: true\n",
+        encoding="utf-8",
+    )
+
+    from agent.secret_sources import registry as reg_module
+    from hermes_cli import plugins as plugins_mod
+
+    reg_module._reset_registry_for_tests()
+    plugins_mod._plugin_manager = plugins_mod.PluginManager()
+
+    try:
+        with caplog.at_level(logging.WARNING):
+            env_loader._apply_external_secret_sources(tmp_path)
+    finally:
+        plugins_mod._plugin_manager = None
+        reg_module._reset_registry_for_tests()
+        os.environ.pop("PLUGIN_SECRET_API_KEY", None)
+
+    assert env_loader.get_secret_source("PLUGIN_SECRET_API_KEY") == "plugsecret"
+    assert "unknown source(s): plugsecret" not in caplog.text
 
 
 def test_apply_external_secret_sources_survives_non_dict_section(tmp_path, monkeypatch):

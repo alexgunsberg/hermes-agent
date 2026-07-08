@@ -39,6 +39,58 @@ _SECRET_SOURCES: dict[str, str] = {}
 _APPLIED_HOMES: set[str] = set()
 
 
+def _discover_plugin_secret_sources_if_needed(home_path: Path, cfg: dict) -> None:
+    """Load enabled plugins before resolving plugin-provided secret sources.
+
+    ``load_hermes_dotenv()`` runs before the normal plugin discovery path in
+    several entrypoints.  Built-in secret sources are always registered by the
+    secret-source registry itself, but standalone plugin sources (for example a
+    mapped Proton Pass source) need one early discovery pass or the registry will
+    treat ``secrets.sources`` entries as unknown and skip them.  Keep this
+    targeted: only pay the plugin-discovery cost when the config actually names
+    or enables a source that is not already a bundled source.
+    """
+    if not isinstance(cfg, dict):
+        return
+
+    try:
+        from agent.secret_sources.registry import list_sources
+    except Exception:  # noqa: BLE001 — fail-open; apply_all will handle it later
+        return
+
+    known = {source.name for source in list_sources()}
+    needs_discovery = False
+
+    explicit = cfg.get("sources")
+    if isinstance(explicit, list):
+        needs_discovery = any(
+            isinstance(entry, str) and entry not in known for entry in explicit
+        )
+
+    if not needs_discovery:
+        for name, section in cfg.items():
+            if name == "sources" or name in known:
+                continue
+            if isinstance(section, dict) and section.get("enabled") is True:
+                needs_discovery = True
+                break
+
+    if not needs_discovery:
+        return
+
+    try:
+        from hermes_constants import reset_hermes_home_override, set_hermes_home_override
+        from hermes_cli.plugins import discover_plugins
+
+        token = set_hermes_home_override(home_path)
+        try:
+            discover_plugins()
+        finally:
+            reset_hermes_home_override(token)
+    except Exception:  # noqa: BLE001 — secret sources must never block startup
+        return
+
+
 def get_secret_source(env_var: str) -> str | None:
     """Return the label of the secret source that supplied ``env_var``, if any.
 
@@ -336,6 +388,8 @@ def _apply_external_secret_sources(home_path: Path) -> None:
         return
     if not cfg:
         return
+
+    _discover_plugin_secret_sources_if_needed(home_path, cfg)
 
     try:
         from agent.secret_sources.registry import apply_all
