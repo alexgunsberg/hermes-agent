@@ -256,9 +256,12 @@ _LEGACY_TOOLSET_MAP = {
 #
 # Invalidation happens transparently via the registry's _generation counter,
 # which bumps on register() / deregister() / register_toolset_alias(). The
-# inner check_fn TTL cache in registry.py handles environment drift (Docker
-# daemon start/stop, env var changes, etc.) on a 30 s horizon.
+# cache key also includes a coarse time bucket so the inner check_fn TTL cache
+# in registry.py can re-check environment drift (Docker daemon start/stop, env
+# var changes, vault-backed credentials becoming available) instead of being
+# masked indefinitely by this outer memo.
 _tool_defs_cache: Dict[tuple, List[Dict[str, Any]]] = {}
+_TOOL_DEFS_CHECK_FN_REFRESH_SECONDS = 30.0
 
 # Hard cap on memoized get_tool_definitions() results. A long-lived Gateway
 # process sees many distinct toolset/config fingerprints over its lifetime
@@ -304,10 +307,9 @@ def get_tool_definitions(
     # The cache key captures every argument-level input; the registry
     # generation captures registry mutations (MCP refresh, plugin load).
     # check_fn results are TTL-cached one level down, inside
-    # registry.get_definitions. The config-mtime fingerprint below captures
-    # user-visible config edits that affect dynamic schemas (execute_code
-    # mode, discord action allowlist, etc.) without needing an explicit
-    # invalidate hook on every config-writer.
+    # registry.get_definitions. Include the same coarse time horizon here so a
+    # quiet-mode cache hit cannot pin a credential-gated tool unavailable after
+    # the check_fn TTL would otherwise have re-probed.
     if quiet_mode:
         try:
             from hermes_cli.config import get_config_path
@@ -323,6 +325,7 @@ def get_tool_definitions(
             cfg_fp,
             bool(os.environ.get("HERMES_KANBAN_TASK")),
             bool(skip_tool_search_assembly),
+            int(time.monotonic() // _TOOL_DEFS_CHECK_FN_REFRESH_SECONDS),
         )
         cached = _tool_defs_cache.get(cache_key)
         if cached is not None:
