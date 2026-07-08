@@ -339,6 +339,39 @@ TOOLSETS = {
         "includes": ["web", "vision", "image_gen"]
     },
 
+    # Task-shaped presets. These are named, opt-in routing postures that keep
+    # the default/platform tool schema unchanged while giving CLI, cron, and
+    # worker callers small bundles for common task shapes.
+    "fast-no-tools": {
+        "description": "Fast reasoning-only posture with no model-callable tools",
+        "tools": [],
+        "includes": [],
+    },
+
+    "file-code": {
+        "description": "Lean local code/file posture: files, terminal, Python batch execution, todos, and skills",
+        "tools": [],
+        "includes": ["file", "terminal", "code_execution", "todo", "skills"],
+    },
+
+    "research": {
+        "description": "Read-only research posture: web, session recall, skill reading, and vision without terminal or file writes",
+        "tools": ["skills_list", "skill_view"],
+        "includes": ["web", "session_search", "vision", "x_search"],
+    },
+
+    "browser-automation": {
+        "description": "Browser automation posture with web lookup, vision, file artifacts, and todo planning",
+        "tools": [],
+        "includes": ["browser", "web", "vision", "file", "todo"],
+    },
+
+    "kanban-worker": {
+        "description": "Kanban worker posture: lifecycle handoff tools plus lean code/file execution and session recall",
+        "tools": [],
+        "includes": ["kanban", "file-code", "session_search"],
+    },
+
     # Coding posture (base Hermes — CLI/TUI/desktop/ACP). Auto-selected in a
     # code workspace; see agent/coding_context.py. Keeps everything you reach
     # for while pairing on code and drops the rest (messaging, tts, image_gen,

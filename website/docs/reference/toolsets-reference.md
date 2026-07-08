@@ -23,6 +23,8 @@ Every tool belongs to exactly one toolset. When you enable a toolset, all tools 
 ```bash
 hermes chat --toolsets web,file,terminal
 hermes chat --toolsets debugging        # composite — expands to file + terminal + web
+hermes chat --toolsets file-code        # task-shaped preset — lean local code/file work
+hermes -z --toolsets fast-no-tools "Draft a concise reply"
 hermes chat --toolsets all              # everything
 ```
 
@@ -53,10 +55,12 @@ Or in-session:
 | Toolset | Tools | Purpose |
 |---------|-------|---------|
 | `browser` | `browser_back`, `browser_cdp`, `browser_click`, `browser_console`, `browser_dialog`, `browser_get_images`, `browser_navigate`, `browser_press`, `browser_scroll`, `browser_snapshot`, `browser_type`, `browser_vision`, `web_search` | Core browser automation. Includes `web_search` as a fallback for quick lookups. `browser_cdp` and `browser_dialog` are gated at runtime — registered only when a CDP endpoint is reachable at session start (via `/browser connect`, `browser.cdp_url` config, Browserbase, or Camofox). `browser_dialog` works together with the `pending_dialogs` and `frame_tree` fields that `browser_snapshot` adds when a CDP supervisor is attached. |
+| `browser-automation` | composite (`browser` + `web` + `vision` + `file` + `todo`) | Browser interaction posture: navigation/click/type/screenshot, web lookup, vision, file artifacts, and task planning. No terminal or code execution. |
 | `clarify` | `clarify` | Ask the user a question when the agent needs clarification. |
 | `code_execution` | `execute_code` | Run Python scripts that call Hermes tools programmatically. |
 | `coding` | composite (`file` + `terminal` + `search` + `web` + `skills` + `browser` + `todo` + `memory` + `session_search` + `clarify` + `code_execution` + `delegation` + `vision`) | Coding-focused bundle for software work: file editing, terminal, search, web docs, skills, browser, delegate, and code execution. |
 | `cronjob` | `cronjob` | Schedule and manage recurring tasks. |
+| `cursor` | `cursor_agent` | Cursor Cloud Agent delegation. Requires `CURSOR_API_KEY`. |
 | `debugging` | composite (`file` + `terminal` + `web`) | Debug bundle — file, process/terminal, web extract/search. |
 | `delegation` | `delegate_task` | Spawn isolated subagent instances for parallel work. |
 | `discord` | `discord` | Core Discord text/embed/DM actions (gateway-only). Active on the `hermes-discord` toolset. |
@@ -64,14 +68,18 @@ Or in-session:
 | `feishu_doc` | `feishu_doc_read` | Read Feishu/Lark document content. Used by the Feishu document-comment intelligent-reply handler. |
 | `feishu_drive` | `feishu_drive_add_comment`, `feishu_drive_list_comments`, `feishu_drive_list_comment_replies`, `feishu_drive_reply_comment` | Feishu/Lark drive comment operations. Scoped to the comment agent; not exposed on `hermes-cli` or other messaging toolsets. |
 | `file` | `patch`, `read_file`, `search_files`, `write_file` | File reading, writing, searching, and editing. |
+| `file-code` | composite (`file` + `terminal` + `code_execution` + `todo` + `skills`) | Lean local code/file posture for repo work that does not need web, browser, delegation, cron, media, or memory writes. |
+| `fast-no-tools` | (none) | Reasoning-only posture. Use for classification, summarization, rewriting, short planning, or scripted `-z` calls where tool schemas would be pure overhead. In dispatcher-spawned Kanban workers, Hermes still appends the Kanban lifecycle tools so the worker can complete/block/heartbeat. |
 | `homeassistant` | `ha_call_service`, `ha_get_state`, `ha_list_entities`, `ha_list_services` | Smart home control via Home Assistant. Only available when `HASS_TOKEN` is set. |
 | `computer_use` | `computer_use` | Background desktop control via cua-driver — does not steal cursor/focus. Works with any tool-capable model. macOS, Windows, and Linux; requires `cua-driver` on `$PATH`. |
 | `context_engine` | (varies) | Runtime tools exposed by the active context-engine plugin (empty until a plugin populates it). |
 | `image_gen` | `image_generate` | Text-to-image generation via FAL.ai (with opt-in OpenAI / xAI backends). |
 | `video_gen` | `video_generate` | Text-to-video and image-to-video via plugin-registered backends (xAI Grok-Imagine, FAL.ai Veo 3.1 / Pixverse v6 / Kling O3). Pass `image_url` to animate an image; omit it for text-to-video. |
 | `kanban` | `kanban_block`, `kanban_comment`, `kanban_complete`, `kanban_create`, `kanban_heartbeat`, `kanban_link`, `kanban_list`, `kanban_show`, `kanban_unblock` | Multi-agent coordination tools. Registered for dispatcher-spawned task workers (`HERMES_KANBAN_TASK`) and for profiles that explicitly list the `kanban` toolset by name (the `all`/`*` wildcard does **not** enable it). Workers mark tasks done, block, heartbeat, comment, and create/link follow-up tasks; orchestrator profiles additionally get board-routing tools like list/unblock. |
+| `kanban-worker` | composite (`kanban` + `file-code` + `session_search`) | Scoped worker posture for Kanban cards: lifecycle handoff, file/code execution, todos/skills, and session recall. Outside dispatcher-spawned workers, Kanban schemas remain hidden unless the profile explicitly enables `kanban`. |
 | `memory` | `memory` | Persistent cross-session memory management. |
 | `project` | `project_create`, `project_list`, `project_switch` | Create and switch desktop [Projects](../user-guide/cli.md) (named, multi-folder workspaces). GUI / desktop sessions only. |
+| `research` | composite (`web` + `session_search` + skill read tools + `vision` + `x_search`) | Read-only research posture. Use for web/current information, X search when configured, past-session recall, skill reading, and image analysis without terminal, file writes, or skill editing. |
 | `safe` | `image_generate`, `vision_analyze`, `web_extract`, `web_search` (via `includes`) | Read-only research + media generation. No file writes, no terminal, no code execution. |
 | `search` | `web_search` | Web search only (without extract). |
 | `session_search` | `session_search` | Search past conversation sessions. |
@@ -116,6 +124,46 @@ Platform toolsets define the complete tool configuration for a deployment target
 | `hermes-homeassistant` | Same as `hermes-cli` (the Home Assistant tools are already present by default and activate when `HASS_TOKEN` is set). |
 | `hermes-webhook` | Same as `hermes-cli`. |
 | `hermes-gateway` | Internal gateway orchestrator toolset — union of every `hermes-<platform>` toolset; used when the gateway needs to accept any message source. |
+
+## Task-Shaped Routing Presets
+
+Task-shaped presets are ordinary toolsets, but their purpose is overhead control: pick the smallest schema that matches the task instead of sending the full platform bundle on every turn. They do not change the user's main model or provider; pair them with per-run model flags only when the caller explicitly wants that run to use a different model.
+
+Recommended presets:
+
+| Task shape | Toolset preset | Model routing | Where it belongs | Notes |
+|------------|----------------|---------------|------------------|-------|
+| Fast no-tools | `fast-no-tools` | Current profile model, or an explicit cheap/fast `--provider` + `--model` on one-shot commands | CLI alias, shell script, cron/script caller, or skill recipe | No always-on core tool. Best for classification, rewrite, short planning, and deterministic scripts. |
+| Web lookup | `web` | Current profile model by default; use a verification model per run only when needed | Existing core toolset; no new preset needed | Smallest current-information posture: search plus page extraction, with no file, terminal, browser, memory, or session schemas. |
+| File/code | `file-code` | Current coding model unless a one-shot command passes `--provider` / `--model` | Built-in composite toolset; optional CLI alias | Keeps file, terminal, code execution, todos, and skills; skips browser, delegation, cron, image/TTS, memory, and broad web schemas. |
+| Web research | `research` | Current model by default; use a research/verification model per run only when needed | Built-in composite toolset or research-profile config | Read-only web/session/skill-view/vision/X search posture; no terminal, file writes, or skill editing. |
+| Kanban worker | `kanban-worker` | Worker profile's configured model; dispatcher may override per card | Kanban card/worker config | Dispatcher-spawned workers always get lifecycle tools; this preset scopes the rest of the schema. |
+| Browser automation | `browser-automation` | Current model; choose a vision-capable model only for visual tasks | Built-in composite toolset, browser-specific skill, or explicit `--toolsets` | Browser tools are backend/credential gated; no terminal or code execution. |
+
+
+Footprint placement rule:
+
+- Use `--toolsets <preset>` for one-off CLI/TUI/API calls.
+- Use cron/job `enabled_toolsets` for recurring work; prefer script-only no-agent cron when no reasoning is needed.
+- Use profile/platform config only when a surface is dedicated to that task shape.
+- Use a skill when the routing is procedural guidance rather than a new tool bundle.
+- Do not add a new always-on core model tool for a preset; these are schema filters over existing tools.
+
+Prompt-schema impact on this checkout, measured by serializing OpenAI tool schemas from `get_tool_definitions(..., quiet_mode=True)` and using `bytes / 4` as a rough token proxy:
+
+| Representative routing | Available tools | Schema bytes | Rough schema tokens | Reduction vs `hermes-cli` |
+|------------------------|-----------------|--------------|---------------------|---------------------------|
+| `hermes-cli` | 31 | 58,102 | ~14,526 | baseline |
+| `fast-no-tools` outside Kanban | 0 | 2 | ~0 | ~100% |
+| `web` | 2 | 1,862 | ~466 | ~97% |
+| `file-code` | 11 | 21,569 | ~5,392 | ~63% |
+| `research` | 7 | 11,010 | ~2,752 | ~81% |
+| `browser-automation` | 18 | 15,972 | ~3,993 | ~73% |
+| `kanban-worker` outside dispatcher | 12 | 27,432 | ~6,858 | ~53% |
+| `kanban-worker` in dispatcher env | 19 | 40,829 | ~10,207 | ~43% vs dispatcher `hermes-cli` |
+
+
+Exact counts vary with configured credentials, plugins, MCP servers, and runtime gates. The rollback path is simple: stop passing the preset (or remove it from profile/job config) and Hermes falls back to the existing platform toolset.
 
 ## Dynamic Toolsets
 

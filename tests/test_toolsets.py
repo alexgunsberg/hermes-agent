@@ -118,6 +118,41 @@ class TestResolveMultipleToolsets:
         assert resolve_multiple_toolsets([]) == []
 
 
+class TestTaskShapedToolsets:
+    def test_fast_no_tools_is_empty_and_valid(self):
+        assert validate_toolset("fast-no-tools") is True
+        assert resolve_toolset("fast-no-tools") == []
+
+    def test_web_is_existing_minimal_lookup_posture(self):
+        tools = set(resolve_toolset("web"))
+        assert tools == {"web_search", "web_extract"}
+
+    def test_file_code_is_lean_local_code_posture(self):
+        tools = set(resolve_toolset("file-code"))
+        assert {"read_file", "patch", "terminal", "process", "execute_code", "todo"}.issubset(tools)
+        assert "web_search" not in tools
+        assert "browser_navigate" not in tools
+        assert "delegate_task" not in tools
+
+    def test_research_is_read_only_no_terminal_or_file_writes(self):
+        tools = set(resolve_toolset("research"))
+        assert {"web_search", "web_extract", "session_search", "skill_view", "vision_analyze"}.issubset(tools)
+        assert "terminal" not in tools
+        assert "write_file" not in tools
+        assert "patch" not in tools
+        assert "skill_manage" not in tools
+
+    def test_browser_automation_keeps_browser_but_not_terminal(self):
+        tools = set(resolve_toolset("browser-automation"))
+        assert {"browser_navigate", "browser_click", "web_search", "vision_analyze", "read_file"}.issubset(tools)
+        assert "terminal" not in tools
+        assert "execute_code" not in tools
+
+    def test_worker_presets_compose_from_existing_toolsets(self):
+        kanban_worker = set(resolve_toolset("kanban-worker"))
+        assert {"kanban_show", "kanban_complete", "read_file", "terminal", "session_search"}.issubset(kanban_worker)
+
+
 class TestValidateToolset:
     def test_valid(self):
         assert validate_toolset("web") is True
