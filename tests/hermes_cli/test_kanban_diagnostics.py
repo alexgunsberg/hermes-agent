@@ -54,12 +54,14 @@ def _event(kind, ts=None, **payload):
     }
 
 
-def _run(outcome="completed", run_id=1, error=None):
-    return {
+def _run(outcome="completed", run_id=1, error=None, **overrides):
+    base = {
         "id": run_id,
         "outcome": outcome,
         "error": error,
     }
+    base.update(overrides)
+    return base
 
 
 # ---------------------------------------------------------------------------
@@ -88,6 +90,233 @@ def test_hallucinated_cards_fires_on_blocked_event():
     kinds = [a.kind for a in d.actions]
     assert "comment" in kinds
     assert "reassign" in kinds
+
+
+def test_ownership_audit_flags_missing_ledger_only_when_enabled():
+    task = _task(
+        title="implement governance",
+        body="Build the feature",
+        created_at=100,
+        goal_mode=True,
+    )
+    assert kd.compute_task_diagnostics(task, [], [], now=200) == []
+
+    diags = kd.compute_task_diagnostics(
+        task, [], [], now=200, config={"ownership_audit": True}
+    )
+    missing = [d for d in diags if d.kind == "missing_ownership_ledger"]
+    assert len(missing) == 1
+    assert "task owner" in missing[0].data["missing"]
+    assert "stage owner" in missing[0].data["missing"]
+
+
+def test_ownership_audit_flags_non_goal_work_cards():
+    task = _task(
+        title="review Cursor refactor",
+        body=(
+            "Ownership:\n- Task owner: a\n- Project owner: b\n"
+            "- Kanban owner: c\n- Stage owner: reviewer\n- Escalation target: human"
+        ),
+        created_at=100,
+        goal_mode=False,
+    )
+    diags = kd.compute_task_diagnostics(
+        task, [], [], now=200, config={"ownership_audit": True}
+    )
+    assert any(d.kind == "non_goal_work_card" for d in diags)
+
+
+def test_ownership_audit_flags_unbounded_cursor_cards():
+    task = _task(
+        title="Cursor refactor auth flow",
+        body=(
+            "Ownership:\n- Task owner: worker\n- Project owner: owner\n"
+            "- Kanban owner: board\n- Stage owner: reviewer\n"
+            "- Escalation target: Alex\n"
+            "Ask Cursor to improve auth."
+        ),
+        created_at=100,
+        goal_mode=True,
+    )
+    diags = kd.compute_task_diagnostics(
+        task, [], [], now=200, config={"ownership_audit": True}
+    )
+    cursor = [d for d in diags if d.kind == "unbounded_cursor_workflow"]
+    assert len(cursor) == 1
+    assert "bounded_scope" in cursor[0].data["missing"]
+    assert "acceptance_criteria" in cursor[0].data["missing"]
+    assert "auto_create_pr_false" in cursor[0].data["missing"]
+
+
+def test_ownership_audit_accepts_bounded_cursor_completion_with_hermes_evidence():
+    task = _task(
+        title="Cursor refactor auth flow",
+        status="done",
+        body=(
+            "Ownership:\n- Task owner: worker\n- Project owner: owner\n"
+            "- Kanban owner: board\n- Stage owner: reviewer\n"
+            "- Escalation target: Alex\n"
+            "Cursor bounded-work checklist:\n"
+            "- scope: single file auth.py\n"
+            "- acceptance criteria: tests pass and auth diff is minimal\n"
+            "- model: composer-2.5\n"
+            "- auto_create_pr=false\n"
+            "- role: advisory review lane; Hermes owns final verification\n"
+            "- evidence: changed_files and tests_run in metadata\n"
+            "- Hermes verification: inspect git diff and pytest output"
+        ),
+        created_at=100,
+        goal_mode=True,
+    )
+    runs = [
+        _run(
+            run_id=7,
+            summary="Hermes verification complete: reviewed Cursor diff and tests passed.",
+            metadata={
+                "changed_files": ["auth.py"],
+                "tests_run": ["scripts/run_tests.sh tests/test_auth.py"],
+                "verified_by_hermes": True,
+            },
+            ended_at=180,
+        )
+    ]
+    diags = kd.compute_task_diagnostics(
+        task, [], runs, now=200, config={"ownership_audit": True}
+    )
+    assert [d for d in diags if d.kind == "unbounded_cursor_workflow"] == []
+
+
+def test_ownership_audit_flags_done_cursor_card_without_diff_test_evidence():
+    task = _task(
+        title="Cursor review lane auth flow",
+        status="done",
+        body=(
+            "Cursor bounded-work checklist:\n"
+            "- scope: auth.py\n"
+            "- acceptance criteria: improve readability\n"
+            "- auto_create_pr=false\n"
+            "- role: advisory; Hermes verification before done"
+        ),
+        created_at=100,
+        goal_mode=True,
+    )
+    runs = [_run(run_id=8, summary="Looks good", metadata={}, ended_at=180)]
+    diags = kd.compute_task_diagnostics(
+        task, [], runs, now=200, config={"ownership_audit": True}
+    )
+    cursor = [d for d in diags if d.kind == "unbounded_cursor_workflow"]
+    assert len(cursor) == 1
+    assert "diff_or_changed_files_evidence" in cursor[0].data["missing"]
+    assert "test_or_verification_output" in cursor[0].data["missing"]
+
+
+def test_ownership_audit_flags_review_required_without_acceptance():
+    task = _task(
+        status="blocked",
+        body=(
+            "Ownership:\n- Task owner: worker\n- Project owner: t_project\n"
+            "- Kanban owner: t_board\n- Stage owner: reviewer\n"
+            "- Escalation target: Alex"
+        ),
+        created_at=100,
+    )
+    events = [_event("blocked", ts=150, reason="review-required: inspect diff")]
+    diags = kd.compute_task_diagnostics(
+        task, events, [], now=200, config={"ownership_audit": True}
+    )
+    invalid = [d for d in diags if d.kind == "invalid_handoff_contract"]
+    assert len(invalid) == 1
+    assert "review_required_without_project_owner_acceptance" in invalid[0].data["violations"]
+    assert "blocked_without_next_action" in invalid[0].data["violations"]
+    assert "blocked_without_stale_after" in invalid[0].data["violations"]
+    assert "blocked_without_evidence" in invalid[0].data["violations"]
+
+
+def test_ownership_audit_flags_blocked_cards_without_accepting_owner_contract():
+    task = _task(
+        status="blocked",
+        body=(
+            "Ownership:\n- Task owner: worker\n- Project owner: t_project\n"
+            "- Kanban owner: t_board\n- Stage owner: reviewer\n"
+            "- Escalation target: Alex"
+        ),
+        created_at=100,
+    )
+    events = [_event("blocked", ts=150, reason="waiting for non-human dependency")]
+    diags = kd.compute_task_diagnostics(
+        task, events, [], now=200, config={"ownership_audit": True}
+    )
+    invalid = [d for d in diags if d.kind == "invalid_handoff_contract"]
+
+    assert len(invalid) == 1
+    assert invalid[0].data["violations"] == [
+        "blocked_without_accepting_owner",
+        "blocked_without_next_action",
+        "blocked_without_stale_after",
+        "blocked_without_evidence",
+    ]
+
+
+def test_ownership_audit_flags_review_status_without_accepting_owner_contract():
+    task = _task(
+        status="review",
+        body=(
+            "Ownership:\n- Task owner: worker\n- Project owner: t_project\n"
+            "- Kanban owner: t_board\n- Stage owner: reviewer\n"
+            "- Escalation target: Alex"
+        ),
+        created_at=100,
+    )
+    diags = kd.compute_task_diagnostics(
+        task, [], [], now=200, config={"ownership_audit": True}
+    )
+    invalid = [d for d in diags if d.kind == "invalid_handoff_contract"]
+
+    assert len(invalid) == 1
+    assert "review_required_without_project_owner_acceptance" in invalid[0].data["violations"]
+    assert "blocked_without_next_action" in invalid[0].data["violations"]
+
+
+def test_ownership_audit_accepts_structured_review_handoff():
+    task = _task(
+        status="blocked",
+        body=(
+            "Ownership:\n- Task owner: worker\n- Project owner: t_project\n"
+            "- Kanban owner: t_board\n- Stage owner: reviewer\n"
+            "- Escalation target: Alex\n\n"
+            "Handoff:\n- from: worker\n- to: t_project\n"
+            "- accepted_by: t_project\n"
+            "- next_action: complete reviewed sibling via CLI\n"
+            "- stale_after: 24h\n- evidence: tests passed"
+        ),
+        created_at=100,
+    )
+    events = [_event("blocked", ts=150, reason="review-required: inspect diff")]
+    diags = kd.compute_task_diagnostics(
+        task, events, [], now=200, config={"ownership_audit": True}
+    )
+    assert [d for d in diags if d.kind == "invalid_handoff_contract"] == []
+
+
+def test_ownership_audit_flags_ready_without_accepting_owner():
+    task = _task(
+        status="ready",
+        assignee=None,
+        body=(
+            "Ownership:\n- Task owner: pending\n- Kanban owner: t_board\n"
+            "- Stage owner: implementer\n- Escalation target: Alex"
+        ),
+        created_at=100,
+    )
+    diags = kd.compute_task_diagnostics(
+        task, [], [], now=200, config={"ownership_audit": True}
+    )
+    invalid = [d for d in diags if d.kind == "invalid_handoff_contract"]
+    assert len(invalid) == 1
+    assert invalid[0].data["violations"] == [
+        "ready_without_assignee",
+        "ready_without_project_owner",
+    ]
 
 
 def test_hallucinated_cards_clears_on_subsequent_completion():

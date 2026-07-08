@@ -11,9 +11,12 @@ Run with:  python -m pytest tests/test_delegate.py -v
 
 import json
 import os
+import sys
 import threading
 import time
 import unittest
+import builtins
+import types
 from unittest.mock import MagicMock, patch
 
 from tools.delegate_tool import (
@@ -134,6 +137,47 @@ class TestDelegateRequirements(unittest.TestCase):
         )
         self.assertIn(f"up to {_get_max_concurrent_children()}", fn["description"])
         self.assertIn(f"max_spawn_depth={_get_max_spawn_depth()}", fn["description"])
+
+    def test_schema_config_load_does_not_import_cli_when_cold(self):
+        """Cold schema assembly must not import cli.py.
+
+        Importing cli.py from delegate_task's dynamic schema path triggers the
+        full CLI/env/secret-source bootstrap for normal sessions that merely
+        advertise delegation, causing multi-second cold latency before any
+        delegate_task call is made.
+        """
+        from tools.delegate_tool import _build_dynamic_schema_overrides
+
+        imported_cli = []
+        real_import = builtins.__import__
+
+        def recording_import(name, *args, **kwargs):
+            if name == "cli":
+                imported_cli.append(name)
+            return real_import(name, *args, **kwargs)
+
+        with patch.object(builtins, "__import__", side_effect=recording_import):
+            overrides = _build_dynamic_schema_overrides()
+
+        self.assertIn("description", overrides)
+        self.assertEqual(imported_cli, [])
+
+    def test_load_config_uses_loaded_cli_config_without_importing_cli(self):
+        """Interactive CLI still wins when cli.py is already loaded."""
+        from tools.delegate_tool import _load_config
+
+        sentinel = object()
+        old_cli = sys.modules.get("cli", sentinel)
+        fake_cli = types.ModuleType("cli")
+        setattr(fake_cli, "CLI_CONFIG", {"delegation": {"max_concurrent_children": 7}})
+        sys.modules["cli"] = fake_cli
+        try:
+            self.assertEqual(_load_config().get("max_concurrent_children"), 7)
+        finally:
+            if old_cli is sentinel:
+                sys.modules.pop("cli", None)
+            elif isinstance(old_cli, types.ModuleType):
+                sys.modules["cli"] = old_cli
 
 
 class TestChildSystemPrompt(unittest.TestCase):

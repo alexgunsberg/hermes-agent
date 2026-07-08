@@ -2326,6 +2326,7 @@ class BasePlatformAdapter(ABC):
         self.config = config
         self.platform = platform
         self._message_handler: Optional[MessageHandler] = None
+        self._pre_session_handler: Optional[Callable[["MessageEvent"], Awaitable[Optional[str]]]] = None
         # Optional hook (e.g. Telegram DM topic recovery) that rewrites
         # ``event.source.thread_id`` before session keying. Returns the
         # corrected thread_id or None to leave the source untouched.
@@ -2773,6 +2774,19 @@ class BasePlatformAdapter(ABC):
         an optional response string.
         """
         self._message_handler = handler
+
+    def set_pre_session_handler(
+        self,
+        handler: Optional[Callable[["MessageEvent"], Awaitable[Optional[str]]]],
+    ) -> None:
+        """Install a handler that may consume an event before session locking.
+
+        This is for lightweight gateway-control intake, such as zero-prefix
+        Kanban inbox topics.  It runs after topic recovery but before the
+        active-session guard, so the handler must perform its own authorization
+        checks before creating side effects.
+        """
+        self._pre_session_handler = handler
 
     def set_topic_recovery_fn(
         self,
@@ -4600,6 +4614,30 @@ class BasePlatformAdapter(ABC):
         # downstream delivery all agree on the same lane.
         # Offloaded: the sync hook must not block the loop.
         await asyncio.to_thread(self._apply_topic_recovery, event)
+
+        pre_session_handler = getattr(self, "_pre_session_handler", None)
+        if pre_session_handler is not None:
+            try:
+                response = await pre_session_handler(event)
+            except Exception as e:
+                logger.error("[%s] Pre-session handler failed: %s", self.name, e, exc_info=True)
+                response = None
+            _text, _eph_ttl = self._unwrap_ephemeral(response)
+            if _text:
+                _thread_meta = _thread_metadata_for_source(event.source, _reply_anchor_for_event(event))
+                _r = await self._send_with_retry(
+                    chat_id=event.source.chat_id,
+                    content=_text,
+                    reply_to=_reply_anchor_for_event(event),
+                    metadata=_mark_notify_metadata(_thread_meta),
+                )
+                if _eph_ttl > 0 and _r.success and _r.message_id:
+                    self._schedule_ephemeral_delete(
+                        chat_id=event.source.chat_id,
+                        message_id=_r.message_id,
+                        ttl_seconds=_eph_ttl,
+                    )
+                return
 
         session_key = build_session_key(
             event.source,

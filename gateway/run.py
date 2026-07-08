@@ -6937,6 +6937,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             
             # Set up message + fatal error handlers
             adapter.set_message_handler(self._handle_message)
+            adapter.set_pre_session_handler(self._handle_kanban_inbox_capture)
             adapter.set_fatal_error_handler(self._handle_adapter_fatal_error)
             adapter.set_session_store(self.session_store)
             adapter.set_busy_session_handler(self._handle_active_session_busy_message)
@@ -7773,6 +7774,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         continue
 
                     adapter.set_message_handler(self._handle_message)
+                    adapter.set_pre_session_handler(self._handle_kanban_inbox_capture)
                     adapter.set_fatal_error_handler(self._handle_adapter_fatal_error)
                     adapter.set_session_store(self.session_store)
                     adapter.set_busy_session_handler(self._handle_active_session_busy_message)
@@ -8453,6 +8455,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             adapter.set_message_handler(
                 self._make_profile_message_handler(profile_name)
             )
+            adapter.set_pre_session_handler(
+                self._make_profile_pre_session_handler(profile_name)
+            )
             adapter.set_fatal_error_handler(self._handle_adapter_fatal_error)
             adapter.set_session_store(self.session_store)
             adapter.set_busy_session_handler(self._handle_active_session_busy_message)
@@ -8485,6 +8490,46 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 pass
             return await self._handle_message(event)
         return _handler
+
+    def _make_profile_pre_session_handler(self, profile_name: str):
+        """Return a pre-session handler that stamps source.profile first."""
+        async def _handler(event):
+            try:
+                if getattr(event, "source", None) is not None and not event.source.profile:
+                    event.source.profile = profile_name
+            except Exception:
+                pass
+            return await self._handle_kanban_inbox_capture(event)
+        return _handler
+
+    async def _handle_kanban_inbox_capture(self, event) -> Optional[str]:
+        """Capture plain messages in bound zero-prefix Kanban inbox topics."""
+        source = getattr(event, "source", None)
+        if source is None or getattr(event, "internal", False):
+            return None
+        if getattr(event, "is_command", lambda: False)():
+            return None
+        try:
+            if not self._is_user_authorized(source):
+                return None
+        except Exception:
+            logger.debug("Kanban inbox auth check failed", exc_info=True)
+            return None
+        try:
+            from hermes_cli.kanban_inbox import capture_inbox_message
+            result = await asyncio.to_thread(
+                capture_inbox_message,
+                event,
+                profile=getattr(source, "profile", None),
+                notifier_profile=getattr(source, "profile", None) or self._active_profile_name(),
+            )
+        except Exception:
+            logger.warning("Kanban inbox capture failed", exc_info=True)
+            return None
+        if not result:
+            return None
+        receipt = result.get("receipt") if isinstance(result, dict) else None
+        return receipt if isinstance(receipt, str) else None
 
     @staticmethod
     def _adapter_credential_fingerprint(adapter: Any) -> Optional[str]:

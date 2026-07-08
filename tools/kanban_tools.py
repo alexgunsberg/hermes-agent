@@ -881,7 +881,10 @@ def _handle_create(args: dict, **kw) -> str:
         return tool_error(
             f"skills must be a list of skill names, got {type(skills).__name__}"
         )
-    goal_mode, goal_bool_error = _parse_bool_arg(args, "goal_mode")
+    default_goal_mode = not (triage or str(initial_status) == "blocked")
+    goal_mode, goal_bool_error = _parse_bool_arg(
+        args, "goal_mode", default=default_goal_mode
+    )
     if goal_bool_error:
         return tool_error(goal_bool_error)
     goal_max_turns = args.get("goal_max_turns")
@@ -1529,7 +1532,8 @@ KANBAN_CREATE_SCHEMA = {
                     "complete (or the goal-turn budget is exhausted, which "
                     "blocks the task for human review). Use this for "
                     "open-ended cards where one shot rarely finishes the "
-                    "work. Defaults to false (classic single-shot worker)."
+                    "work. Defaults to true for normal work cards and false "
+                    "for triage / initially-blocked human gates."
                 ),
             },
             "goal_max_turns": {

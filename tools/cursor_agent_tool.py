@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import base64
 import json
+import logging
 import os
 import time
 import urllib.error
@@ -23,6 +24,10 @@ from tools.registry import registry
 
 API_BASE = "https://api.cursor.com"
 TERMINAL_STATUSES = {"FINISHED", "ERROR", "CANCELLED", "EXPIRED"}
+_ENV_SOURCES_ATTEMPTED = False
+_ENV_SOURCES_LAST_ATTEMPT = 0.0
+_ENV_SOURCES_RETRY_SECONDS = 30.0
+logger = logging.getLogger(__name__)
 
 
 class CursorAgentError(RuntimeError):
@@ -48,18 +53,58 @@ def _load_env_file(path: Path) -> None:
         return
 
 
+def _load_configured_secret_sources() -> None:
+    """Best-effort Hermes env/secret-source load for direct tool execution.
+
+    Normal Hermes entrypoints load .env and discover plugins before tools are
+    exposed. Direct source probes and some short-lived subprocesses can import
+    this tool before a plugin-provided SecretSource (for example Proton Pass) is
+    registered, so the old fallback only saw plaintext ~/.hermes/.env values.
+    This guarded path loads configured plugins, resets the once-per-home secret
+    cache, and lets load_hermes_dotenv resolve mapped secret sources without
+    printing secret values.
+    """
+    global _ENV_SOURCES_ATTEMPTED, _ENV_SOURCES_LAST_ATTEMPT
+    now = time.monotonic()
+    if _ENV_SOURCES_ATTEMPTED:
+        if os.environ.get("CURSOR_API_KEY", "").strip():
+            return
+        if now - _ENV_SOURCES_LAST_ATTEMPT < _ENV_SOURCES_RETRY_SECONDS:
+            return
+    _ENV_SOURCES_ATTEMPTED = True
+    _ENV_SOURCES_LAST_ATTEMPT = now
+    try:
+        from hermes_constants import get_hermes_home
+        from hermes_cli.env_loader import load_hermes_dotenv, reset_secret_source_cache
+        from hermes_cli.plugins import discover_plugins
+
+        discover_plugins()
+        reset_secret_source_cache()
+        load_hermes_dotenv(hermes_home=get_hermes_home())
+    except Exception:
+        logger.debug("cursor_agent secret-source bootstrap failed", exc_info=True)
+        return
+
+
 def _cursor_api_key() -> str:
     key = os.environ.get("CURSOR_API_KEY", "").strip()
     if key:
         return key
+
+    _load_configured_secret_sources()
+    key = os.environ.get("CURSOR_API_KEY", "").strip()
+    if key:
+        return key
+
     # Hermes loads profile env in many paths, but direct tests/tool runs may not.
-    # Fall back to the default profile's .env because Alex stored the key there.
+    # Fall back to the default Hermes home .env for plain-env setups that do not
+    # use configured secret sources.
     _load_env_file(Path.home() / ".hermes" / ".env")
     key = os.environ.get("CURSOR_API_KEY", "").strip()
     if key:
         return key
     raise CursorAgentError(
-        "CURSOR_API_KEY is not configured. Put it in ~/.hermes/.env or the active process environment."
+        "CURSOR_API_KEY is not configured. Put it in ~/.hermes/.env, a configured secret source, or the active process environment."
     )
 
 
@@ -140,14 +185,18 @@ def _create(args: Dict[str, Any]) -> Dict[str, Any]:
     prompt = str(args.get("prompt") or "").strip()
     if not prompt:
         raise CursorAgentError("prompt is required for action='create'.")
+    model = str(args.get("model") or "composer-2.5").strip()
+    auto_create_pr = args.get("auto_create_pr")
+    if auto_create_pr is None:
+        auto_create_pr = False
     body = _clean_dict(
         {
             "prompt": {"text": prompt},
-            "model": _model_obj(args.get("model", ""), args.get("model_params")),
+            "model": _model_obj(model, args.get("model_params")),
             "name": args.get("name"),
             "repos": _build_repos(args.get("repo_url", ""), args.get("starting_ref", ""), args.get("pr_url", "")),
             "workOnCurrentBranch": args.get("work_on_current_branch"),
-            "autoCreatePR": args.get("auto_create_pr"),
+            "autoCreatePR": auto_create_pr,
             "skipReviewerRequest": args.get("skip_reviewer_request"),
             "mode": args.get("mode"),
             "env": args.get("env"),
@@ -342,9 +391,10 @@ def _handle_cursor_agent(args: Dict[str, Any], **_: Any) -> Dict[str, Any]:
 CURSOR_AGENT_SCHEMA = {
     "name": "cursor_agent",
     "description": (
-        "Delegate bounded repo/code tasks to Cursor Cloud Agents via Cursor's API; "
+        "Delegate bounded, advisory repo/code tasks to Cursor Cloud Agents via Cursor's API; "
         "list Cursor models, create agents/runs, follow up, poll, wait, or stream results. "
-        "Requires CURSOR_API_KEY. This is not a chat-completions model provider."
+        "Hermes must verify Cursor diffs/tests before accepting work. Requires CURSOR_API_KEY. "
+        "This is not a chat-completions model provider."
     ),
     "parameters": {
         "type": "object",
@@ -365,7 +415,7 @@ CURSOR_AGENT_SCHEMA = {
                 "default": "list_models",
             },
             "prompt": {"type": "string", "description": "Task prompt for create/followup."},
-            "model": {"type": "string", "description": "Cursor model ID from list_models, e.g. composer-2.5."},
+            "model": {"type": "string", "description": "Cursor model ID from list_models; defaults to composer-2.5."},
             "model_params": {"type": "array", "items": {"type": "object"}},
             "name": {"type": "string", "description": "Optional display name for a new agent."},
             "repo_url": {"type": "string", "description": "GitHub repo URL for a cloud agent workspace."},
@@ -375,7 +425,7 @@ CURSOR_AGENT_SCHEMA = {
             "client_agent_id": {"type": "string", "description": "Optional idempotency ID for create (bc-uuid)."},
             "run_id": {"type": "string", "description": "Cursor run ID (run-...)."},
             "mode": {"type": "string", "enum": ["agent", "plan"]},
-            "auto_create_pr": {"type": "boolean"},
+            "auto_create_pr": {"type": "boolean", "description": "Whether Cursor should create a PR automatically. Defaults to false; keep false unless explicitly requested."},
             "skip_reviewer_request": {"type": "boolean"},
             "work_on_current_branch": {"type": "boolean"},
             "env": {"type": "object", "description": "Cursor env selection object, e.g. {type: 'cloud', name: '...'}"},

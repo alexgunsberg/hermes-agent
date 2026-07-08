@@ -16,6 +16,8 @@ Every conversation — whether from the CLI, Telegram, Discord, Slack, WhatsApp,
 
 1. **SQLite database** (`~/.hermes/state.db`) — structured session metadata with FTS5 full-text search, plus full message history
 
+Hermes has unified storage, not unified live surface state. Desktop/API session cards, CLI sessions, and Telegram topics can all read and write the same canonical session store, but each live surface still keeps its own routing key and UI state. Telegram topics are routing endpoints for a chat/thread, not automatic mirrors of Desktop or API-server session cards. A Desktop/API session appears in Telegram only after an explicit handoff or resume/binding action.
+
 The SQLite database stores:
 - Session ID, source platform, user ID
 - **Session title** (unique, human-readable name)
@@ -171,6 +173,8 @@ Session IDs follow the format `YYYYMMDD_HHMMSS_<hex>` — CLI/TUI sessions use a
 ## Cross-Platform Handoff
 
 Use `/handoff <platform>` from a CLI session to transfer the live conversation to a messaging platform's home channel. The agent picks up exactly where the CLI left off — same session id, full role-aware transcript, tool calls and all.
+
+This is the explicit bridge between surfaces: it does not make Telegram a full session-sidebar clone. It binds one Telegram/Discord/Slack/etc. routing endpoint to the existing session so replies in that endpoint continue the same transcript.
 
 ```bash
 # Inside a CLI session

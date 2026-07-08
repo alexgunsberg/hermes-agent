@@ -1305,6 +1305,22 @@ def _is_channel_dm_topic(
     return is_channel
 
 
+def _format_cron_delivery_content(job: dict, content: str) -> str:
+    """Format cron output for chat without operational wrapper noise.
+
+    Cron run IDs, schedules, prompts, and full stdout are already persisted in
+    the cron output directory. Delivery channels — especially mobile chat — get
+    only the job's human-facing output. Individual scripts/agents are expected
+    to emit semantic summaries; raw metrics and manage/stop boilerplate stay in
+    logs/reports unless explicitly requested.
+    """
+    body = str(content or "").strip()
+    if body:
+        return body
+    task_name = str(job.get("name") or "cron job").strip()
+    return f"{task_name} ran.\n\n- Action: none"
+
+
 def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Optional[str]:
     """
     Deliver job output to the configured target(s) (origin chat, specific platform, etc.).
@@ -1353,15 +1369,7 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
         pass
 
     if wrap_response:
-        task_name = job.get("name", job["id"])
-        job_id = job.get("id", "")
-        delivery_content = (
-            f"Cronjob Response: {task_name}\n"
-            f"(job_id: {job_id})\n"
-            f"-------------\n\n"
-            f"{content}\n\n"
-            f"To stop or manage this job, send me a new message (e.g. \"stop reminder {task_name}\")."
-        )
+        delivery_content = _format_cron_delivery_content(job, content)
     else:
         delivery_content = content
 

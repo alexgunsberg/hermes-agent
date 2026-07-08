@@ -184,6 +184,8 @@ hermes sessions prune       Clean up old sessions (--older-than N days)
 hermes sessions stats       Session store statistics
 ```
 
+Cross-surface session model: Hermes has unified storage, not unified live surface state. CLI, Desktop/API-server, Telegram, and other gateway surfaces store transcripts in the profile's canonical `state.db`, but each live surface has its own routing key and UI state. Telegram topics are routing endpoints, not automatic mirrors of Desktop/API session cards. Use `/handoff telegram` from a live CLI session, or the documented resume/binding path for the target gateway surface, when a conversation should intentionally move to Telegram; do not turn Telegram into a full session-sidebar clone.
+
 ### Cron Jobs
 
 ```

@@ -19,6 +19,7 @@ never the child's intermediate tool calls or reasoning.
 import enum
 import json
 import logging
+import sys
 
 logger = logging.getLogger(__name__)
 import os
@@ -3100,17 +3101,26 @@ def _resolve_delegation_credentials(cfg: dict, parent_agent) -> dict:
 def _load_config() -> dict:
     """Load delegation config from CLI_CONFIG or persistent config.
 
-    Checks the runtime config (cli.py CLI_CONFIG) first, then falls back
-    to the persistent config (hermes_cli/config.py load_config()) so that
-    ``delegation.model`` / ``delegation.provider`` are picked up regardless
-    of the entry point (CLI, gateway, cron).
+    Checks the runtime config (cli.py CLI_CONFIG) first when cli.py is already
+    loaded, then falls back to the persistent config (hermes_cli/config.py
+    load_config()) so that ``delegation.model`` / ``delegation.provider`` are
+    picked up regardless of the entry point (CLI, gateway, cron).
+
+    Do NOT import ``cli`` from here. Delegate's dynamic schema builder runs
+    during normal tool-schema discovery; importing ``cli`` on that path pulls in
+    the full CLI startup stack and profile secret-source bootstrap even when
+    the user is not invoking delegation. If the CLI module is already resident,
+    use its in-memory config; otherwise the lightweight persistent loader is
+    enough for schema text and non-CLI entrypoints.
     """
     try:
-        from cli import CLI_CONFIG
-
-        cfg = CLI_CONFIG.get("delegation") or {}
-        if cfg:
-            return cfg
+        cli_mod = sys.modules.get("cli")
+        if cli_mod is not None:
+            cli_config = getattr(cli_mod, "CLI_CONFIG", None)
+            if isinstance(cli_config, dict):
+                cfg = cli_config.get("delegation") or {}
+                if cfg:
+                    return cfg
     except Exception:
         pass
     try:

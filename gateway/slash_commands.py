@@ -401,6 +401,37 @@ class GatewaySlashCommandsMixin:
             text = text[len("kanban"):].lstrip()
 
         tokens = shlex.split(text) if text else []
+        if tokens and tokens[0] == "inbox":
+            def _has_option(*names: str) -> bool:
+                return any(tok in names or any(tok.startswith(name + "=") for name in names) for tok in tokens)
+
+            source = event.source
+            platform = getattr(getattr(source, "platform", None), "value", getattr(source, "platform", ""))
+            profile = getattr(source, "profile", None) or self._active_profile_name()
+            if not _has_option("--profile"):
+                tokens.extend(["--profile", str(profile or "default")])
+            subaction = tokens[1] if len(tokens) > 1 else "status"
+            if subaction == "bind":
+                binding_name = tokens[2] if len(tokens) > 2 and not tokens[2].startswith("-") else "inbox"
+                if not _has_option("--platform") and platform:
+                    tokens.extend(["--platform", str(platform).lower()])
+                if not _has_option("--chat-id") and getattr(source, "chat_id", None):
+                    tokens.extend(["--chat-id", str(source.chat_id)])
+                if not _has_option("--thread-id") and getattr(source, "thread_id", None):
+                    tokens.extend(["--thread-id", str(source.thread_id)])
+                if not _has_option("--assignee"):
+                    assignee = "default" if binding_name in {"default", "general"} else binding_name
+                    tokens.extend(["--assignee", assignee])
+            elif subaction == "unbind":
+                has_name = len(tokens) > 2 and not tokens[2].startswith("-")
+                if not has_name and not _has_option("--chat-id") and getattr(source, "chat_id", None):
+                    if not _has_option("--platform") and platform:
+                        tokens.extend(["--platform", str(platform).lower()])
+                    tokens.extend(["--chat-id", str(source.chat_id)])
+                    if not _has_option("--thread-id") and getattr(source, "thread_id", None):
+                        tokens.extend(["--thread-id", str(source.thread_id)])
+            text = shlex.join(tokens)
+
         requested_board = None
         action = None
         i = 0

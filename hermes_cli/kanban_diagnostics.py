@@ -974,6 +974,425 @@ def _rule_stranded_in_ready(task, events, runs, now, cfg) -> list[Diagnostic]:
     )]
 
 
+_OWNER_LEDGER_MARKERS = (
+    "ownership:",
+    "task owner:",
+    "project owner:",
+    "kanban owner:",
+    "stage owner:",
+    "escalation target:",
+)
+
+_HANDOFF_CONTRACT_FIELDS = (
+    "from:",
+    "to:",
+    "accepted_by:",
+    "next_action:",
+    "stale_after:",
+    "evidence:",
+)
+
+
+def _rule_missing_ownership_ledger(task, events, runs, now, cfg) -> list[Diagnostic]:
+    """Active cards should carry the three-level ownership ledger.
+
+    The ledger is convention-backed rather than schema-backed on purpose:
+    older boards and cards can be audited immediately by parsing the card
+    body, while future DB fields remain an additive optimization rather than
+    a prerequisite for board health checks.
+    """
+    status = _task_field(task, "status")
+    if not cfg.get("ownership_audit"):
+        return []
+    if status in {"done", "archived"}:
+        return []
+    text = f"{_task_field(task, 'body', '') or ''}".casefold()
+    missing = [m[:-1] for m in _OWNER_LEDGER_MARKERS if m not in text]
+    if not missing:
+        return []
+    task_id = _task_field(task, "id", "")
+    return [Diagnostic(
+        kind="missing_ownership_ledger",
+        severity="warning",
+        title="Task is missing three-level ownership metadata",
+        detail=(
+            "Every active Kanban mission card should name a task owner, "
+            "project owner, Kanban owner, stage owner, and escalation target. Missing: "
+            + ", ".join(missing)
+        ),
+        actions=[DiagnosticAction(
+            kind="comment",
+            label="Add task/project/Kanban owner ledger",
+            suggested=True,
+        )],
+        first_seen_at=int(_task_field(task, "created_at", now) or now),
+        last_seen_at=now,
+        count=len(missing),
+        data={"task_id": task_id, "missing": missing},
+    )]
+
+
+def _latest_handoff_payload(events: Iterable[Any]) -> dict:
+    """Return the latest block-style payload that represents a handoff."""
+    latest = None
+    for ev in events:
+        if _event_kind(ev) in {"blocked", "dependency_wait", "block_loop_detected"}:
+            if latest is None or _event_ts(ev) >= _event_ts(latest):
+                latest = ev
+    return _parse_payload(latest) if latest is not None else {}
+
+
+def _rule_invalid_handoff_contract(task, events, runs, now, cfg) -> list[Diagnostic]:
+    """Flag active cards whose ownership handoff cannot be accepted.
+
+    This is deliberately a diagnostics-only rule (gated by ``--ownership``)
+    rather than a schema migration: old boards can be audited and repaired
+    in-place, while normal kanban reads stay fast and quiet.
+    """
+    if not cfg.get("ownership_audit"):
+        return []
+    status = _task_field(task, "status")
+    if status in {"done", "archived", "triage"}:
+        return []
+
+    body = str(_task_field(task, "body", "") or "")
+    text = body.casefold()
+    task_id = _task_field(task, "id", "")
+    assignee = (_task_field(task, "assignee", None) or "").strip()
+    payload = _latest_handoff_payload(events)
+    reason = str(payload.get("reason") or _task_field(task, "result", "") or "")
+    reason_text = reason.casefold()
+    combined = f"{text}\n{reason_text}"
+
+    violations: list[str] = []
+    missing_fields: list[str] = []
+
+    if status == "ready":
+        if not assignee:
+            violations.append("ready_without_assignee")
+        if "project owner:" not in text:
+            violations.append("ready_without_project_owner")
+
+    if status in {"blocked", "review"}:
+        if "accepted_by:" not in text:
+            if status == "review" or "review-required" in combined:
+                violations.append("review_required_without_project_owner_acceptance")
+            else:
+                violations.append("blocked_without_accepting_owner")
+        if "next_action:" not in text:
+            violations.append("blocked_without_next_action")
+        if "stale_after:" not in text:
+            violations.append("blocked_without_stale_after")
+        if "evidence:" not in text:
+            violations.append("blocked_without_evidence")
+
+    handoff_present = (
+        "handoff:" in text
+        or "accepting-owner" in text
+        or any(field in text for field in _HANDOFF_CONTRACT_FIELDS)
+    )
+    if handoff_present:
+        missing_fields = [field[:-1] for field in _HANDOFF_CONTRACT_FIELDS if field not in text]
+
+    if not violations and not missing_fields:
+        return []
+
+    labels = violations + [f"handoff_missing_{field}" for field in missing_fields]
+    return [Diagnostic(
+        kind="invalid_handoff_contract",
+        severity="warning",
+        title="Task has an unaccepted or incomplete handoff",
+        detail=(
+            "Accepting-owner handoffs must name from, to, accepted_by, "
+            "next_action, stale_after, and evidence. Invalid states include "
+            "review-required without project-owner acceptance, blocked cards "
+            "without accepting owner / next_action / stale_after / evidence, "
+            "and ready cards without an assignee "
+            "or project owner. Violations: " + ", ".join(labels)
+        ),
+        actions=[DiagnosticAction(
+            kind="comment",
+            label="Add accepting-owner handoff contract",
+            suggested=True,
+            payload={
+                "template": (
+                    "Handoff:\n"
+                    "- from: <profile/task>\n"
+                    "- to: <accepting owner>\n"
+                    "- accepted_by: <project/stage owner or pending>\n"
+                    "- next_action: <specific unblock/closeout step>\n"
+                    "- stale_after: <ISO time or duration>\n"
+                    "- evidence: <diff/test/report/comment link>"
+                )
+            },
+        )],
+        first_seen_at=int(_task_field(task, "created_at", now) or now),
+        last_seen_at=now,
+        count=len(labels),
+        data={
+            "task_id": task_id,
+            "violations": violations,
+            "missing_fields": missing_fields,
+        },
+    )]
+
+
+_WORK_CARD_KEYWORDS = (
+    "implement",
+    "review",
+    "orchestrat",
+    "project owner",
+    "cursor",
+    "refactor",
+    "fix ",
+    "build ",
+)
+
+
+_CURSOR_TASK_MARKERS = (
+    "cursor_agent",
+    "cloud agent",
+    "composer-2.5",
+    "ask cursor",
+    "delegate to cursor",
+    "using cursor",
+    "cursor review lane",
+    "cursor refactor",
+    "cursor lane",
+)
+_CURSOR_SCOPE_MARKERS = (
+    "scope:",
+    "bounded scope",
+    "narrow scope",
+    "one subsystem",
+    "single subsystem",
+    "single file",
+    "starting_ref",
+    "starting ref",
+    "repo_url",
+)
+_CURSOR_ACCEPTANCE_MARKERS = ("acceptance criteria", "done criteria", "acceptance:")
+_CURSOR_HERMES_VERIFY_MARKERS = (
+    "hermes verification",
+    "hermes verifies",
+    "hermes checking",
+    "hermes checks",
+    "verify diffs",
+    "verify tests",
+    "verified_by_hermes",
+)
+_CURSOR_ADVISORY_MARKERS = (
+    "advisory",
+    "not authoritative",
+    "not authority",
+    "on-demand muscle",
+    "review lane",
+    "refactor lane",
+)
+_CURSOR_NO_AUTO_PR_MARKERS = (
+    "auto_create_pr=false",
+    "autocreatepr=false",
+    "auto create pr false",
+    "auto-create pr false",
+    "no auto pr",
+    "do not create pr",
+    "without creating a pr",
+)
+_CURSOR_DIFF_EVIDENCE_MARKERS = (
+    "changed_files",
+    "files_changed",
+    "git diff",
+    "diff",
+    "patch",
+)
+_CURSOR_TEST_EVIDENCE_MARKERS = (
+    "tests_run",
+    "tests passed",
+    "test output",
+    "scripts/run_tests.sh",
+    "pytest",
+)
+
+
+def _has_any(text: str, markers: Iterable[str]) -> bool:
+    return any(marker in text for marker in markers)
+
+
+def _compact(text: str) -> str:
+    return "".join(ch for ch in text.casefold() if ch.isalnum())
+
+
+def _json_text(value: Any) -> str:
+    try:
+        return json.dumps(value, ensure_ascii=False, sort_keys=True, default=str)
+    except Exception:
+        return str(value)
+
+
+def _latest_run_completion_text(runs: Iterable[Any]) -> str:
+    latest = None
+    for run in runs:
+        if latest is None:
+            latest = run
+            continue
+        latest_key = (
+            int(_task_field(latest, "ended_at", 0) or 0),
+            int(_task_field(latest, "id", 0) or 0),
+        )
+        run_key = (
+            int(_task_field(run, "ended_at", 0) or 0),
+            int(_task_field(run, "id", 0) or 0),
+        )
+        if run_key >= latest_key:
+            latest = run
+    if latest is None:
+        return ""
+    parts = [
+        _task_field(latest, "summary", ""),
+        _task_field(latest, "result", ""),
+        _task_field(latest, "error", ""),
+        _json_text(_task_field(latest, "metadata", "")),
+    ]
+    return "\n".join(str(p) for p in parts if p)
+
+
+def _events_payload_text(events: Iterable[Any]) -> str:
+    return "\n".join(_json_text(_parse_payload(ev)) for ev in events)
+
+
+def _rule_cursor_bounded_workflow(task, events, runs, now, cfg) -> list[Diagnostic]:
+    """Cursor cards must remain bounded advisory lanes with Hermes evidence."""
+    if not cfg.get("ownership_audit"):
+        return []
+    status = _task_field(task, "status")
+    if status in {"archived", "triage"}:
+        return []
+
+    title = str(_task_field(task, "title", "") or "")
+    body = str(_task_field(task, "body", "") or "")
+    spec_text = f"{title}\n{body}".casefold()
+    compact_spec = _compact(spec_text)
+    if not (_has_any(spec_text, _CURSOR_TASK_MARKERS) or "cursoragent" in compact_spec):
+        return []
+
+    missing: list[str] = []
+    if not _has_any(spec_text, _CURSOR_SCOPE_MARKERS):
+        missing.append("bounded_scope")
+    if not _has_any(spec_text, _CURSOR_ACCEPTANCE_MARKERS):
+        missing.append("acceptance_criteria")
+    if not _has_any(spec_text, _CURSOR_HERMES_VERIFY_MARKERS):
+        missing.append("hermes_verification_step")
+    if not _has_any(spec_text, _CURSOR_ADVISORY_MARKERS):
+        missing.append("advisory_not_authoritative")
+    if not (
+        _has_any(spec_text, _CURSOR_NO_AUTO_PR_MARKERS)
+        or "autocreateprfalse" in compact_spec
+        or "autoprfalse" in compact_spec
+    ):
+        missing.append("auto_create_pr_false")
+
+    completion_text = (
+        spec_text
+        + "\n"
+        + _latest_run_completion_text(runs).casefold()
+        + "\n"
+        + _events_payload_text(events).casefold()
+    )
+    compact_completion = _compact(completion_text)
+    if status == "done":
+        if not _has_any(completion_text, _CURSOR_DIFF_EVIDENCE_MARKERS):
+            missing.append("diff_or_changed_files_evidence")
+        if not _has_any(completion_text, _CURSOR_TEST_EVIDENCE_MARKERS):
+            missing.append("test_or_verification_output")
+        if not (
+            _has_any(completion_text, _CURSOR_HERMES_VERIFY_MARKERS)
+            or "verifiedbyhermes" in compact_completion
+        ):
+            missing.append("hermes_checked_completion")
+    else:
+        if "evidence:" not in spec_text and "verification:" not in spec_text:
+            missing.append("planned_evidence_field")
+
+    if not missing:
+        return []
+
+    task_id = _task_field(task, "id", "")
+    return [Diagnostic(
+        kind="unbounded_cursor_workflow",
+        severity="warning",
+        title="Cursor card lacks bounded advisory workflow evidence",
+        detail=(
+            "Cursor is an on-demand advisory review/refactor lane, not an "
+            "always-on authority. Cursor cards must specify bounded scope, "
+            "acceptance criteria, auto_create_pr=false unless explicitly requested, "
+            "and Hermes-verifiable diff/test evidence before completion. Missing: "
+            + ", ".join(missing)
+        ),
+        actions=[DiagnosticAction(
+            kind="comment",
+            label="Add bounded Cursor checklist and Hermes verification evidence",
+            suggested=True,
+            payload={
+                "template": (
+                    "Cursor bounded-work checklist:\n"
+                    "- scope: <single subsystem/files/branch>\n"
+                    "- acceptance criteria: <Hermes-verifiable checks>\n"
+                    "- model: composer-2.5 unless explicitly overridden\n"
+                    "- auto_create_pr: false\n"
+                    "- role: advisory; Hermes owns final verification\n"
+                    "- evidence: <git diff/changed_files + tests_run/test output>\n"
+                    "- Hermes verification: <who checked diffs/tests before done>"
+                )
+            },
+        )],
+        first_seen_at=int(_task_field(task, "created_at", now) or now),
+        last_seen_at=now,
+        count=len(missing),
+        data={"task_id": task_id, "missing": missing},
+    )]
+
+
+def _rule_non_goal_work_card(task, events, runs, now, cfg) -> list[Diagnostic]:
+    """Implementation/review/orchestration cards should run in goal mode."""
+    status = _task_field(task, "status")
+    if not cfg.get("ownership_audit"):
+        return []
+    if status in {"done", "archived", "triage"}:
+        return []
+    text = f"{_task_field(task, 'title', '')} {_task_field(task, 'body', '')}".casefold()
+    if status == "blocked" and (
+        "human gate" in text or "needs_input" in text or "captcha" in text
+    ):
+        return []
+    if bool(_task_field(task, "goal_mode", False)):
+        return []
+    if not any(word in text for word in _WORK_CARD_KEYWORDS):
+        return []
+    task_id = _task_field(task, "id", "")
+    return [Diagnostic(
+        kind="non_goal_work_card",
+        severity="warning",
+        title="Work card is not running in goal mode",
+        detail=(
+            "Implementation, review, Cursor, refactor, and orchestration "
+            "cards should be created with --goal unless the card is an "
+            "explicit human gate or triage item."
+        ),
+        actions=[DiagnosticAction(
+            kind="cli_hint",
+            label="Recreate or edit the card as a goal-mode task",
+            payload={
+                "command": f"hermes kanban show {task_id}" if task_id else "hermes kanban list"
+            },
+            suggested=True,
+        )],
+        first_seen_at=int(_task_field(task, "created_at", now) or now),
+        last_seen_at=now,
+        count=1,
+        data={"task_id": task_id},
+    )]
+
+
 # Registry — order matters: rules higher on the list render first when
 # severity ties. Add new rules here.
 _RULES: list[RuleFn] = [
@@ -985,6 +1404,10 @@ _RULES: list[RuleFn] = [
     _rule_stuck_in_blocked,
     _rule_block_unblock_cycling,
     _rule_stranded_in_ready,
+    _rule_missing_ownership_ledger,
+    _rule_invalid_handoff_contract,
+    _rule_cursor_bounded_workflow,
+    _rule_non_goal_work_card,
 ]
 
 
@@ -999,6 +1422,10 @@ DIAGNOSTIC_KINDS = (
     "stuck_in_blocked",
     "block_unblock_cycling",
     "stranded_in_ready",
+    "missing_ownership_ledger",
+    "invalid_handoff_contract",
+    "unbounded_cursor_workflow",
+    "non_goal_work_card",
 )
 
 
@@ -1014,6 +1441,10 @@ DEFAULT_CONFIG = {
     # signal is dominated by tasks that are about to be claimed on the
     # next dispatcher tick (default 60s) and would just be noise.
     "stranded_threshold_seconds": 30 * 60,
+    # Opt-in governance audit. Enabled by `hermes kanban diagnostics --ownership`
+    # so existing boards/tests do not suddenly emit ownership-policy warnings
+    # unless the operator is deliberately running the ownership check.
+    "ownership_audit": False,
 }
 
 
