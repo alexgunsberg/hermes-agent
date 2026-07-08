@@ -307,7 +307,7 @@ class TestPruneStaleDmTopicBindingHelper:
 
 
 # ---------------------------------------------------------------------------
-# Source-level wiring guards — both fallback sites must call the helper
+# Source-level wiring guards — both missing-thread sites must call the helper
 # ---------------------------------------------------------------------------
 
 
@@ -322,22 +322,21 @@ class TestThreadNotFoundFallbackSitesPruneBinding:
         from plugins.platforms.telegram import adapter as telegram_mod
 
         src = inspect.getsource(telegram_mod.TelegramAdapter.send)
-        # Locate the second-failure branch (the one that flips
-        # ``used_thread_fallback``).  It must invoke the prune
-        # helper before flipping the flag.
-        marker = "retrying without message_thread_id"
+        # Locate the second-failure branch (the one that moves from transient
+        # retry to fail-loud). It must invoke the prune helper before returning
+        # failure.
+        marker = "refusing to deliver without message_thread_id"
         idx = src.find(marker)
         assert idx != -1, (
             "Streaming send must keep its 'thread not found' "
-            "fallback log line — the prune wiring is anchored "
+            "fail-loud log line — the prune wiring is anchored "
             "next to it."
         )
         # 600 char window is enough to cover the warning, the
-        # prune call, and the ``used_thread_fallback = True``
-        # assignment that follows.
+        # prune call, and the fail-loud SendResult that follows.
         window = src[idx:idx + 600]
         assert "_prune_stale_dm_topic_binding" in window, (
-            "Streaming send 'Thread not found' fallback must call "
+            "Streaming send 'Thread not found' failure must call "
             "_prune_stale_dm_topic_binding so the stale row in "
             "telegram_dm_topic_bindings doesn't keep redirecting "
             "future inbound messages to the deleted topic (#31501)."
@@ -358,14 +357,12 @@ class TestThreadNotFoundFallbackSitesPruneBinding:
             "BadRequest('Thread not found') for a control message "
             "(#31501)."
         )
-        # Belt-and-braces: the call must precede the retry
-        # ``send_message`` so the prune happens whether or not
-        # the retry itself succeeds.
+        # Belt-and-braces: the call must precede the fail-loud exception.
         prune_idx = src.find("_prune_stale_dm_topic_binding")
-        retry_idx = src.find("send_message(**retry_kwargs)")
-        assert 0 <= prune_idx < retry_idx, (
+        fail_idx = src.rfind("raise RuntimeError")
+        assert 0 <= prune_idx < fail_idx, (
             "_prune_stale_dm_topic_binding must run before the "
-            "fallback send_message retry."
+            "fail-loud missing-thread error."
         )
 
 

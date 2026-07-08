@@ -373,8 +373,8 @@ async def test_send_typing_falls_back_without_thread_on_bad_request():
 
 
 @pytest.mark.asyncio
-async def test_send_retries_without_thread_on_thread_not_found():
-    """When message_thread_id keeps failing, retry once then fall back."""
+async def test_send_fails_loud_after_topic_thread_not_found():
+    """When message_thread_id keeps failing, do not leak into General/root."""
     adapter = _make_adapter()
 
     call_log = []
@@ -394,15 +394,13 @@ async def test_send_retries_without_thread_on_thread_not_found():
         metadata={"thread_id": "99999"},
     )
 
-    assert result.success is True
-    assert result.message_id == "42"
-    assert result.raw_response["requested_thread_id"] == 99999
-    assert result.raw_response["thread_fallback"] is True
-    # First two calls keep the configured thread, then final fallback drops it.
-    assert len(call_log) == 3
+    assert result.success is False
+    assert result.retryable is False
+    assert "refusing to deliver without message_thread_id" in (result.error or "")
+    # First two calls keep the configured thread; no final root/General send.
+    assert len(call_log) == 2
     assert call_log[0]["message_thread_id"] == 99999
     assert call_log[1]["message_thread_id"] == 99999
-    assert call_log[2]["message_thread_id"] is None
 
 
 @pytest.mark.asyncio
@@ -1479,7 +1477,7 @@ async def test_send_marks_pool_timeout_retryable_after_exhaustion():
 
 @pytest.mark.asyncio
 async def test_thread_fallback_only_fires_once():
-    """After clearing thread_id, subsequent chunks should also use None."""
+    """An invalid first chunk stops before any root/General fallback chunks."""
     adapter = _make_adapter()
 
     call_log = []
@@ -1501,11 +1499,12 @@ async def test_thread_fallback_only_fires_once():
         metadata={"thread_id": "99999"},
     )
 
-    assert result.success is True
-    # First chunk: attempt with thread → fail → retry without → succeed
-    # Second chunk: should use thread_id=None directly (effective_thread_id
-    # was cleared per-chunk but the metadata doesn't change between chunks)
-    # The key point: the message was delivered despite the invalid thread
+    assert result.success is False
+    assert result.retryable is False
+    assert "refusing to deliver without message_thread_id" in (result.error or "")
+    assert len(call_log) == 2
+    assert call_log[0]["message_thread_id"] == 99999
+    assert call_log[1]["message_thread_id"] == 99999
 
 
 @pytest.mark.asyncio

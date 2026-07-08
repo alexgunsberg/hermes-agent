@@ -1366,44 +1366,34 @@ class TestSendTelegramThreadIdMapping:
         kwargs = bot.send_message.await_args.kwargs
         assert "message_thread_id" not in kwargs
 
-    def test_thread_not_found_retries_without_message_thread_id(self, monkeypatch):
-        """When send_message raises "thread not found", retry without thread_id (#27012)."""
+    def test_thread_not_found_fails_without_root_retry(self, monkeypatch):
+        """When send_message raises "thread not found", do not retry in root."""
         bot = self._make_bot()
         _install_telegram_mock(monkeypatch, bot)
 
-        # First call raises thread-not-found, second succeeds
-        bot.send_message = AsyncMock(side_effect=[
-            Exception("Bad Request: message thread not found"),
-            SimpleNamespace(message_id=2),
-        ])
+        bot.send_message = AsyncMock(side_effect=Exception("Bad Request: message thread not found"))
 
-        asyncio.run(
+        result = asyncio.run(
             _send_telegram("tok", "-1001234567890", "hello", thread_id="17585")
         )
 
-        assert bot.send_message.await_count == 2
-        # First call: should include message_thread_id=17585
+        assert "error" in result
+        assert "refusing to deliver without message_thread_id" in result["error"]
+        assert bot.send_message.await_count == 1
         call1_kwargs = bot.send_message.await_args_list[0].kwargs
         assert call1_kwargs["message_thread_id"] == 17585
-        # Second call (retry): should NOT include message_thread_id
-        call2_kwargs = bot.send_message.await_args_list[1].kwargs
-        assert "message_thread_id" not in call2_kwargs
 
-    def test_thread_not_found_for_media_retries_without_message_thread_id(self, monkeypatch, tmp_path):
-        """Media send with stale thread_id retries without it (#27012)."""
+    def test_thread_not_found_for_media_fails_without_root_retry(self, monkeypatch, tmp_path):
+        """Media send with stale thread_id must not retry in root."""
         bot = self._make_bot()
-        # Mock send_document to fail with thread-not-found, then succeed
-        bot.send_document = AsyncMock(side_effect=[
-            Exception("Bad Request: message thread not found"),
-            SimpleNamespace(message_id=3),
-        ])
+        bot.send_document = AsyncMock(side_effect=Exception("Bad Request: message thread not found"))
         _install_telegram_mock(monkeypatch, bot)
 
         # Create a test file
         test_file = tmp_path / "doc.txt"
         test_file.write_text("test content")
 
-        asyncio.run(
+        result = asyncio.run(
             _send_telegram(
                 "tok", "-1001234567890", "",
                 media_files=[(str(test_file), False)],
@@ -1411,13 +1401,11 @@ class TestSendTelegramThreadIdMapping:
             )
         )
 
-        assert bot.send_document.await_count == 2
-        # First call: should include message_thread_id=17585
+        assert "error" in result
+        assert "refusing to deliver without message_thread_id" in result["error"]
+        assert bot.send_document.await_count == 1
         call1_kwargs = bot.send_document.await_args_list[0].kwargs
         assert call1_kwargs["message_thread_id"] == 17585
-        # Second call (retry): should NOT include message_thread_id
-        call2_kwargs = bot.send_document.await_args_list[1].kwargs
-        assert "message_thread_id" not in call2_kwargs
 
 
 # ---------------------------------------------------------------------------
@@ -3285,7 +3273,7 @@ class TestCheckSendMessage:
 
 
 class TestSendTelegramThreadNotFoundRetry:
-    """Tests for thread-not-found retry behaviour in _send_telegram (#27012)."""
+    """Tests for thread-not-found fail-loud behaviour in _send_telegram."""
 
     def test_is_thread_not_found_matches_expected_errors(self):
         """_is_telegram_thread_not_found should detect thread-not-found errors."""
@@ -3299,16 +3287,13 @@ class TestSendTelegramThreadNotFoundRetry:
         assert _is_telegram_thread_not_found(FakeError("parse error")) is False
         assert _is_telegram_thread_not_found(FakeError("")) is False
 
-    def test_text_send_retries_without_thread_id_on_thread_not_found(self):
-        """When thread is not found, the text send should retry without
-        message_thread_id."""
+    def test_text_send_fails_loud_on_thread_not_found(self):
+        """When a configured topic is missing, do not retry into General/root."""
         call_args = []
 
         async def fake_retry(bot, *, chat_id, text, parse_mode, **kwargs):
             call_args.append(dict(kwargs, chat_id=chat_id, text=text))
-            if len(call_args) == 1:
-                raise Exception("Bad Request: message thread not found")
-            return SimpleNamespace(message_id=42)
+            raise Exception("Bad Request: message thread not found")
 
         async def run_test():
             with patch(
@@ -3324,14 +3309,10 @@ class TestSendTelegramThreadNotFoundRetry:
                 )
 
         result = asyncio.run(run_test())
-        assert result["success"] is True
-        assert result["message_id"] == "42"
-        assert len(call_args) == 2, f"expected 2 calls, got {len(call_args)}"
-        # First call should have message_thread_id
+        assert "error" in result
+        assert "refusing to deliver without message_thread_id" in result["error"]
+        assert len(call_args) == 1, f"expected 1 call, got {len(call_args)}"
         assert call_args[0].get("message_thread_id") is not None
-        # Second call (retry) should NOT have message_thread_id
-        assert "message_thread_id" not in call_args[1], \
-            "retry should drop message_thread_id after thread-not-found"
 
     def test_disable_web_page_preview_not_leaked_to_media_sends(self):
         """disable_web_page_preview should only appear in text send, not media sends."""

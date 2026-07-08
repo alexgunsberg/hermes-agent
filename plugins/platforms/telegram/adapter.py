@@ -3604,7 +3604,6 @@ class TelegramAdapter(BasePlatformAdapter):
             message_ids = []
             thread_id = self._metadata_thread_id(metadata)
             requested_thread_id = self._message_thread_id_for_send(thread_id)
-            used_thread_fallback = False
             
             try:
                 from telegram.error import NetworkError as _NetErr
@@ -3659,9 +3658,6 @@ class TelegramAdapter(BasePlatformAdapter):
                     reply_to_message_id=reply_to_id,
                     reply_to_mode=self._reply_to_mode,
                 )
-                if used_thread_fallback and thread_kwargs.get("message_thread_id") is not None:
-                    thread_kwargs = dict(thread_kwargs)
-                    thread_kwargs["message_thread_id"] = None
                 effective_thread_id = thread_kwargs.get("message_thread_id")
 
                 msg = None
@@ -3722,22 +3718,28 @@ class TelegramAdapter(BasePlatformAdapter):
                                     )
                                     continue
                                 # Second failure: the thread is genuinely gone.
-                                # Retry without ``message_thread_id`` so the
-                                # message still reaches the chat, and prune
-                                # the stale binding so future inbound
-                                # messages aren't redirected back to it
-                                # (#31501).
+                                # Do NOT retry without ``message_thread_id``:
+                                # in forum groups that would post internal
+                                # reports/watchdogs into General.  Prune the
+                                # stale binding so future inbound messages
+                                # aren't redirected back to the deleted topic
+                                # (#31501), then fail loud so the caller can
+                                # choose an explicit safe reroute.
                                 logger.warning(
-                                    "[%s] Thread %s not found, retrying without message_thread_id",
+                                    "[%s] Thread %s not found; refusing to deliver without message_thread_id",
                                     self.name, effective_thread_id,
                                 )
                                 self._prune_stale_dm_topic_binding(
                                     chat_id, effective_thread_id,
                                 )
-                                used_thread_fallback = True
-                                effective_thread_id = None
-                                thread_kwargs = {"message_thread_id": None}
-                                continue
+                                return SendResult(
+                                    success=False,
+                                    error=(
+                                        f"Telegram thread {effective_thread_id} not found; "
+                                        "refusing to deliver without message_thread_id"
+                                    ),
+                                    retryable=False,
+                                )
                             err_lower = str(send_err).lower()
                             if "message to be replied not found" in err_lower and reply_to_id is not None:
                                 if private_dm_topic_send:
@@ -3837,7 +3839,7 @@ class TelegramAdapter(BasePlatformAdapter):
                 raw_response={
                     "message_ids": message_ids,
                     "requested_thread_id": requested_thread_id,
-                    "thread_fallback": used_thread_fallback,
+                    "thread_fallback": False,
                 },
             )
             
@@ -4458,14 +4460,13 @@ class TelegramAdapter(BasePlatformAdapter):
         return SendResult(success=False, error="draft_rejected")
 
     async def _send_message_with_thread_fallback(self, **kwargs):
-        """Send a Telegram message, retrying once without message_thread_id
-        if Telegram returns 'Message thread not found'.
+        """Send a Telegram control message without leaking stale topics to root.
 
         Used for control-style sends (approval prompts, model picker,
         update prompts) that can carry a stale thread_id from a DM
-        reply chain.  The streaming send loop has its own equivalent
-        (PR #3390) at the body of ``send``; this helper applies the
-        same retry pattern to the non-streaming control paths.
+        reply chain.  If Telegram confirms the topic is missing, prune
+        the stale binding and fail loud instead of retrying without
+        ``message_thread_id`` (which would leak the prompt into General/root).
         """
         if not self._bot:
             raise RuntimeError("Not connected")
@@ -4480,20 +4481,21 @@ class TelegramAdapter(BasePlatformAdapter):
                 and self._is_thread_not_found_error(send_err)
             ):
                 logger.warning(
-                    "[%s] Thread %s not found for control message, retrying without message_thread_id",
+                    "[%s] Thread %s not found for control message; refusing to deliver without message_thread_id",
                     self.name,
                     message_thread_id,
                 )
-                # Same prune as the streaming send path — the
-                # control-message retry tells us the topic is gone,
-                # so the binding row in state.db must go too
-                # (#31501).
+                # Same prune as the streaming send path — Telegram has told us
+                # the topic is gone, so the binding row in state.db must go too
+                # (#31501). Do not retry without the topic id; that can leak
+                # internal controls into the root/General thread.
                 self._prune_stale_dm_topic_binding(
                     kwargs.get("chat_id"), message_thread_id,
                 )
-                retry_kwargs = dict(kwargs)
-                retry_kwargs.pop("message_thread_id", None)
-                return await self._bot.send_message(**retry_kwargs)
+                raise RuntimeError(
+                    f"Telegram thread {message_thread_id} not found; "
+                    "refusing to deliver without message_thread_id"
+                ) from send_err
             raise
 
     async def send_update_prompt(
