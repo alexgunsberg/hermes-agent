@@ -229,6 +229,14 @@ class TestToolsetConsistency:
         # silently let a platform diverge so far that nothing is shared).
         assert len(core) > 20, f"Suspiciously small shared core: {len(core)} tools"
 
+    def test_cursor_agent_is_opt_in_not_core_cli_or_telegram(self):
+        """Cursor delegation stays out of default CLI/messaging schemas."""
+        assert "cursor_agent" in resolve_toolset("cursor")
+        assert "cursor_agent" not in resolve_toolset("hermes-cli")
+        assert "cursor_agent" not in resolve_toolset("hermes-telegram")
+        assert "cursor_agent" not in TOOLSETS["hermes-cli"]["tools"]
+        assert "cursor_agent" not in TOOLSETS["hermes-telegram"]["tools"]
+
 
 class TestPluginToolsets:
     def test_get_all_toolsets_includes_plugin_toolset(self, monkeypatch):

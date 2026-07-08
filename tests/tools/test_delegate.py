@@ -11,8 +11,10 @@ Run with:  python -m pytest tests/test_delegate.py -v
 
 import json
 import os
+import sys
 import threading
 import time
+import builtins
 import types
 import unittest
 from unittest.mock import MagicMock, patch
@@ -136,6 +138,51 @@ class TestDelegateRequirements(unittest.TestCase):
         )
         self.assertIn(f"up to {_get_max_concurrent_children()}", fn["description"])
         self.assertIn(f"max_spawn_depth={_get_max_spawn_depth()}", fn["description"])
+
+    def test_schema_config_load_does_not_import_cli_when_cold(self):
+        """Cold schema assembly must not import cli.py.
+
+        Importing cli.py from delegate_task's dynamic schema path triggers the
+        full CLI/env/secret-source bootstrap for sessions that merely advertise
+        delegation, causing multi-second cold latency before any delegate_task
+        call is made.
+        """
+        from tools.delegate_tool import _build_dynamic_schema_overrides
+
+        imported_cli = []
+        real_import = builtins.__import__
+
+        def recording_import(name, *args, **kwargs):
+            if name == "cli":
+                imported_cli.append(name)
+            return real_import(name, *args, **kwargs)
+
+        sentinel = object()
+        old_cli = sys.modules.pop("cli", sentinel)
+        try:
+            with patch.object(builtins, "__import__", side_effect=recording_import):
+                overrides = _build_dynamic_schema_overrides()
+        finally:
+            if isinstance(old_cli, types.ModuleType):
+                sys.modules["cli"] = old_cli
+
+        self.assertIn("description", overrides)
+        self.assertEqual(imported_cli, [])
+
+    def test_load_config_uses_loaded_cli_config_without_importing_cli(self):
+        """Interactive CLI still wins when cli.py is already loaded."""
+        sentinel = object()
+        old_cli = sys.modules.get("cli", sentinel)
+        fake_cli = types.ModuleType("cli")
+        setattr(fake_cli, "CLI_CONFIG", {"delegation": {"max_concurrent_children": 7}})
+        sys.modules["cli"] = fake_cli
+        try:
+            self.assertEqual(_load_config().get("max_concurrent_children"), 7)
+        finally:
+            if old_cli is sentinel:
+                sys.modules.pop("cli", None)
+            elif isinstance(old_cli, types.ModuleType):
+                sys.modules["cli"] = old_cli
 
 
 class TestChildSystemPrompt(unittest.TestCase):
@@ -2392,17 +2439,7 @@ class TestDelegateEventEnum(unittest.TestCase):
 class TestConcurrencyDefaults(unittest.TestCase):
     """Tests for the concurrency default and no hard ceiling."""
 
-    def test_load_config_prefers_active_persistent_config_over_cli_defaults(self):
-        stale_cli = types.ModuleType("cli")
-        stale_cli.CLI_CONFIG = {
-            "delegation": {
-                "max_iterations": 45,
-                "model": "",
-                "provider": "",
-                "base_url": "",
-                "api_key": "",
-            }
-        }
+    def test_load_config_uses_persistent_config_when_cli_not_loaded(self):
         active_config = {
             "delegation": {
                 "max_iterations": 50,
@@ -2411,12 +2448,17 @@ class TestConcurrencyDefaults(unittest.TestCase):
             }
         }
 
-        with patch.dict("sys.modules", {"cli": stale_cli}):
+        sentinel = object()
+        old_cli = sys.modules.pop("cli", sentinel)
+        try:
             with patch(
                 "hermes_cli.config.load_config_readonly", return_value=active_config
             ):
                 self.assertEqual(_load_config()["max_concurrent_children"], 50)
                 self.assertEqual(_get_max_concurrent_children(), 50)
+        finally:
+            if isinstance(old_cli, types.ModuleType):
+                sys.modules["cli"] = old_cli
 
     def test_load_config_falls_back_to_cli_config_when_persistent_load_fails(self):
         fallback_cli = types.ModuleType("cli")
