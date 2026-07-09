@@ -271,19 +271,11 @@ class GatewaySlashCommandsMixin:
                     idempotency_key=idempotency_key,
                     board=board,
                 )
-                user_id = str(getattr(source, "user_id", "") or "") or None
-                _kb.add_notify_sub(
-                    conn,
-                    task_id=task_id,
-                    platform=platform_str,
-                    chat_id=chat_id,
-                    thread_id=thread_id,
-                    user_id=user_id,
-                    notifier_profile=(
-                        getattr(self, "_kanban_notifier_profile", None)
-                        or getattr(self, "_active_profile_name", lambda: "default")()
-                    ),
-                )
+                # Inbox topics are capture surfaces, not report channels. Do not
+                # auto-subscribe terminal task notifications back to the same
+                # Telegram topic: worker closeouts/blockers would pollute the
+                # mobile inbox and the topic's conversation context. Operators
+                # can add explicit subscriptions to a separate reports topic.
                 return task_id
             finally:
                 conn.close()

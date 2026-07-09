@@ -62,6 +62,34 @@ async def test_kanban_inbox_bind_and_plain_message_creates_triage_card(tmp_path,
 
 
 @pytest.mark.asyncio
+async def test_kanban_inbox_does_not_subscribe_replies_to_capture_topic(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    kb.write_board_metadata("general", name="General")
+    gateway = DummyGateway()
+    source = _source()
+    await gateway._handle_kanban_inbox_command(
+        MessageEvent(text="/kanban inbox bind general", message_type=MessageType.TEXT, source=source),
+        "bind general",
+    )
+
+    reply = await gateway._maybe_handle_kanban_inbox_message(
+        MessageEvent(
+            text="task: keep this as capture only",
+            message_type=MessageType.TEXT,
+            source=source,
+            message_id="m-no-sub",
+        )
+    )
+
+    assert reply is not None
+    with kb.connect_closing(board="general") as conn:
+        tasks = kb.list_tasks(conn)
+        subs = kb.list_notify_subs(conn, task_id=tasks[0].id)
+    assert len(tasks) == 1
+    assert subs == []
+
+
+@pytest.mark.asyncio
 async def test_kanban_inbox_is_idempotent_per_platform_message(tmp_path, monkeypatch):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     kb.write_board_metadata("general", name="General")
