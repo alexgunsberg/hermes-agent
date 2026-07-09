@@ -1,5 +1,6 @@
 """Tests that /new (and its /reset alias) clears session-scoped overrides."""
 from datetime import datetime
+import threading
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
@@ -139,3 +140,26 @@ async def test_new_command_only_clears_own_session():
     assert other_key in runner._session_reasoning_overrides
     assert session_key not in runner._pending_model_notes
     assert other_key in runner._pending_model_notes
+
+
+@pytest.mark.asyncio
+async def test_new_command_disables_agent_close_end_reason_before_cleanup():
+    """/new must let reset_session() write session_reset, not agent_close."""
+    runner = _make_runner()
+    session_key = build_session_key(_make_source())
+    old_agent = SimpleNamespace(_end_session_on_close=True)
+    setattr(runner, "_agent_cache_lock", threading.RLock())
+    setattr(runner, "_agent_cache", {session_key: (old_agent, "signature")})
+    runner._release_evicted_agent_soft = MagicMock()
+    runner._cleanup_agent_resources = MagicMock()
+
+    async def _inline_executor(func, *args):
+        return func(*args)
+
+    runner._run_in_executor_with_context = _inline_executor
+
+    await runner._handle_reset_command(_make_event("/new"))
+
+    assert old_agent._end_session_on_close is False
+    runner._cleanup_agent_resources.assert_called_once_with(old_agent)
+    getattr(runner.session_store.reset_session, "assert_called_once_with")(session_key)

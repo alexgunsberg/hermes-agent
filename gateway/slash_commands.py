@@ -135,6 +135,15 @@ class GatewaySlashCommandsMixin:
                 _cached = self._agent_cache.get(session_key)
                 _old_agent = _cached[0] if isinstance(_cached, tuple) else _cached if _cached else None
             if _old_agent is not None:
+                # /new is the authoritative conversation boundary. Do not let
+                # agent.close() stamp the expiring row as ``agent_close`` before
+                # reset_session() can mark it ``session_reset``; ``agent_close``
+                # rows are deliberately recoverable after gateway crashes, so
+                # mislabeling a /new boundary can resurrect the old transcript.
+                try:
+                    setattr(_old_agent, "_end_session_on_close", False)
+                except Exception:
+                    pass
                 try:
                     await asyncio.wait_for(
                         self._run_in_executor_with_context(
