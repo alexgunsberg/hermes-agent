@@ -2379,6 +2379,37 @@ def _profile_platform_ports(profile_home: Path, runtime: Optional[dict]) -> Dict
     return ports
 
 
+# Short-lived topology cache for high-frequency /api/status polls (sidebar +
+# multi-tab dashboards). Invalidates when any profile's gateway.pid /
+# gateway.lock / gateway_state.json mtime/size changes, or after a short TTL
+# so start/stop still surfaces within ~1s.
+_TOPOLOGY_CACHE_TTL_SECONDS = 1.0
+_topology_cache_lock = threading.Lock()
+_topology_cache: dict[str, Any] | None = None
+_topology_cache_at: float = 0.0
+_topology_cache_signature: tuple[Any, ...] | None = None
+
+
+def _topology_file_signature(path: Path) -> tuple[bool, Optional[int], Optional[int]]:
+    try:
+        st = path.stat()
+    except OSError:
+        return (False, None, None)
+    return (True, int(st.st_mtime_ns), int(st.st_size))
+
+
+def _profile_gateway_topology_signature(
+    homes: List[Tuple[str, Path]],
+) -> tuple[Any, ...]:
+    parts: List[Any] = []
+    for name, home in homes:
+        parts.append(name)
+        parts.append(_topology_file_signature(home / "gateway.pid"))
+        parts.append(_topology_file_signature(home / "gateway.lock"))
+        parts.append(_topology_file_signature(home / "gateway_state.json"))
+    return tuple(parts)
+
+
 def _collect_profile_gateway_topology() -> Dict[str, Any]:
     """Enumerate profiles and the gateways serving them for ``/api/status``.
 
@@ -2394,7 +2425,13 @@ def _collect_profile_gateway_topology() -> Dict[str, Any]:
       multiple profiles (gateway.multiplex_profiles), ``"single"`` for one
       live gateway, ``"multiple"`` for independent per-profile gateways,
       ``"none"`` when nothing is running.
+
+    Results are cached briefly (see ``_TOPOLOGY_CACHE_TTL_SECONDS``) and
+    invalidated when profile gateway identity files change, so multi-tab
+    status polling does not re-walk every profile on every HTTP request.
     """
+    global _topology_cache, _topology_cache_at, _topology_cache_signature
+
     try:
         from hermes_cli.profiles import _check_gateway_running, profiles_to_serve
         from gateway.status import read_runtime_status
@@ -2402,6 +2439,16 @@ def _collect_profile_gateway_topology() -> Dict[str, Any]:
     except Exception:
         _log.debug("profile/gateway topology enumeration failed", exc_info=True)
         return {"profiles": [], "gateway_mode": "unknown", "gateways": []}
+
+    signature = _profile_gateway_topology_signature(homes)
+    now = time.monotonic()
+    with _topology_cache_lock:
+        if (
+            _topology_cache is not None
+            and _topology_cache_signature == signature
+            and now - _topology_cache_at <= _TOPOLOGY_CACHE_TTL_SECONDS
+        ):
+            return _topology_cache
 
     profile_names = [name for name, _home in homes]
     gateways: List[Dict[str, Any]] = []
@@ -2436,7 +2483,12 @@ def _collect_profile_gateway_topology() -> Dict[str, Any]:
     else:
         mode = "none"
 
-    return {"profiles": profile_names, "gateway_mode": mode, "gateways": gateways}
+    result = {"profiles": profile_names, "gateway_mode": mode, "gateways": gateways}
+    with _topology_cache_lock:
+        _topology_cache = result
+        _topology_cache_at = time.monotonic()
+        _topology_cache_signature = signature
+    return result
 
 
 @app.get("/api/status")

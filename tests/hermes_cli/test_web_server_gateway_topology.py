@@ -93,6 +93,13 @@ def _patch_topology(monkeypatch, homes, running, runtimes):
     """
     import hermes_cli.profiles as profiles_mod
     import gateway.status as status_mod
+    import hermes_cli.web_server as web_server_mod
+
+    # Topology results are short-lived cached; wipe between unit cases so
+    # sequential tests with different collaborator patches stay independent.
+    web_server_mod._topology_cache = None
+    web_server_mod._topology_cache_at = 0.0
+    web_server_mod._topology_cache_signature = None
 
     monkeypatch.setattr(profiles_mod, "profiles_to_serve", lambda multiplex: homes)
     monkeypatch.setattr(
@@ -167,6 +174,37 @@ class TestCollectProfileGatewayTopology:
         monkeypatch.setattr(profiles_mod, "profiles_to_serve", _boom)
         topo = _collect_profile_gateway_topology()
         assert topo == {"profiles": [], "gateway_mode": "unknown", "gateways": []}
+
+
+    def test_topology_cache_reuses_result_within_ttl(self, tmp_path, monkeypatch):
+        """Second call within TTL must not re-probe gateway liveness."""
+        import hermes_cli.profiles as profiles_mod
+        import hermes_cli.web_server as web_server_mod
+
+        homes = [("default", tmp_path / "d")]
+        (tmp_path / "d").mkdir()
+        checks = {"n": 0}
+
+        def _check(home):
+            checks["n"] += 1
+            return True
+
+        web_server_mod._topology_cache = None
+        web_server_mod._topology_cache_at = 0.0
+        web_server_mod._topology_cache_signature = None
+        monkeypatch.setattr(profiles_mod, "profiles_to_serve", lambda multiplex: homes)
+        monkeypatch.setattr(profiles_mod, "_check_gateway_running", _check)
+        monkeypatch.setattr(
+            __import__("gateway.status", fromlist=["read_runtime_status"]),
+            "read_runtime_status",
+            lambda path=None: {"platforms": {}},
+        )
+
+        first = _collect_profile_gateway_topology()
+        second = _collect_profile_gateway_topology()
+        assert first == second
+        assert first["gateway_mode"] == "single"
+        assert checks["n"] == 1
 
 
 # ---------------------------------------------------------------------------

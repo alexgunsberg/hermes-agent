@@ -179,9 +179,17 @@ def get_process_start_time(pid: int) -> Optional[int]:
 def _read_process_cmdline(pid: int) -> Optional[str]:
     """Return the process command line as a space-separated string.
 
-    On Linux, reads /proc/<pid>/cmdline directly.  On macOS and other
-    platforms without /proc, falls back to ``ps -p <pid> -o command=``.
-    On Windows (no /proc, no ps), uses psutil.
+    Preference order (zero avoidable forks on the hot dashboard path):
+
+    1. Linux ``/proc/<pid>/cmdline`` (no subprocess)
+    2. ``psutil.Process(pid).cmdline()`` when available (in-process; works on
+       macOS/Windows and is a hard Hermes dependency on those platforms)
+    3. ``ps -p <pid> -o command=`` only as a last-resort fallback when psutil
+       is unavailable or fails
+
+    High-frequency ``/api/status`` polling previously forked ``ps`` once per
+    live gateway profile on every request. Preferring psutil eliminates those
+    forks while preserving the historical ``ps`` path for stripped installs.
     """
     cmdline_path = Path(f"/proc/{pid}/cmdline")
     try:
@@ -191,6 +199,18 @@ def _read_process_cmdline(pid: int) -> Optional[str]:
     else:
         if raw:
             return raw.replace(b"\x00", b" ").decode("utf-8", errors="ignore").strip()
+
+    # Prefer in-process psutil before forking ``ps``. Dashboard status topology
+    # probes every profile's PID; forking once per profile per poll is the
+    # dominant idle-CPU cost on multi-profile hosts (macOS especially).
+    try:
+        import psutil  # type: ignore
+        proc = psutil.Process(pid)
+        cmdline_parts = proc.cmdline()
+        if cmdline_parts:
+            return " ".join(cmdline_parts)
+    except Exception:
+        pass
 
     if not _IS_WINDOWS:
         try:
@@ -204,16 +224,6 @@ def _read_process_cmdline(pid: int) -> Optional[str]:
                 return result.stdout.strip()
         except (OSError, subprocess.TimeoutExpired):
             pass
-
-    # Windows fallback: psutil (already used by _pid_exists)
-    try:
-        import psutil  # type: ignore
-        proc = psutil.Process(pid)
-        cmdline_parts = proc.cmdline()
-        if cmdline_parts:
-            return " ".join(cmdline_parts)
-    except Exception:
-        pass
 
     return None
 

@@ -1448,11 +1448,24 @@ class TestPlannedStopMarker:
 
 
 class TestReadProcessCmdlinePsFallback:
-    """Tests for _read_process_cmdline falling back to ps on non-Linux."""
+    """Tests for _read_process_cmdline process-table probes."""
+
+    def _block_proc_and_psutil(self, monkeypatch):
+        monkeypatch.setattr(
+            status.Path,
+            "read_bytes",
+            lambda self: (_ for _ in ()).throw(FileNotFoundError),
+        )
+        monkeypatch.setattr(status, "_IS_WINDOWS", False)
+        # Force the psutil path to fail so the historical ``ps`` fallback runs.
+        monkeypatch.setitem(
+            sys.modules,
+            "psutil",
+            SimpleNamespace(Process=lambda pid: (_ for _ in ()).throw(RuntimeError("no psutil"))),
+        )
 
     def test_ps_fallback_when_proc_unavailable(self, monkeypatch):
-        monkeypatch.setattr(status.Path, "read_bytes", lambda self: (_ for _ in ()).throw(FileNotFoundError))
-        monkeypatch.setattr(status, "_IS_WINDOWS", False)
+        self._block_proc_and_psutil(monkeypatch)
         monkeypatch.setattr(
             status.subprocess, "run",
             lambda args, **kwargs: SimpleNamespace(returncode=0, stdout="/usr/libexec/bluetoothuserd\n"),
@@ -1461,8 +1474,7 @@ class TestReadProcessCmdlinePsFallback:
         assert result == "/usr/libexec/bluetoothuserd"
 
     def test_ps_fallback_returns_none_on_failure(self, monkeypatch):
-        monkeypatch.setattr(status.Path, "read_bytes", lambda self: (_ for _ in ()).throw(FileNotFoundError))
-        monkeypatch.setattr(status, "_IS_WINDOWS", False)
+        self._block_proc_and_psutil(monkeypatch)
         monkeypatch.setattr(
             status.subprocess, "run",
             lambda args, **kwargs: SimpleNamespace(returncode=1, stdout=""),
@@ -1485,12 +1497,47 @@ class TestReadProcessCmdlinePsFallback:
     def test_ps_fallback_used_when_proc_returns_empty(self, monkeypatch):
         monkeypatch.setattr(status.Path, "read_bytes", lambda self: b"")
         monkeypatch.setattr(status, "_IS_WINDOWS", False)
+        monkeypatch.setitem(
+            sys.modules,
+            "psutil",
+            SimpleNamespace(Process=lambda pid: (_ for _ in ()).throw(RuntimeError("no psutil"))),
+        )
         monkeypatch.setattr(
             status.subprocess, "run",
             lambda args, **kwargs: SimpleNamespace(returncode=0, stdout="python hermes_cli/main.py gateway run\n"),
         )
         result = status._read_process_cmdline(12345)
         assert "hermes_cli/main.py" in result
+
+    def test_psutil_preferred_over_ps_on_non_linux(self, monkeypatch):
+        """Dashboard status polls must not fork ``ps`` when psutil works."""
+        monkeypatch.setattr(
+            status.Path,
+            "read_bytes",
+            lambda self: (_ for _ in ()).throw(FileNotFoundError),
+        )
+        monkeypatch.setattr(status, "_IS_WINDOWS", False)
+        ps_calls = []
+        monkeypatch.setattr(
+            status.subprocess,
+            "run",
+            lambda args, **kwargs: ps_calls.append(list(args))
+            or SimpleNamespace(returncode=0, stdout="ps should not run\n"),
+        )
+
+        class _Proc:
+            def __init__(self, pid):
+                self.pid = pid
+
+            def cmdline(self):
+                return ["python3", "-m", "hermes_cli.main", "gateway", "run"]
+
+        monkeypatch.setitem(sys.modules, "psutil", SimpleNamespace(Process=_Proc))
+
+        result = status._read_process_cmdline(4242)
+
+        assert result == "python3 -m hermes_cli.main gateway run"
+        assert ps_calls == []
 
     def test_windows_skips_ps_fallback_and_uses_psutil(self, monkeypatch):
         monkeypatch.setattr(status.Path, "read_bytes", lambda self: (_ for _ in ()).throw(FileNotFoundError))

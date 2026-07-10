@@ -710,9 +710,14 @@ def _check_gateway_running(profile_dir: Path) -> bool:
     agree.  Parameterized by ``profile_dir`` so it never mutates ``HERMES_HOME``.
     """
     try:
-        from gateway.status import get_running_pid
+        # Read-side only (dashboard /api/status topology, profiles sidebar).
+        # Use the short-lived PID cache so multi-profile status polls do not
+        # re-open/lock every profile's gateway.lock + re-probe cmdline on every
+        # HTTP hit. Control paths (start/stop/replace) still call
+        # get_running_pid() directly for an authoritative lock probe.
+        from gateway.status import get_running_pid_cached
         if (
-            get_running_pid(profile_dir / "gateway.pid", cleanup_stale=False)
+            get_running_pid_cached(profile_dir / "gateway.pid", cleanup_stale=False)
             is not None
         ):
             return True
