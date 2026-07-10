@@ -21,6 +21,30 @@ def _fake_invoke_jwt(ttl_seconds=3600):
     return f"{header}.{payload}.sig"
 
 
+def test_resolve_runtime_provider_loads_external_secrets_before_credentials(monkeypatch):
+    order = []
+
+    monkeypatch.setattr(
+        rp,
+        "ensure_external_secret_sources_loaded",
+        lambda: order.append("external-secrets"),
+    )
+    monkeypatch.setattr(
+        rp,
+        "_getenv",
+        lambda name, default="": order.append(f"env:{name}") or default,
+    )
+
+    resolved = rp.resolve_runtime_provider(
+        requested="anthropic",
+        explicit_api_key="test-key",
+        explicit_base_url="https://example.azure.com/anthropic",
+    )
+
+    assert resolved["provider"] == "anthropic"
+    assert order[0] == "external-secrets"
+
+
 def test_resolve_runtime_provider_uses_credential_pool(monkeypatch):
     class _Entry:
         access_token = "pool-token"

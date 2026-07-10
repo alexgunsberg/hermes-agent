@@ -38,6 +38,12 @@ _SECRET_SOURCES: dict[str, str] = {}
 # config re-parse, and the ASCII sanitization sweep still ran every time.
 _APPLIED_HOMES: set[str] = set()
 
+# Homes currently inside ``_apply_external_secret_sources``.  Plugin discovery
+# (needed for plugin-registered secret sources) can re-enter env loading via
+# import side effects; this set makes nested calls no-ops so we do not recurse
+# and so the outer call remains the one that runs apply_all.
+_APPLYING_HOMES: set[str] = set()
+
 
 def get_secret_source(env_var: str) -> str | None:
     """Return the label of the secret source that supplied ``env_var``, if any.
@@ -63,6 +69,7 @@ def reset_secret_source_cache() -> None:
     that want to refresh after a config change.
     """
     _APPLIED_HOMES.clear()
+    _APPLYING_HOMES.clear()
 
 
 def format_secret_source_suffix(env_var: str) -> str:
@@ -221,6 +228,7 @@ def load_hermes_dotenv(
     *,
     hermes_home: str | os.PathLike | None = None,
     project_env: str | os.PathLike | None = None,
+    resolve_external_secrets: bool = True,
 ) -> list[Path]:
     """Load Hermes environment files with user config taking precedence.
 
@@ -229,6 +237,10 @@ def load_hermes_dotenv(
     - project `.env` acts as a dev fallback and only fills missing values when
       the user env exists.
     - if no user env exists, the project `.env` also overrides stale shell vars.
+    - external secret managers are resolved by default. Cold administrative CLI
+      bootstrap may pass ``resolve_external_secrets=False`` and call
+      :func:`ensure_external_secret_sources_loaded` before a real consumer reads
+      provider credentials.
     """
     loaded: list[Path] = []
 
@@ -264,10 +276,31 @@ def load_hermes_dotenv(
         _load_dotenv_with_fallback(project_env_path, override=not loaded)
         loaded.append(project_env_path)
 
-    _apply_external_secret_sources(home_path)
+    if resolve_external_secrets:
+        _apply_external_secret_sources(home_path)
     _apply_managed_env()
 
     return loaded
+
+
+def ensure_external_secret_sources_loaded(
+    *, hermes_home: str | os.PathLike | None = None
+) -> None:
+    """Resolve configured external secrets once, immediately before use.
+
+    The top-level CLI loads local ``.env`` files before parsing commands, but
+    deliberately defers remote vault calls so administrative commands do not
+    inherit network latency. Agent/provider entrypoints call this helper before
+    their first credential read. The existing once-per-home and re-entrancy
+    guards keep repeated consumer calls cheap.
+    """
+    home_path = Path(
+        hermes_home or os.getenv("HERMES_HOME", Path.home() / ".hermes")
+    )
+    _apply_external_secret_sources(home_path)
+    # Managed values are authoritative and must remain last even when external
+    # resolution was deferred from the initial dotenv bootstrap.
+    _apply_managed_env()
 
 
 def _apply_managed_env() -> None:
@@ -302,6 +335,53 @@ def _apply_managed_env() -> None:
     _load_dotenv_with_fallback(managed_env, override=True)
 
 
+def _config_requests_plugin_secret_sources(secrets_cfg: dict) -> bool:
+    """True when config may need plugin-registered secret backends.
+
+    Bundled sources (Bitwarden, 1Password) register lazily without plugins.
+    Plugin backends only exist after ``discover_plugins()`` runs, so we detect
+    when config names a non-bundled source or enables a non-bundled section.
+    """
+    if not isinstance(secrets_cfg, dict) or not secrets_cfg:
+        return False
+    # Keep this list local and tiny — it is only an optimization gate for
+    # whether to pay for plugin discovery before apply.  New *bundled*
+    # sources should be added here; third-party backends stay as plugins.
+    bundled = frozenset({"bitwarden", "onepassword"})
+    sources = secrets_cfg.get("sources")
+    if isinstance(sources, list):
+        for entry in sources:
+            if isinstance(entry, str) and entry and entry not in bundled:
+                return True
+    for key, section in secrets_cfg.items():
+        if key == "sources" or key in bundled:
+            continue
+        if isinstance(section, dict) and section.get("enabled"):
+            return True
+    return False
+
+
+def _ensure_plugin_secret_sources_registered(secrets_cfg: dict) -> None:
+    """Discover plugins when config references non-bundled secret sources.
+
+    ``load_hermes_dotenv()`` often runs at import time — before command
+    handlers call ``discover_plugins()``.  Without this step, plugin
+    backends named in ``secrets.sources`` appear as "unknown source" and
+    never run on the first process env load.  Fail-open: discovery errors
+    never block startup.
+    """
+    if not _config_requests_plugin_secret_sources(secrets_cfg):
+        return
+    try:
+        from hermes_cli.plugins import discover_plugins
+    except Exception:  # noqa: BLE001 — plugins optional during early bootstrap
+        return
+    try:
+        discover_plugins()
+    except Exception:  # noqa: BLE001 — never block secret/env startup
+        return
+
+
 def _apply_external_secret_sources(home_path: Path) -> None:
     """Pull secrets from every enabled external source into env.
 
@@ -309,6 +389,11 @@ def _apply_external_secret_sources(home_path: Path) -> None:
     to locate bootstrap tokens) but BEFORE the rest of Hermes reads
     ``os.environ`` for credentials.  Any failure here is logged and
     swallowed — external secret sources must never block startup.
+
+    When config references a non-bundled secret source, this path also
+    runs plugin discovery first so plugin-registered backends participate
+    in the same first-process env load (eliminating the historical
+    "unknown source" warning and skipped apply for plugin vaults).
 
     The heavy lifting (source ordering, mapped-beats-bulk precedence,
     first-claim-wins conflict handling, override semantics, provenance)
@@ -326,53 +411,64 @@ def _apply_external_secret_sources(home_path: Path) -> None:
     (tests, long-running processes after a config change).
     """
     home_key = str(Path(home_path).resolve())
-    if home_key in _APPLIED_HOMES:
+    if home_key in _APPLIED_HOMES or home_key in _APPLYING_HOMES:
         return
-    _APPLIED_HOMES.add(home_key)
-
+    _APPLYING_HOMES.add(home_key)
     try:
-        cfg = _load_secrets_config(home_path)
-    except Exception:  # noqa: BLE001 — config errors must not block startup
-        return
-    if not cfg:
-        return
+        try:
+            cfg = _load_secrets_config(home_path)
+        except Exception:  # noqa: BLE001 — config errors must not block startup
+            return
+        if not cfg:
+            return
 
-    try:
-        from agent.secret_sources.registry import apply_all
-    except ImportError:
-        return
+        # Register plugin backends before apply so a plugin source is
+        # available on this first load, not only after a later
+        # discover_plugins() + reset_secret_source_cache() cycle.
+        _ensure_plugin_secret_sources_registered(cfg)
 
-    try:
-        report = apply_all(cfg, home_path)
-    except Exception:  # noqa: BLE001 — belt-and-braces; apply_all shouldn't raise
-        return
+        try:
+            from agent.secret_sources.registry import apply_all
+        except ImportError:
+            return
 
-    if report.applied_any:
-        # Re-run the ASCII sanitization pass: vault values are
-        # user-supplied and might have the same copy-paste corruption as
-        # a manually edited .env (see #6843).
-        _sanitize_loaded_credentials()
-        # Remember where each var came from so setup / `hermes model`
-        # flows can label detected credentials with "(from Bitwarden)" /
-        # "(from 1Password)" — otherwise users see "credentials ✓" with
-        # no hint the value came from a vault rather than .env.
-        for name, applied in report.provenance.items():
-            _SECRET_SOURCES[name] = applied.source
+        try:
+            report = apply_all(cfg, home_path)
+        except Exception:  # noqa: BLE001 — belt-and-braces; apply_all shouldn't raise
+            return
 
-    for src in report.sources:
-        if src.applied:
-            print(
-                f"  {src.label}: applied {len(src.applied)} "
-                f"secret{'s' if len(src.applied) != 1 else ''} "
-                f"({', '.join(sorted(src.applied))})",
-                file=sys.stderr,
-            )
-        if src.result.error:
-            print(f"  {src.label}: {src.result.error}", file=sys.stderr)
-        for warn in src.result.warnings:
-            print(f"  {src.label}: {warn}", file=sys.stderr)
-    for conflict in report.conflicts:
-        print(f"  Secret sources: {conflict}", file=sys.stderr)
+        if report.applied_any:
+            # Re-run the ASCII sanitization pass: vault values are
+            # user-supplied and might have the same copy-paste corruption as
+            # a manually edited .env (see #6843).
+            _sanitize_loaded_credentials()
+            # Remember where each var came from so setup / `hermes model`
+            # flows can label detected credentials with "(from Bitwarden)" /
+            # "(from 1Password)" — otherwise users see "credentials ✓" with
+            # no hint the value came from a vault rather than .env.
+            for name, applied in report.provenance.items():
+                _SECRET_SOURCES[name] = applied.source
+
+        for src in report.sources:
+            if src.applied:
+                print(
+                    f"  {src.label}: applied {len(src.applied)} "
+                    f"secret{'s' if len(src.applied) != 1 else ''} "
+                    f"({', '.join(sorted(src.applied))})",
+                    file=sys.stderr,
+                )
+            if src.result.error:
+                print(f"  {src.label}: {src.result.error}", file=sys.stderr)
+            for warn in src.result.warnings:
+                print(f"  {src.label}: {warn}", file=sys.stderr)
+        for conflict in report.conflicts:
+            print(f"  Secret sources: {conflict}", file=sys.stderr)
+    finally:
+        # Once-per-home semantics (including empty/error paths after entry),
+        # and clear the re-entrancy window so nested import-time loads cannot
+        # skip a still-running outer apply.
+        _APPLIED_HOMES.add(home_key)
+        _APPLYING_HOMES.discard(home_key)
 
 
 def _load_secrets_config(home_path: Path) -> dict:

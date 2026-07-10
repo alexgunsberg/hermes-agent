@@ -7,6 +7,7 @@ don't see an unexplained "credentials ✓" line when their .env is empty.
 
 from __future__ import annotations
 
+import os
 import sys
 from pathlib import Path
 
@@ -274,3 +275,163 @@ def test_apply_external_secret_sources_bad_ttl_does_not_crash(tmp_path, monkeypa
 
     # Coerced to the 300s default rather than raising ValueError.
     assert captured["cache_ttl_seconds"] == 300
+
+
+def test_config_requests_plugin_secret_sources_detects_non_bundled_name():
+    assert env_loader._config_requests_plugin_secret_sources(
+        {"sources": ["protonpass"], "protonpass": {"enabled": True}}
+    )
+    assert env_loader._config_requests_plugin_secret_sources(
+        {"myvault": {"enabled": True}}
+    )
+    assert not env_loader._config_requests_plugin_secret_sources(
+        {"sources": ["bitwarden"], "bitwarden": {"enabled": True}}
+    )
+    assert not env_loader._config_requests_plugin_secret_sources({})
+    assert not env_loader._config_requests_plugin_secret_sources(
+        {"bitwarden": {"enabled": False}, "onepassword": {"enabled": False}}
+    )
+
+
+def test_apply_discovers_plugins_for_non_bundled_source(tmp_path, monkeypatch):
+    """Plugin backends named in secrets.sources must be discovered before apply.
+
+    Without this, first-process env load warns "unknown source" and skips the
+    plugin backend entirely because discover_plugins() usually runs later.
+    """
+    from agent.secret_sources.base import FetchResult, SecretSource
+    from agent.secret_sources import registry as reg
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.delenv("PLUGIN_TEST_API_KEY", raising=False)
+    (tmp_path / "config.yaml").write_text(
+        "secrets:\n"
+        "  sources:\n"
+        "  - plugintest\n"
+        "  plugintest:\n"
+        "    enabled: true\n",
+        encoding="utf-8",
+    )
+
+    class _PluginTestSource(SecretSource):
+        name = "plugintest"
+        label = "Plugin Test"
+        shape = "mapped"
+
+        def fetch(self, cfg, home_path):
+            del cfg, home_path
+            result = FetchResult()
+            result.secrets = {"PLUGIN_TEST_API_KEY": "from-plugin"}
+            return result
+
+    discovered = {"count": 0}
+
+    def _fake_discover():
+        discovered["count"] += 1
+        reg.register_source(_PluginTestSource(), replace=True)
+
+    reg._reset_registry_for_tests()
+    monkeypatch.setattr(
+        "hermes_cli.plugins.discover_plugins",
+        _fake_discover,
+        raising=False,
+    )
+    # Ensure import path used by env_loader resolves to our fake.
+    import hermes_cli.plugins as plugins_mod
+
+    monkeypatch.setattr(plugins_mod, "discover_plugins", _fake_discover)
+
+    env_loader.reset_secret_source_cache()
+    env_loader._apply_external_secret_sources(tmp_path)
+
+    assert discovered["count"] == 1
+    assert env_loader.get_secret_source("PLUGIN_TEST_API_KEY") == "plugintest"
+    import os
+
+    assert os.environ.get("PLUGIN_TEST_API_KEY") == "from-plugin"
+
+
+def test_dotenv_bootstrap_can_defer_plugin_fetch_until_consumer(
+    tmp_path, monkeypatch, capsys
+):
+    """Administrative startup must not pay remote plugin fetch latency.
+
+    A later consumer must still discover the source and resolve its mapped
+    credential before reading it.
+    """
+    from agent.secret_sources.base import FetchResult, SecretSource
+    from agent.secret_sources import registry as reg
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.delenv("DEFERRED_TEST_API_KEY", raising=False)
+    (tmp_path / "config.yaml").write_text(
+        "secrets:\n"
+        "  sources:\n"
+        "  - deferredtest\n"
+        "  deferredtest:\n"
+        "    enabled: true\n",
+        encoding="utf-8",
+    )
+
+    class _DeferredSource(SecretSource):
+        name = "deferredtest"
+        label = "Deferred Test"
+        shape = "mapped"
+
+        def fetch(self, cfg, home_path):
+            del cfg, home_path
+            result = FetchResult()
+            result.secrets = {"DEFERRED_TEST_API_KEY": "resolved-at-consumer"}
+            return result
+
+    discovered = {"count": 0}
+
+    def _fake_discover():
+        discovered["count"] += 1
+        reg.register_source(_DeferredSource(), replace=True)
+
+    import hermes_cli.plugins as plugins_mod
+
+    reg._reset_registry_for_tests()
+    monkeypatch.setattr(plugins_mod, "discover_plugins", _fake_discover)
+
+    env_loader.load_hermes_dotenv(
+        hermes_home=tmp_path,
+        resolve_external_secrets=False,
+    )
+
+    assert discovered["count"] == 0
+    assert "DEFERRED_TEST_API_KEY" not in os.environ
+    assert str(tmp_path.resolve()) not in env_loader._APPLIED_HOMES
+
+    env_loader.ensure_external_secret_sources_loaded(hermes_home=tmp_path)
+
+    assert discovered["count"] == 1
+    assert os.environ["DEFERRED_TEST_API_KEY"] == "resolved-at-consumer"
+    assert env_loader.get_secret_source("DEFERRED_TEST_API_KEY") == "deferredtest"
+    captured = capsys.readouterr()
+    assert "resolved-at-consumer" not in captured.out
+    assert "resolved-at-consumer" not in captured.err
+
+
+def test_apply_skips_plugin_discovery_for_bundled_only(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    (tmp_path / "config.yaml").write_text(
+        "secrets:\n"
+        "  sources:\n"
+        "  - bitwarden\n"
+        "  bitwarden:\n"
+        "    enabled: false\n",
+        encoding="utf-8",
+    )
+    calls = {"count": 0}
+
+    def _fake_discover():
+        calls["count"] += 1
+
+    import hermes_cli.plugins as plugins_mod
+
+    monkeypatch.setattr(plugins_mod, "discover_plugins", _fake_discover)
+    env_loader.reset_secret_source_cache()
+    env_loader._apply_external_secret_sources(tmp_path)
+    assert calls["count"] == 0

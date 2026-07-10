@@ -802,22 +802,22 @@ class PluginContext:
 
         ``source`` must be an instance of
         :class:`agent.secret_sources.base.SecretSource`.  Registered
-        sources run during ``load_hermes_dotenv()`` startup — after
-        ``~/.hermes/.env`` loads, before Hermes reads credentials — when
-        their ``secrets.<source.name>`` config section is enabled.  The
+        sources run after ``~/.hermes/.env`` loads and before Hermes reads
+        credentials when their ``secrets.<source.name>`` config section is
+        enabled. Administrative CLI commands may defer the remote fetch until
+        an agent/provider consumer starts. The
         orchestrator (``agent.secret_sources.registry.apply_all``) owns
         ordering, mapped-vs-bulk precedence, conflict warnings, and
         provenance; the source only fetches.
 
-        NOTE ON TIMING: plugin discovery happens later in startup than
-        the first ``load_hermes_dotenv()`` call, so a plugin-registered
-        source is not consulted by the initial env load of the process
-        that discovers it.  It IS consulted by every subsequently
-        spawned Hermes process (gateway children, cron sessions,
-        subagents), and immediately after a
-        ``reset_secret_source_cache()`` re-pull.  Plugin sources are
-        therefore best for supplying credentials to the running fleet;
-        the bundled sources cover first-process bootstrap.
+        NOTE ON TIMING: local dotenv bootstrap runs early (often at import
+        time), while top-level administrative CLI startup defers remote secret
+        resolution. Before the first actual consumer, Hermes calls
+        ``ensure_external_secret_sources_loaded``; when config names a
+        non-bundled source, that path discovers plugins before applying it.
+        Bundled sources still cover installs that never enable plugins.
+        Discovery is fail-open and re-entrancy-safe if import side effects
+        re-enter env loading.
 
         Contract requirements (rejected with a warning otherwise):
         inherit from ``SecretSource``, ``api_version`` matching
