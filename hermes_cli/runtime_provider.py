@@ -36,6 +36,7 @@ from hermes_cli.config import (
     load_config,
     normalize_extra_headers,
 )
+from hermes_cli.env_loader import ensure_external_secret_sources_loaded
 from hermes_constants import OPENROUTER_BASE_URL
 from utils import base_url_host_matches, base_url_hostname, env_int
 
@@ -1534,6 +1535,12 @@ def resolve_runtime_provider(
             "source": "moa-virtual-provider",
             "requested_provider": requested_provider,
         }
+
+    # This is the shared first-use boundary for CLI, gateway, cron, ACP, and
+    # helper consumers. Top-level administrative CLI bootstrap deliberately
+    # leaves remote vaults unresolved; provider resolution must populate mapped
+    # credentials before any provider-specific env lookup below.
+    ensure_external_secret_sources_loaded()
 
     # Azure Anthropic short-circuit: when explicitly targeting an Azure endpoint
     # with provider="anthropic", bypass _resolve_named_custom_runtime (which would

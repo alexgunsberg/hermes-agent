@@ -126,7 +126,7 @@ def register(ctx):
 Registration is rejected (with a log warning, never a crash) for: non-`SecretSource` instances, invalid/duplicate names, a `scheme` another source owns, wrong `api_version`, or a `shape` outside `mapped`/`bulk`.
 
 :::note Timing
-Plugin discovery runs later in startup than the first `load_hermes_dotenv()` call, so a plugin source is not consulted by the very first env load of the process that discovers it. It IS consulted by every subsequently spawned Hermes process (gateway children, cron sessions, subagents). Bundled sources cover first-process bootstrap.
+Hermes loads local dotenv files early, but administrative CLI commands defer remote secret resolution so commands such as `hermes config`, `hermes cron`, and `hermes kanban` do not inherit vault network latency. Before the first agent/provider consumer reads credentials, Hermes discovers plugins and applies configured sources. When your `secrets` config names a non-bundled source (or enables a non-bundled `secrets.<name>` section), your backend is therefore registered before that first consumer read. Bundled sources (Bitwarden, 1Password) do not require plugins.
 :::
 
 ## Users configure it like any other source

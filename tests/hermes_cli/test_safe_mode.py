@@ -29,9 +29,11 @@ def test_cmd_chat_safe_mode_sets_env_before_startup(monkeypatch):
     chat_parser.set_defaults(func=main_mod.cmd_chat)
     args = parser.parse_args(["chat", "--safe-mode"])
     captured: dict[str, object] = {}
+    startup_order: list[str] = []
     fake_cli = types.ModuleType("cli")
 
     def fake_has_provider() -> bool:
+        startup_order.append("provider-check")
         assert os.environ["HERMES_SAFE_MODE"] == "1"
         assert os.environ["HERMES_IGNORE_USER_CONFIG"] == "1"
         assert os.environ["HERMES_IGNORE_RULES"] == "1"
@@ -41,6 +43,11 @@ def test_cmd_chat_safe_mode_sets_env_before_startup(monkeypatch):
         captured.update(kwargs)
 
     monkeypatch.setattr(main_mod, "_has_any_provider_configured", fake_has_provider)
+    monkeypatch.setattr(
+        main_mod,
+        "ensure_external_secret_sources_loaded",
+        lambda: startup_order.append("external-secrets"),
+    )
     monkeypatch.setattr(main_mod, "_pin_kanban_board_env", lambda: None)
     monkeypatch.setattr(main_mod, "_sync_bundled_skills_for_startup", lambda: None)
     monkeypatch.setattr(main_mod, "_termux_should_prefetch_update_check", lambda: False)
@@ -51,6 +58,7 @@ def test_cmd_chat_safe_mode_sets_env_before_startup(monkeypatch):
 
     assert captured["ignore_user_config"] is True
     assert captured["ignore_rules"] is True
+    assert startup_order == ["external-secrets", "provider-check"]
 
 
 def test_prepare_agent_startup_applies_safe_mode_before_plugin_discovery(monkeypatch):

@@ -530,9 +530,19 @@ _apply_profile_override()
 # Load .env from ~/.hermes/.env first, then project root as dev fallback.
 # User-managed env files should override stale shell exports on restart.
 from hermes_cli.config import get_hermes_home
-from hermes_cli.env_loader import load_hermes_dotenv
+from hermes_cli.env_loader import (
+    ensure_external_secret_sources_loaded,
+    load_hermes_dotenv,
+)
 
-load_hermes_dotenv(project_env=PROJECT_ROOT / ".env")
+# Load local bootstrap values immediately, but do not contact remote secret
+# managers before we even know which command is running. Agent/provider
+# entrypoints resolve those sources immediately before their first credential
+# read; administrative commands remain network-free.
+load_hermes_dotenv(
+    project_env=PROJECT_ROOT / ".env",
+    resolve_external_secrets=False,
+)
 
 # Bridge security.redact_secrets from config.yaml → HERMES_REDACT_SECRETS env
 # var BEFORE hermes_logging imports agent.redact (which snapshots the flag at
@@ -2252,6 +2262,10 @@ def cmd_chat(args):
 
     _apply_safe_mode(args)
 
+    # Chat is the first real provider consumer on this path. Resolve deferred
+    # vault-backed credentials before the first-run/provider checks below.
+    ensure_external_secret_sources_loaded()
+
     # Resolve --continue into --resume with the latest session or by name
     continue_val = getattr(args, "continue_last", None)
     if continue_val and not getattr(args, "resume", None):
@@ -2711,6 +2725,8 @@ def cmd_whatsapp_cloud(args):
 
 def cmd_setup(args):
     """Interactive setup wizard."""
+    # Setup reports available credentials, including vault-backed ones.
+    ensure_external_secret_sources_loaded()
     from hermes_cli.setup import run_setup_wizard
 
     run_setup_wizard(args)
@@ -2739,6 +2755,9 @@ def cmd_postinstall(args):
 
 def cmd_model(args):
     """Select default model — starts with provider selection, then model picker."""
+    # The picker labels and validates detected credentials, so it is a real
+    # secret consumer rather than an administrative status command.
+    ensure_external_secret_sources_loaded()
     _require_tty("model")
     if getattr(args, "refresh", False):
         try:
