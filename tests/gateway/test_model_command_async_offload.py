@@ -124,7 +124,11 @@ class _FakePickerAdapter:
     """Adapter whose *type* exposes ``send_model_picker`` (the gate the handler
     checks via ``getattr(type(adapter), 'send_model_picker', None)``)."""
 
+    def __init__(self):
+        self.sent_kwargs = None
+
     async def send_model_picker(self, **kwargs):
+        self.sent_kwargs = kwargs
         return _FakePickerResult()
 
     def _thread_metadata(self, *a, **k):  # pragma: no cover - not exercised
@@ -192,3 +196,52 @@ async def test_picker_path_requests_moa_presets(_isolated_config, monkeypatch):
 
     assert result is None
     assert captured["include_moa"] is True
+
+
+@pytest.mark.asyncio
+async def test_picker_path_applies_configured_model_policy(_isolated_config, monkeypatch):
+    config_path = _isolated_config / "config.yaml"
+    config_path.write_text(
+        "model:\n"
+        "  default: gpt-old\n"
+        "  provider: openai-codex\n"
+        "providers: {}\n"
+        "model_picker:\n"
+        "  providers:\n"
+        "    openai-codex: [gpt-new]\n"
+        "    anthropic: [claude-new]\n",
+        encoding="utf-8",
+    )
+    listed = [
+        {
+            "slug": "anthropic",
+            "name": "Anthropic",
+            "models": ["claude-old", "claude-new"],
+            "total_models": 2,
+        },
+        {
+            "slug": "openai-codex",
+            "name": "OpenAI Codex",
+            "models": ["gpt-old", "gpt-new"],
+            "total_models": 2,
+        },
+    ]
+    monkeypatch.setattr(
+        "hermes_cli.model_switch.list_picker_providers",
+        lambda **kwargs: listed,
+    )
+
+    adapter = _FakePickerAdapter()
+    runner = _make_runner()
+    runner.adapters = {Platform.TELEGRAM: adapter}  # type: ignore[assignment]
+    monkeypatch.setattr(runner, "_thread_metadata_for_source", lambda *a, **k: None, raising=False)
+    monkeypatch.setattr(runner, "_reply_anchor_for_event", lambda *a, **k: None, raising=False)
+
+    result = await runner._handle_model_command(_make_event())
+
+    assert result is None
+    assert adapter.sent_kwargs is not None
+    providers = adapter.sent_kwargs["providers"]
+    assert [row["slug"] for row in providers] == ["openai-codex", "anthropic"]
+    assert providers[0]["models"] == ["gpt-old", "gpt-new"]
+    assert providers[1]["models"] == ["claude-new"]

@@ -1414,6 +1414,7 @@ class GatewaySlashCommandsMixin:
             resolve_persist_behavior,
             list_authenticated_providers,
             list_picker_providers,
+            apply_model_picker_policy,
         )
         from hermes_cli.providers import get_label
 
@@ -1444,6 +1445,7 @@ class GatewaySlashCommandsMixin:
         current_api_key = ""
         user_provs = None
         custom_provs = None
+        cfg = {}
         config_path = _hermes_home / "config.yaml"
         try:
             cfg = _load_gateway_config()
@@ -1500,6 +1502,12 @@ class GatewaySlashCommandsMixin:
                         custom_providers=custom_provs,
                         max_models=50,
                         include_moa=True,
+                    )
+                    providers = apply_model_picker_policy(
+                        providers,
+                        cfg.get("model_picker") if isinstance(cfg, dict) else None,
+                        current_provider=current_provider,
+                        current_model=current_model,
                     )
                 except Exception:
                     providers = []

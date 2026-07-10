@@ -1449,6 +1449,98 @@ def prewarm_picker_cache_async() -> Optional["_threading.Thread"]:
     return t
 
 
+def apply_model_picker_policy(
+    providers: List[dict],
+    policy: Any,
+    *,
+    current_provider: str = "",
+    current_model: str = "",
+) -> List[dict]:
+    """Apply an optional ordered allowlist to an interactive model picker.
+
+    ``policy`` is read from the top-level ``model_picker`` config section::
+
+        model_picker:
+          include_current: true
+          providers:
+            openai-codex: [gpt-5.6-sol]
+            anthropic: [claude-opus-4-8, claude-sonnet-5]
+
+    Provider and model order follows the config. Unknown or unavailable entries
+    are skipped, so one policy can be shared across profiles with different
+    credentials. By default, the active model is retained in its provider row.
+
+    A missing or malformed policy is a no-op for backward compatibility. JSON
+    strings are accepted because ``hermes config set`` stores object values as
+    scalar text.
+    """
+    if isinstance(policy, str):
+        try:
+            import json
+
+            policy = json.loads(policy)
+        except (TypeError, ValueError):
+            return providers
+    if not isinstance(policy, dict):
+        return providers
+
+    configured = policy.get("providers")
+    if not isinstance(configured, dict):
+        return providers
+
+    by_slug = {
+        str(row.get("slug", "")).strip().lower(): row
+        for row in providers
+        if isinstance(row, dict) and str(row.get("slug", "")).strip()
+    }
+    current_slug = str(current_provider or "").strip().lower()
+    current_id = str(current_model or "").strip()
+    include_current = policy.get("include_current", True) is not False
+    filtered: List[dict] = []
+
+    for raw_slug, raw_models in configured.items():
+        slug = str(raw_slug or "").strip().lower()
+        row = by_slug.get(slug)
+        if row is None:
+            continue
+
+        if isinstance(raw_models, str):
+            requested = [raw_models]
+        elif isinstance(raw_models, (list, tuple)):
+            requested = [model for model in raw_models if isinstance(model, str)]
+        else:
+            continue
+
+        available = {
+            str(model).strip().lower(): str(model)
+            for model in (row.get("models") or [])
+            if str(model).strip()
+        }
+        selected: List[str] = []
+        seen: set[str] = set()
+        for requested_model in requested:
+            key = requested_model.strip().lower()
+            actual = available.get(key)
+            if actual and key not in seen:
+                selected.append(actual)
+                seen.add(key)
+
+        if include_current and slug == current_slug and current_id:
+            current_key = current_id.lower()
+            actual_current = available.get(current_key)
+            if actual_current and current_key not in seen:
+                selected.insert(0, actual_current)
+
+        if not selected:
+            continue
+        curated_row = dict(row)
+        curated_row["models"] = selected
+        curated_row["total_models"] = len(selected)
+        filtered.append(curated_row)
+
+    return filtered
+
+
 def list_authenticated_providers(
     current_provider: str = "",
     current_base_url: str = "",
