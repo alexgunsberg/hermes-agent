@@ -7,6 +7,7 @@ import sys
 from pathlib import Path
 
 from dotenv import load_dotenv
+from hermes_constants import get_hermes_home
 from utils import atomic_replace, fast_safe_load
 
 
@@ -244,7 +245,7 @@ def load_hermes_dotenv(
     """
     loaded: list[Path] = []
 
-    home_path = Path(hermes_home or os.getenv("HERMES_HOME", Path.home() / ".hermes"))
+    home_path = Path(hermes_home) if hermes_home is not None else get_hermes_home()
     user_env = home_path / ".env"
     project_env_path = Path(project_env) if project_env else None
 
@@ -294,9 +295,7 @@ def ensure_external_secret_sources_loaded(
     their first credential read. The existing once-per-home and re-entrancy
     guards keep repeated consumer calls cheap.
     """
-    home_path = Path(
-        hermes_home or os.getenv("HERMES_HOME", Path.home() / ".hermes")
-    )
+    home_path = Path(hermes_home) if hermes_home is not None else get_hermes_home()
     _apply_external_secret_sources(home_path)
     # Managed values are authoritative and must remain last even when external
     # resolution was deferred from the initial dotenv bootstrap.
@@ -338,23 +337,27 @@ def _apply_managed_env() -> None:
 def _config_requests_plugin_secret_sources(secrets_cfg: dict) -> bool:
     """True when config may need plugin-registered secret backends.
 
-    Bundled sources (Bitwarden, 1Password) register lazily without plugins.
+    Bundled and already-registered sources do not require plugin discovery.
     Plugin backends only exist after ``discover_plugins()`` runs, so we detect
-    when config names a non-bundled source or enables a non-bundled section.
+    config names that are not yet present in the source registry.
     """
     if not isinstance(secrets_cfg, dict) or not secrets_cfg:
         return False
-    # Keep this list local and tiny — it is only an optimization gate for
-    # whether to pay for plugin discovery before apply.  New *bundled*
-    # sources should be added here; third-party backends stay as plugins.
-    bundled = frozenset({"bitwarden", "onepassword"})
+    try:
+        from agent.secret_sources.registry import known_source_names
+
+        known = known_source_names()
+    except Exception:  # noqa: BLE001 — discovery gate must remain fail-open
+        # If even the lightweight registry lookup fails, discovery is the only
+        # remaining chance to satisfy configured sources.
+        known = frozenset()
     sources = secrets_cfg.get("sources")
     if isinstance(sources, list):
         for entry in sources:
-            if isinstance(entry, str) and entry and entry not in bundled:
+            if isinstance(entry, str) and entry and entry not in known:
                 return True
     for key, section in secrets_cfg.items():
-        if key == "sources" or key in bundled:
+        if key == "sources" or key in known:
             continue
         if isinstance(section, dict) and section.get("enabled"):
             return True
@@ -410,6 +413,26 @@ def _apply_external_secret_sources(home_path: Path) -> None:
     ``reset_secret_source_cache()`` if you need to force a re-pull
     (tests, long-running processes after a config change).
     """
+    # Safe mode intentionally excludes all user plugins. Do not even parse the
+    # source config here: doing so could lead to plugin imports or an
+    # ``unknown source`` warning from the registry.
+    if os.getenv("HERMES_SAFE_MODE", "").strip().lower() in {
+        "1", "true", "yes", "on",
+    }:
+        return
+
+    # External source application writes to process-global os.environ. A
+    # multiplex gateway serves several profile contexts in one process, so
+    # there is no safe global destination for a profile's plugin secrets.
+    # Until the registry has a scoped apply target, fail closed with a no-op.
+    try:
+        from agent.secret_scope import is_multiplex_active
+
+        if is_multiplex_active():
+            return
+    except Exception:  # noqa: BLE001 — ordinary single-profile startup
+        pass
+
     home_key = str(Path(home_path).resolve())
     if home_key in _APPLIED_HOMES or home_key in _APPLYING_HOMES:
         return

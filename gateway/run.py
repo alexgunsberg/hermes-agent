@@ -1308,7 +1308,11 @@ _hermes_home = get_hermes_home()
 from dotenv import load_dotenv  # noqa: F401  # backward-compat for tests that monkeypatch this symbol
 from hermes_cli.env_loader import load_hermes_dotenv
 _env_path = _hermes_home / '.env'
-load_hermes_dotenv(hermes_home=_hermes_home, project_env=Path(__file__).resolve().parents[1] / '.env')
+load_hermes_dotenv(
+    hermes_home=_hermes_home,
+    project_env=Path(__file__).resolve().parents[1] / '.env',
+    resolve_external_secrets=False,
+)
 
 
 def _reload_runtime_env_preserving_config_authority() -> None:
@@ -20321,6 +20325,33 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
                  Useful for systemd services to avoid restart-loop deadlocks
                  when the previous process hasn't fully exited yet.
     """
+    # Resolve the gateway mode before any external secret source can write to
+    # process-global os.environ. Module bootstrap loaded local dotenv files but
+    # deliberately deferred vaults for this decision. A simplex gateway can
+    # apply them now; a multiplex gateway remains a conservative no-op until a
+    # scoped secret-source apply path exists.
+    config_was_supplied = config is not None
+    if config is None:
+        config = load_gateway_config()
+    try:
+        from agent.secret_scope import set_multiplex_active
+
+        set_multiplex_active(bool(getattr(config, "multiplex_profiles", False)))
+    except Exception:
+        logger.debug("could not set multiplex-active flag", exc_info=True)
+    if not getattr(config, "multiplex_profiles", False):
+        try:
+            from hermes_cli.env_loader import ensure_external_secret_sources_loaded
+
+            ensure_external_secret_sources_loaded(hermes_home=_hermes_home)
+            # GatewayConfig snapshots platform credentials from os.environ.
+            # Reload only when we constructed it here, after external sources
+            # had a chance to populate those values.
+            if not config_was_supplied:
+                config = load_gateway_config()
+        except Exception:
+            logger.debug("external secret-source loading failed", exc_info=True)
+
     # Snapshot the checkout revision now, while sys.modules still matches disk,
     # so a later `git pull` under this long-lived process can be detected (and
     # risky work like model switching refused) instead of crashing on a stale

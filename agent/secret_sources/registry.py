@@ -150,6 +150,17 @@ def list_sources() -> List[SecretSource]:
     return list(_SOURCES.values())
 
 
+def known_source_names() -> frozenset[str]:
+    """Return bundled and already-registered source names.
+
+    This is the registry-owned discovery gate used by the environment loader.
+    It deliberately performs only bundled source registration; it never scans
+    plugins or fetches secrets.
+    """
+    _ensure_builtin_sources()
+    return frozenset(_SOURCES)
+
+
 def _ensure_builtin_sources() -> None:
     """Idempotently register the bundled sources.
 
