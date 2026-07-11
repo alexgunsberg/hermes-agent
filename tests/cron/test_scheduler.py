@@ -3694,6 +3694,7 @@ class TestDeliverResultTimeoutCancelsFuture:
         media_metadata = adapter.send_image_file.call_args[1]["metadata"]
         assert str(media_metadata.get("thread_id")) == "7072"
         assert not media_metadata.get("direct_messages_topic_id")
+        assert media_metadata.get("strict_topic_delivery") is True
         # Probe exactly once and reuse the result for BOTH the text and media
         # sends — never re-probe per send (the "compute ONCE" contract).
         assert probe_calls["n"] == 1
@@ -3761,6 +3762,7 @@ class TestDeliverResultTimeoutCancelsFuture:
         assert str(media_metadata.get("direct_messages_topic_id")) == "7072"
         assert not media_metadata.get("message_thread_id")
         assert not media_metadata.get("thread_id")
+        assert media_metadata.get("strict_topic_delivery") is True
 
     def test_live_adapter_forum_thread_fallback_records_delivery_error(self):
         """A forum/supergroup cron target whose configured topic is gone must
@@ -3824,6 +3826,141 @@ class TestDeliverResultTimeoutCancelsFuture:
         # Forum target routes via message_thread_id (mode 1), not DM-topic.
         sent_metadata = adapter.send.call_args[1]["metadata"]
         assert not sent_metadata.get("direct_messages_topic_id")
+        assert sent_metadata.get("strict_topic_delivery") is True
+
+    def test_live_adapter_explicit_telegram_topic_propagates_strict_text_and_media(
+        self, tmp_path, monkeypatch,
+    ):
+        """Explicit telegram:chat:topic cron/report delivery must opt into
+        strict_topic_delivery for BOTH text and media so a disappeared topic
+        cannot fall back into General after validation."""
+        from gateway.config import Platform
+        from gateway.platforms.base import SendResult
+        from concurrent.futures import Future
+
+        media_root = tmp_path / "media-cache"
+        media_file = media_root / "report.png"
+        media_file.parent.mkdir(parents=True, exist_ok=True)
+        media_file.write_bytes(b"media")
+        monkeypatch.setattr(
+            "gateway.platforms.base.MEDIA_DELIVERY_SAFE_ROOTS",
+            (media_root,),
+        )
+        media_path = media_file.resolve()
+
+        class _ForumAdapter(AsyncMock):
+            async def get_chat_info(self, chat_id):
+                return {"name": "Reports", "type": "supergroup", "is_forum": True}
+
+        adapter = _ForumAdapter()
+        adapter.send.return_value = SendResult(success=True, message_id="1")
+        adapter.send_image_file.return_value = SendResult(success=True, message_id="2")
+
+        pconfig = MagicMock()
+        pconfig.enabled = True
+        mock_cfg = MagicMock()
+        mock_cfg.platforms = {Platform.TELEGRAM: pconfig}
+        mock_cfg.filter_silence_narration = False
+
+        loop = MagicMock()
+        loop.is_running.return_value = True
+
+        job = {
+            "id": "strict-topic-report-job",
+            "deliver": "telegram:-1001234567890:4242",
+        }
+
+        def fake_run_coro(coro, _loop):
+            import asyncio as _asyncio
+            future = Future()
+            try:
+                future.set_result(_asyncio.run(coro))
+            except BaseException as _e:  # noqa: BLE001
+                future.set_exception(_e)
+            return future
+
+        with patch("gateway.config.load_gateway_config", return_value=mock_cfg), \
+             patch("cron.scheduler.load_config", return_value={"cron": {"wrap_response": False}}), \
+             patch("asyncio.run_coroutine_threadsafe", side_effect=fake_run_coro):
+            result = _deliver_result(
+                job,
+                f"Daily report\nMEDIA:{media_path}",
+                adapters={Platform.TELEGRAM: adapter},
+                loop=loop,
+            )
+
+        assert result is None, f"expected clean delivery, got: {result!r}"
+        adapter.send.assert_called_once()
+        text_metadata = adapter.send.call_args[1]["metadata"]
+        assert str(text_metadata.get("thread_id")) == "4242"
+        assert text_metadata.get("strict_topic_delivery") is True
+
+        adapter.send_image_file.assert_called_once()
+        media_metadata = adapter.send_image_file.call_args[1]["metadata"]
+        assert str(media_metadata.get("thread_id")) == "4242"
+        assert media_metadata.get("strict_topic_delivery") is True
+
+    def test_live_adapter_strict_topic_failure_does_not_count_as_delivered(self):
+        """When the adapter refuses General fallback under strict delivery,
+        the scheduler must treat it as a failed live send (not a clean
+        delivery-with-warning)."""
+        from gateway.config import Platform
+        from gateway.platforms.base import SendResult
+        from concurrent.futures import Future
+
+        send_result = SendResult(
+            success=False,
+            error="Strict topic delivery failed for thread 17: Message thread not found",
+            retryable=False,
+        )
+        adapter = MagicMock()
+        adapter.send = AsyncMock(return_value=send_result)
+
+        pconfig = MagicMock()
+        pconfig.enabled = True
+        mock_cfg = MagicMock()
+        mock_cfg.platforms = {Platform.TELEGRAM: pconfig}
+        mock_cfg.filter_silence_narration = False
+
+        loop = MagicMock()
+        loop.is_running.return_value = True
+
+        job = {
+            "id": "strict-fail-job",
+            "deliver": "telegram:-1001234567890:17",
+        }
+
+        def fake_run_coro(coro, _loop):
+            import asyncio as _asyncio
+            future = Future()
+            try:
+                future.set_result(_asyncio.run(coro))
+            except BaseException as _e:  # noqa: BLE001
+                future.set_exception(_e)
+            return future
+
+        with patch("gateway.config.load_gateway_config", return_value=mock_cfg), \
+             patch("cron.scheduler.load_config", return_value={"cron": {"wrap_response": False}}), \
+             patch("asyncio.run_coroutine_threadsafe", side_effect=fake_run_coro), \
+             patch("tools.send_message_tool._send_to_platform", new_callable=AsyncMock) as standalone:
+            standalone.return_value = {
+                "success": False,
+                "error": "Strict topic delivery failed for thread 17: Message thread not found",
+            }
+            result = _deliver_result(
+                job,
+                "Hello world",
+                adapters={Platform.TELEGRAM: adapter},
+                loop=loop,
+            )
+
+        assert result is not None
+        assert "strict topic delivery failed" in result.lower()
+        sent_metadata = adapter.send.call_args[1]["metadata"]
+        assert sent_metadata.get("strict_topic_delivery") is True
+        # Standalone fallback must also keep the strict contract.
+        assert standalone.await_count >= 1
+        assert standalone.await_args.kwargs.get("strict_topic_delivery") is True
 
 
 class TestDeliverResultLiveAdapterUnconfirmed:

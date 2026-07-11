@@ -436,6 +436,117 @@ async def test_send_retries_transient_thread_not_found_before_fallback():
 
 
 @pytest.mark.asyncio
+async def test_strict_topic_delivery_success():
+    """Strict topic sends land in the requested topic on the happy path."""
+    adapter = _make_adapter()
+    call_log = []
+
+    async def mock_send_message(**kwargs):
+        call_log.append(dict(kwargs))
+        return SimpleNamespace(message_id=501)
+
+    adapter._bot = SimpleNamespace(send_message=mock_send_message)
+
+    result = await adapter.send(
+        chat_id="-100123",
+        content="strict topic ok",
+        metadata={"thread_id": "4242", "strict_topic_delivery": True},
+    )
+
+    assert result.success is True
+    assert result.message_id == "501"
+    assert result.raw_response["thread_fallback"] is False
+    assert len(call_log) == 1
+    assert call_log[0]["message_thread_id"] == 4242
+
+
+@pytest.mark.asyncio
+async def test_strict_topic_delivery_retries_identical_topic_then_succeeds():
+    """Strict sends retry the same topic once on a transient thread-not-found."""
+    adapter = _make_adapter()
+    call_log = []
+
+    async def mock_send_message(**kwargs):
+        call_log.append(dict(kwargs))
+        if len(call_log) == 1:
+            raise FakeBadRequest("Message thread not found")
+        return SimpleNamespace(message_id=502)
+
+    adapter._bot = SimpleNamespace(send_message=mock_send_message)
+
+    result = await adapter.send(
+        chat_id="-100123",
+        content="strict topic retry",
+        metadata={"thread_id": "4242", "strict_topic_delivery": True},
+    )
+
+    assert result.success is True
+    assert result.message_id == "502"
+    assert result.raw_response["thread_fallback"] is False
+    assert len(call_log) == 2
+    assert call_log[0]["message_thread_id"] == 4242
+    assert call_log[1]["message_thread_id"] == 4242
+
+
+@pytest.mark.asyncio
+async def test_strict_topic_delivery_double_failure_refuses_root_fallback():
+    """After two identical-topic failures, strict sends must not land in General."""
+    adapter = _make_adapter()
+    call_log = []
+
+    async def mock_send_message(**kwargs):
+        call_log.append(dict(kwargs))
+        raise FakeBadRequest("Message thread not found")
+
+    adapter._bot = SimpleNamespace(send_message=mock_send_message)
+
+    result = await adapter.send(
+        chat_id="-100123",
+        content="strict topic gone",
+        metadata={"thread_id": "4242", "strict_topic_delivery": True},
+    )
+
+    assert result.success is False
+    assert "strict topic delivery failed" in str(result.error).lower()
+    assert "4242" in str(result.error)
+    assert result.retryable is False
+    # Exactly two attempts — both with the same topic, never a root send.
+    assert len(call_log) == 2
+    assert call_log[0]["message_thread_id"] == 4242
+    assert call_log[1]["message_thread_id"] == 4242
+    assert all(c.get("message_thread_id") is not None for c in call_log)
+
+
+@pytest.mark.asyncio
+async def test_non_strict_topic_delivery_still_falls_back_to_root():
+    """Ordinary interactive callers keep the legacy General/root soft fallback."""
+    adapter = _make_adapter()
+    call_log = []
+
+    async def mock_send_message(**kwargs):
+        call_log.append(dict(kwargs))
+        tid = kwargs.get("message_thread_id")
+        if tid is not None:
+            raise FakeBadRequest("Message thread not found")
+        return SimpleNamespace(message_id=503)
+
+    adapter._bot = SimpleNamespace(send_message=mock_send_message)
+
+    result = await adapter.send(
+        chat_id="-100123",
+        content="legacy fallback",
+        metadata={"thread_id": "4242"},
+    )
+
+    assert result.success is True
+    assert result.raw_response["thread_fallback"] is True
+    assert len(call_log) == 3
+    assert call_log[0]["message_thread_id"] == 4242
+    assert call_log[1]["message_thread_id"] == 4242
+    assert call_log[2]["message_thread_id"] is None
+
+
+@pytest.mark.asyncio
 async def test_send_private_dm_topic_uses_direct_messages_topic_id():
     """Private Telegram topics route sends via direct_messages_topic_id."""
     adapter = _make_adapter()

@@ -1561,10 +1561,16 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
                 route_metadata = {
                     "direct_messages_topic_id": str(thread_id),
                     "job_id": job["id"],
+                    # Explicit topic cron/report: never fall back into General
+                    # if the topic disappears after validation.
+                    "strict_topic_delivery": True,
                 }
                 # Media metadata mirrors the text routing so attachments land in
                 # the same DM topic instead of the General lane (#22773).
-                media_metadata = {"direct_messages_topic_id": str(thread_id)}
+                media_metadata = {
+                    "direct_messages_topic_id": str(thread_id),
+                    "strict_topic_delivery": True,
+                }
             else:
                 # Forum-style topic (private chat / supergroup) or non-topic
                 # target: route via message_thread_id (#52060).  Put thread_id in
@@ -1578,7 +1584,12 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
                 route_metadata = {"job_id": job["id"]}
                 if route_thread_id:
                     route_metadata["thread_id"] = route_thread_id
+                    # Explicit Telegram topic target: opt into fail-closed
+                    # delivery so a disappeared topic cannot land in General.
+                    route_metadata["strict_topic_delivery"] = True
                 media_metadata = {"thread_id": thread_id} if thread_id else None
+                if media_metadata is not None:
+                    media_metadata["strict_topic_delivery"] = True
 
             try:
                 # Send cleaned text (MEDIA tags stripped) — not the raw content.
@@ -1803,7 +1814,21 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
                 delivery_errors.extend(target_errors)
                 continue
             # Standalone path: run the async send in a fresh event loop (safe from any thread)
-            coro = _send_to_platform(platform, pconfig, chat_id, cleaned_delivery_content, thread_id=thread_id, media_files=media_files)
+            # Explicit Telegram topic targets keep strict_topic_delivery so a
+            # disappeared topic cannot fall back into General via the
+            # standalone soft-fallback path either.
+            _strict_topic = (
+                platform == Platform.TELEGRAM and thread_id is not None
+            )
+            coro = _send_to_platform(
+                platform,
+                pconfig,
+                chat_id,
+                cleaned_delivery_content,
+                thread_id=thread_id,
+                media_files=media_files,
+                strict_topic_delivery=_strict_topic,
+            )
             try:
                 result = asyncio.run(coro)
             except RuntimeError as run_err:
@@ -1832,7 +1857,18 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
                 try:
                     pool = concurrent.futures.ThreadPoolExecutor(max_workers=1)
                     try:
-                        future = pool.submit(asyncio.run, _send_to_platform(platform, pconfig, chat_id, cleaned_delivery_content, thread_id=thread_id, media_files=media_files))
+                        future = pool.submit(
+                            asyncio.run,
+                            _send_to_platform(
+                                platform,
+                                pconfig,
+                                chat_id,
+                                cleaned_delivery_content,
+                                thread_id=thread_id,
+                                media_files=media_files,
+                                strict_topic_delivery=_strict_topic,
+                            ),
+                        )
                         result = future.result(timeout=30)
                     finally:
                         pool.shutdown(wait=False)
