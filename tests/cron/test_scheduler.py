@@ -3762,6 +3762,7 @@ class TestDeliverResultTimeoutCancelsFuture:
         assert str(media_metadata.get("direct_messages_topic_id")) == "7072"
         assert not media_metadata.get("message_thread_id")
         assert not media_metadata.get("thread_id")
+        assert media_metadata.get("strict_topic_delivery") is True
 
     def test_live_adapter_forum_thread_fallback_records_delivery_error(self):
         """A forum/supergroup cron target whose configured topic is gone must
