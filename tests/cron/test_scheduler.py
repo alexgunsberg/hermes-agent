@@ -3942,7 +3942,7 @@ class TestDeliverResultTimeoutCancelsFuture:
         with patch("gateway.config.load_gateway_config", return_value=mock_cfg), \
              patch("cron.scheduler.load_config", return_value={"cron": {"wrap_response": False}}), \
              patch("asyncio.run_coroutine_threadsafe", side_effect=fake_run_coro), \
-             patch("cron.scheduler._send_to_platform", new_callable=AsyncMock) as standalone:
+             patch("tools.send_message_tool._send_to_platform", new_callable=AsyncMock) as standalone:
             standalone.return_value = {
                 "success": False,
                 "error": "Strict topic delivery failed for thread 17: Message thread not found",
