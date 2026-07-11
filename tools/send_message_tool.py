@@ -720,7 +720,7 @@ async def _send_via_adapter(
     }
 
 
-async def _send_to_platform(platform, pconfig, chat_id, message, thread_id=None, media_files=None, force_document=False):
+async def _send_to_platform(platform, pconfig, chat_id, message, thread_id=None, media_files=None, force_document=False, strict_topic_delivery=False):
     """Route a message to the appropriate platform sender.
 
     Long messages are automatically chunked to fit within platform limits
@@ -800,6 +800,7 @@ async def _send_to_platform(platform, pconfig, chat_id, message, thread_id=None,
             thread_id=thread_id,
             disable_link_previews=disable_link_previews,
             force_document=force_document,
+            strict_topic_delivery=strict_topic_delivery,
         )
 
     # --- Discord: chunked delivery via the registry's standalone_sender_fn.
@@ -1014,13 +1015,17 @@ def _is_telegram_thread_not_found(error: Exception) -> bool:
     return "thread not found" in str(error).lower()
 
 
-async def _send_telegram(token, chat_id, message, media_files=None, thread_id=None, disable_link_previews=False, force_document=False):
+async def _send_telegram(token, chat_id, message, media_files=None, thread_id=None, disable_link_previews=False, force_document=False, strict_topic_delivery=False):
     """Send via Telegram Bot API (one-shot, no polling needed).
 
     Applies markdown→MarkdownV2 formatting (same as the gateway adapter)
     so that bold, links, and headers render correctly.  If the message
     already contains HTML tags, it is sent with ``parse_mode='HTML'``
     instead, bypassing MarkdownV2 conversion.
+
+    When ``strict_topic_delivery`` is set with a ``thread_id``, a
+    disappeared/transient topic is retried once on the same topic and then
+    returned as an error — never fallen back into the parent chat/General.
     """
     try:
         from telegram import Bot
@@ -1129,20 +1134,45 @@ async def _send_telegram(token, chat_id, message, media_files=None, thread_id=No
                         parse_mode=send_parse_mode, **text_kwargs
                     )
                 except Exception as md_error:
-                    # Thread not found — retry without message_thread_id so the
-                    # message still delivers (matching the gateway adapter's
-                    # fallback behaviour, issue #27012).
+                    # Thread not found — for strict topic delivery, retry the
+                    # identical topic once, then fail closed (no General /
+                    # root-chat fallback). Legacy callers keep the soft
+                    # fallback that drops message_thread_id (issue #27012).
                     if _is_telegram_thread_not_found(md_error) and text_kwargs.get("message_thread_id") is not None:
-                        logger.warning(
-                            "Thread %s not found in _send_telegram, retrying without message_thread_id",
-                            text_kwargs.get("message_thread_id"),
-                        )
-                        text_kwargs.pop("message_thread_id", None)
-                        last_msg = await _send_telegram_message_with_retry(
-                            bot,
-                            chat_id=int_chat_id, text=chunk,
-                            parse_mode=send_parse_mode, **text_kwargs
-                        )
+                        requested_tid = text_kwargs.get("message_thread_id")
+                        if strict_topic_delivery:
+                            logger.warning(
+                                "Thread %s not found in _send_telegram (strict), "
+                                "retrying once with same thread_id",
+                                requested_tid,
+                            )
+                            try:
+                                last_msg = await _send_telegram_message_with_retry(
+                                    bot,
+                                    chat_id=int_chat_id, text=chunk,
+                                    parse_mode=send_parse_mode, **text_kwargs
+                                )
+                            except Exception as retry_err:
+                                if _is_telegram_thread_not_found(retry_err):
+                                    return {
+                                        "success": False,
+                                        "error": (
+                                            f"Strict topic delivery failed for thread "
+                                            f"{requested_tid}: {retry_err}"
+                                        ),
+                                    }
+                                raise
+                        else:
+                            logger.warning(
+                                "Thread %s not found in _send_telegram, retrying without message_thread_id",
+                                requested_tid,
+                            )
+                            text_kwargs.pop("message_thread_id", None)
+                            last_msg = await _send_telegram_message_with_retry(
+                                bot,
+                                chat_id=int_chat_id, text=chunk,
+                                parse_mode=send_parse_mode, **text_kwargs
+                            )
                     elif "parse" in str(md_error).lower() or "markdown" in str(md_error).lower() or "html" in str(md_error).lower():
                         logger.warning(
                             "Parse mode %s failed in _send_telegram, falling back to plain text: %s",
@@ -1199,35 +1229,74 @@ async def _send_telegram(token, chat_id, message, media_files=None, thread_id=No
                             )
                     except Exception as media_err:
                         if _is_telegram_thread_not_found(media_err) and media_kwargs.get("message_thread_id"):
-                            # Thread not found for media — retry without
-                            # message_thread_id (issue #27012).
-                            logger.warning(
-                                "Thread %s not found for media send, retrying without message_thread_id",
-                                media_kwargs["message_thread_id"],
-                            )
+                            requested_tid = media_kwargs["message_thread_id"]
                             # Re-seek the file since the first attempt consumed it
                             f.seek(0)
-                            media_kwargs.pop("message_thread_id", None)
-                            if ext in _IMAGE_EXTS and not force_document:
-                                last_msg = await bot.send_photo(
-                                    chat_id=int_chat_id, photo=f, **media_kwargs
+                            if strict_topic_delivery:
+                                logger.warning(
+                                    "Thread %s not found for media send (strict), "
+                                    "retrying once with same thread_id",
+                                    requested_tid,
                                 )
-                            elif ext in _VIDEO_EXTS:
-                                last_msg = await bot.send_video(
-                                    chat_id=int_chat_id, video=f, **media_kwargs
-                                )
-                            elif ext in _VOICE_EXTS and is_voice:
-                                last_msg = await bot.send_voice(
-                                    chat_id=int_chat_id, voice=f, **media_kwargs
-                                )
-                            elif ext in _TELEGRAM_SEND_AUDIO_EXTS:
-                                last_msg = await bot.send_audio(
-                                    chat_id=int_chat_id, audio=f, **media_kwargs
-                                )
+                                try:
+                                    if ext in _IMAGE_EXTS and not force_document:
+                                        last_msg = await bot.send_photo(
+                                            chat_id=int_chat_id, photo=f, **media_kwargs
+                                        )
+                                    elif ext in _VIDEO_EXTS:
+                                        last_msg = await bot.send_video(
+                                            chat_id=int_chat_id, video=f, **media_kwargs
+                                        )
+                                    elif ext in _VOICE_EXTS and is_voice:
+                                        last_msg = await bot.send_voice(
+                                            chat_id=int_chat_id, voice=f, **media_kwargs
+                                        )
+                                    elif ext in _TELEGRAM_SEND_AUDIO_EXTS:
+                                        last_msg = await bot.send_audio(
+                                            chat_id=int_chat_id, audio=f, **media_kwargs
+                                        )
+                                    else:
+                                        last_msg = await bot.send_document(
+                                            chat_id=int_chat_id, document=f, **media_kwargs
+                                        )
+                                except Exception as retry_err:
+                                    if _is_telegram_thread_not_found(retry_err):
+                                        return {
+                                            "success": False,
+                                            "error": (
+                                                f"Strict topic delivery failed for thread "
+                                                f"{requested_tid}: {retry_err}"
+                                            ),
+                                        }
+                                    raise
                             else:
-                                last_msg = await bot.send_document(
-                                    chat_id=int_chat_id, document=f, **media_kwargs
+                                # Thread not found for media — retry without
+                                # message_thread_id (issue #27012).
+                                logger.warning(
+                                    "Thread %s not found for media send, retrying without message_thread_id",
+                                    requested_tid,
                                 )
+                                media_kwargs.pop("message_thread_id", None)
+                                if ext in _IMAGE_EXTS and not force_document:
+                                    last_msg = await bot.send_photo(
+                                        chat_id=int_chat_id, photo=f, **media_kwargs
+                                    )
+                                elif ext in _VIDEO_EXTS:
+                                    last_msg = await bot.send_video(
+                                        chat_id=int_chat_id, video=f, **media_kwargs
+                                    )
+                                elif ext in _VOICE_EXTS and is_voice:
+                                    last_msg = await bot.send_voice(
+                                        chat_id=int_chat_id, voice=f, **media_kwargs
+                                    )
+                                elif ext in _TELEGRAM_SEND_AUDIO_EXTS:
+                                    last_msg = await bot.send_audio(
+                                        chat_id=int_chat_id, audio=f, **media_kwargs
+                                    )
+                                else:
+                                    last_msg = await bot.send_document(
+                                        chat_id=int_chat_id, document=f, **media_kwargs
+                                    )
                         else:
                             raise
             except Exception as e:

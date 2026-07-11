@@ -1027,6 +1027,18 @@ class TelegramAdapter(BasePlatformAdapter):
     def _is_thread_not_found_error(error: Exception) -> bool:
         return "thread not found" in str(error).lower()
 
+    @staticmethod
+    def _wants_strict_topic_delivery(metadata: Optional[Dict[str, Any]]) -> bool:
+        """Opt-in: refuse root-chat/General fallback when a topic send fails.
+
+        Callers that pin an explicit Telegram topic (cron/report
+        ``telegram:chat_id:thread_id``, named-topic deliveries, etc.) set
+        ``strict_topic_delivery`` so a disappeared/transient topic cannot
+        silently land in General after validation. Ordinary interactive
+        replies omit the flag and keep the legacy soft fallback.
+        """
+        return bool(metadata and metadata.get("strict_topic_delivery"))
+
     def _prune_stale_dm_topic_binding(
         self, chat_id: Any, thread_id: Any,
     ) -> None:
@@ -1101,6 +1113,10 @@ class TelegramAdapter(BasePlatformAdapter):
            than dropping the message.
         """
         if not (metadata and metadata.get("telegram_dm_topic_reply_fallback")):
+            return False
+        # Strict topic delivery must never strip the topic and land in the
+        # parent chat / All Messages lane.
+        if cls._wants_strict_topic_delivery(metadata):
             return False
         if not cls._is_bad_request_error(error):
             return False
@@ -3702,7 +3718,19 @@ class TelegramAdapter(BasePlatformAdapter):
                         # specific cases instead of blindly retrying.
                         if _BadReq and isinstance(send_err, _BadReq):
                             if self._is_thread_not_found_error(send_err) and effective_thread_id is not None:
-                                if private_dm_topic_send or (metadata and metadata.get("telegram_dm_topic_created_for_send")):
+                                strict_topic = self._wants_strict_topic_delivery(metadata)
+                                private_or_created_topic = (
+                                    private_dm_topic_send
+                                    or bool(metadata and metadata.get("telegram_dm_topic_created_for_send"))
+                                )
+                                # Created / private DM topic lanes must never
+                                # leak into All Messages / root chat. Without
+                                # the strict opt-in they fail closed on the
+                                # first thread-not-found (existing contract).
+                                # Strict topic sends get one identical-topic
+                                # retry for transient flakes, then fail closed
+                                # with no General fallback.
+                                if private_or_created_topic and not strict_topic:
                                     return SendResult(
                                         success=False,
                                         error=str(send_err),
@@ -3713,7 +3741,9 @@ class TelegramAdapter(BasePlatformAdapter):
                                 # an immediate retry (transient flake — see
                                 # test_send_retries_transient_thread_not_found_before_fallback).
                                 # Try the same thread_id once without sleeping
-                                # before falling back to a plain send.
+                                # before either failing closed (strict) or
+                                # falling back to a plain root-chat send
+                                # (legacy interactive path).
                                 if not retried_thread_not_found:
                                     retried_thread_not_found = True
                                     logger.warning(
@@ -3721,6 +3751,30 @@ class TelegramAdapter(BasePlatformAdapter):
                                         self.name, effective_thread_id,
                                     )
                                     continue
+                                if strict_topic or private_or_created_topic:
+                                    # Second failure under a topic-bound
+                                    # contract: refuse General/root fallback
+                                    # so an explicit topic that disappeared
+                                    # after validation cannot leak into the
+                                    # parent chat.
+                                    self._prune_stale_dm_topic_binding(
+                                        chat_id, effective_thread_id,
+                                    )
+                                    safe_topic_error = _redact_telegram_error_text(send_err)
+                                    if strict_topic:
+                                        safe_topic_error = (
+                                            f"Strict topic delivery failed for thread "
+                                            f"{effective_thread_id}: {safe_topic_error}"
+                                        )
+                                        logger.error(
+                                            "[%s] %s; refusing fallback to parent chat",
+                                            self.name, safe_topic_error,
+                                        )
+                                    return SendResult(
+                                        success=False,
+                                        error=safe_topic_error,
+                                        retryable=False,
+                                    )
                                 # Second failure: the thread is genuinely gone.
                                 # Retry without ``message_thread_id`` so the
                                 # message still reaches the chat, and prune
