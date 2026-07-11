@@ -1032,8 +1032,21 @@ def _maybe_auto_subscribe(conn: Any, task_id: str) -> bool:
             or os.environ.get("HERMES_PROFILE")
         )
 
-        # Lazy-import to keep the module-level dependency light
+        # Canonical-target late-origin suppression: when a home-channel (or
+        # other non-origin) report target already exists, do not also
+        # subscribe the calling session origin.
+        from hermes_cli.kanban_late_origin import (
+            should_suppress_late_origin_subscription,
+        )
         from hermes_cli import kanban_db as _kb
+        existing = _kb.list_notify_subs(conn, task_id)
+        if should_suppress_late_origin_subscription(
+            platform=platform,
+            chat_id=chat_id,
+            thread_id=thread_id,
+            existing_subs=existing,
+        ):
+            return False
         _kb.add_notify_sub(
             conn, task_id=task_id,
             platform=platform, chat_id=chat_id,

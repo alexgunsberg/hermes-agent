@@ -430,6 +430,11 @@ class GatewaySlashCommandsMixin:
         # success line ("Created t_abcd  (ready, assignee=...)"). If the user
         # passed --json we don't subscribe; they're clearly scripting and
         # can call /kanban notify-subscribe explicitly.
+        #
+        # Canonical-target late-origin suppression (WS2 / t_425f82a0): when a
+        # home-channel (or other non-origin) report target already exists for
+        # this platform/task, skip the late origin subscription so terminal
+        # notifications stay on the canonical destination.
         if is_create and output:
             m = re.search(r"Created\s+(t_[0-9a-f]+)\b", output)
             if m:
@@ -446,8 +451,19 @@ class GatewaySlashCommandsMixin:
                     if platform_str and chat_id:
                         def _sub():
                             from hermes_cli import kanban_db as _kb
+                            from hermes_cli.kanban_late_origin import (
+                                should_suppress_late_origin_subscription,
+                            )
                             conn = _kb.connect(board=requested_board)
                             try:
+                                existing = _kb.list_notify_subs(conn, task_id)
+                                if should_suppress_late_origin_subscription(
+                                    platform=platform_str,
+                                    chat_id=chat_id,
+                                    thread_id=thread_id or None,
+                                    existing_subs=existing,
+                                ):
+                                    return False
                                 _kb.add_notify_sub(
                                     conn, task_id=task_id,
                                     platform=platform_str, chat_id=chat_id,
@@ -455,14 +471,16 @@ class GatewaySlashCommandsMixin:
                                     user_id=user_id,
                                     notifier_profile=getattr(self, "_kanban_notifier_profile", None) or self._active_profile_name(),
                                 )
+                                return True
                             finally:
                                 conn.close()
-                        await asyncio.to_thread(_sub)
-                        output = (
-                            output.rstrip()
-                            + "\n"
-                            + t("gateway.kanban.subscribed_suffix", task_id=task_id)
-                        )
+                        subscribed = await asyncio.to_thread(_sub)
+                        if subscribed:
+                            output = (
+                                output.rstrip()
+                                + "\n"
+                                + t("gateway.kanban.subscribed_suffix", task_id=task_id)
+                            )
                 except Exception as exc:
                     logger.warning("kanban create auto-subscribe failed: %s", exc)
 

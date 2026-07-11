@@ -2102,6 +2102,33 @@ def test_create_subscribes_gateway_session(monkeypatch, worker_env):
     assert s["user_id"] == "user-9"
 
 
+def test_create_suppresses_late_origin_when_canonical_home_differs(
+    monkeypatch, worker_env
+):
+    """When a telegram home channel (canonical report target) is configured
+    and the calling session is a different chat, kanban_create must not
+    late-subscribe the origin."""
+    from tools import kanban_tools as kt
+
+    monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "abc:fake")
+    monkeypatch.setenv("TELEGRAM_HOME_CHANNEL", "-100111")
+    monkeypatch.setenv("TELEGRAM_HOME_CHANNEL_THREAD_ID", "17")
+    monkeypatch.setenv("HERMES_SESSION_PLATFORM", "telegram")
+    monkeypatch.setenv("HERMES_SESSION_CHAT_ID", "chat-42")
+    monkeypatch.setenv("HERMES_SESSION_THREAD_ID", "thread-7")
+    monkeypatch.setenv("HERMES_SESSION_USER_ID", "user-9")
+
+    out = kt._handle_create({
+        "title": "suppress late origin",
+        "assignee": "peer",
+    })
+    d = json.loads(out)
+    assert d["ok"] is True
+    assert d["subscribed"] is False, d
+    assert _list_subs_for_task(d["task_id"]) == []
+
+
+
 def test_create_subscribes_tui_session_via_session_key(monkeypatch, worker_env):
     """TUI / desktop sessions don't have a platform/chat_id (single
     local channel), but the parent process exports HERMES_SESSION_KEY.
