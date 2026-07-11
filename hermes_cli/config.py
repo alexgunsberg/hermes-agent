@@ -3041,6 +3041,11 @@ DEFAULT_CONFIG = {
         "wait_mode": "document",
         "wait_timeout": 5.0,
 
+        # Seconds an unused language-server client may stay alive before
+        # the idle reaper shuts it down.  Default 600 (10 min).  Set to
+        # ``0`` to disable idle reaping (servers live for the process).
+        "idle_timeout": 600,
+
         # How to handle missing server binaries.
         # ``"auto"`` — try to install via npm/go/pip into
         #              ``<HERMES_HOME>/lsp/bin/`` on first use.
