@@ -507,6 +507,7 @@ async def test_strict_topic_delivery_double_failure_refuses_root_fallback():
     )
 
     assert result.success is False
+    assert result.error_kind == "not_found"
     assert "strict topic delivery failed" in str(result.error).lower()
     assert "4242" in str(result.error)
     assert result.retryable is False
@@ -544,6 +545,143 @@ async def test_non_strict_topic_delivery_still_falls_back_to_root():
     assert call_log[0]["message_thread_id"] == 4242
     assert call_log[1]["message_thread_id"] == 4242
     assert call_log[2]["message_thread_id"] is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("method_name", "bot_method_name", "path_kw", "filename", "payload"),
+    [
+        ("send_image_file", "send_photo", "image_path", "photo.png", b"png-data"),
+        ("send_document", "send_document", "file_path", "report.txt", b"report-data"),
+        ("send_video", "send_video", "video_path", "clip.mp4", b"video-data"),
+        ("send_voice", "send_voice", "audio_path", "clip.ogg", b"ogg-data"),
+        ("send_voice", "send_audio", "audio_path", "clip.mp3", b"mp3-data"),
+    ],
+)
+async def test_strict_media_retries_identical_topic_then_fails_without_fallback(
+    tmp_path,
+    method_name,
+    bot_method_name,
+    path_kw,
+    filename,
+    payload,
+):
+    """Strict media: one identical-topic retry, then structured not_found — no
+    document/base/root fallback that could land in General."""
+    adapter = _make_adapter()
+    media_path = tmp_path / filename
+    media_path.write_bytes(payload)
+    call_log = []
+
+    async def mock_send_media(**kwargs):
+        call_log.append(dict(kwargs))
+        raise FakeBadRequest("Message thread not found")
+
+    # If format/base fallbacks fire, these will be called — assert they are not.
+    adapter.send_document = AsyncMock(side_effect=AssertionError("document fallback must not run"))
+    adapter._bot = SimpleNamespace(**{bot_method_name: mock_send_media})
+
+    result = await getattr(adapter, method_name)(
+        chat_id="-100123",
+        **{path_kw: str(media_path)},
+        metadata={"thread_id": "4242", "strict_topic_delivery": True},
+    )
+
+    assert result.success is False
+    assert result.error_kind == "not_found"
+    assert "strict topic delivery failed" in str(result.error).lower()
+    assert "4242" in str(result.error)
+    assert len(call_log) == 2
+    assert call_log[0]["message_thread_id"] == 4242
+    assert call_log[1]["message_thread_id"] == 4242
+    assert all(c.get("message_thread_id") is not None for c in call_log)
+
+
+@pytest.mark.asyncio
+async def test_strict_send_image_url_retries_identical_topic_then_fails_without_upload_fallback(
+    monkeypatch,
+):
+    """URL photo under strict must not fall through to download/upload or text."""
+    monkeypatch.setattr("tools.url_safety.is_safe_url", lambda url: True)
+    adapter = _make_adapter()
+    call_log = []
+
+    async def mock_send_photo(**kwargs):
+        call_log.append(dict(kwargs))
+        raise FakeBadRequest("Message thread not found")
+
+    adapter._bot = SimpleNamespace(send_photo=mock_send_photo)
+
+    result = await adapter.send_image(
+        chat_id="-100123",
+        image_url="https://example.com/chart.png",
+        metadata={"thread_id": "4242", "strict_topic_delivery": True},
+    )
+
+    assert result.success is False
+    assert result.error_kind == "not_found"
+    assert len(call_log) == 2
+    assert call_log[0]["message_thread_id"] == 4242
+    assert call_log[1]["message_thread_id"] == 4242
+
+
+@pytest.mark.asyncio
+async def test_strict_send_animation_retries_identical_topic_then_fails_without_photo_fallback():
+    adapter = _make_adapter()
+    call_log = []
+
+    async def mock_send_animation(**kwargs):
+        call_log.append(dict(kwargs))
+        raise FakeBadRequest("Message thread not found")
+
+    adapter._bot = SimpleNamespace(send_animation=mock_send_animation)
+    adapter.send_image = AsyncMock(side_effect=AssertionError("photo fallback must not run"))
+
+    result = await adapter.send_animation(
+        chat_id="-100123",
+        animation_url="https://example.com/spin.gif",
+        metadata={"thread_id": "4242", "strict_topic_delivery": True},
+    )
+
+    assert result.success is False
+    assert result.error_kind == "not_found"
+    assert len(call_log) == 2
+    assert call_log[0]["message_thread_id"] == 4242
+    assert call_log[1]["message_thread_id"] == 4242
+
+
+@pytest.mark.asyncio
+async def test_strict_send_multiple_images_refuses_per_image_fallback_on_topic_not_found(
+    monkeypatch,
+):
+    """Media-group strict failure must not fall back to per-image root sends."""
+    from gateway.platforms.base import BasePlatformAdapter
+
+    adapter = _make_adapter()
+    call_log = []
+    fallback_calls = []
+
+    async def mock_send_media_group(**kwargs):
+        call_log.append(dict(kwargs))
+        raise FakeBadRequest("Message thread not found")
+
+    async def refuse_per_image(*args, **kwargs):
+        fallback_calls.append((args, kwargs))
+        raise AssertionError("per-image fallback must not run under strict")
+
+    adapter._bot = SimpleNamespace(send_media_group=mock_send_media_group)
+    monkeypatch.setattr(BasePlatformAdapter, "send_multiple_images", refuse_per_image)
+
+    await adapter.send_multiple_images(
+        chat_id="-100123",
+        images=[("https://example.com/a.png", None), ("https://example.com/b.png", None)],
+        metadata={"thread_id": "4242", "strict_topic_delivery": True},
+    )
+
+    assert fallback_calls == []
+    assert len(call_log) == 2
+    assert call_log[0]["message_thread_id"] == 4242
+    assert call_log[1]["message_thread_id"] == 4242
 
 
 @pytest.mark.asyncio
@@ -865,6 +1003,67 @@ async def test_created_private_topic_thread_not_found_fails_without_root_fallbac
     assert "thread not found" in str(result.error).lower()
     assert len(call_log) == 1
     assert call_log[0]["message_thread_id"] == 32343
+
+
+@pytest.mark.asyncio
+async def test_created_private_topic_ignores_strict_flag_and_fails_immediately():
+    """Hermes-created private DM topics keep immediate-fail even if strict is set.
+
+    Strict identical-topic retry is only for explicit forum/topic sends — not
+    for createForumTopic / anchor-required private DM lanes.
+    """
+    adapter = _make_adapter()
+    call_log = []
+
+    async def mock_send_message(**kwargs):
+        call_log.append(dict(kwargs))
+        raise FakeBadRequest("Message thread not found")
+
+    adapter._bot = SimpleNamespace(send_message=mock_send_message)
+
+    result = await adapter.send(
+        chat_id="123",
+        content="created topic message",
+        metadata={
+            "thread_id": "32343",
+            "telegram_dm_topic_created_for_send": True,
+            "strict_topic_delivery": True,
+        },
+    )
+
+    assert result.success is False
+    assert result.error_kind == "not_found"
+    assert len(call_log) == 1
+    assert call_log[0]["message_thread_id"] == 32343
+
+
+@pytest.mark.asyncio
+async def test_dm_topic_reply_fallback_ignores_strict_flag_and_fails_immediately():
+    """Anchor-required private DM topic sends stay immediate-fail under strict."""
+    adapter = _make_adapter()
+    call_log = []
+
+    async def mock_send_message(**kwargs):
+        call_log.append(dict(kwargs))
+        raise FakeBadRequest("Message thread not found")
+
+    adapter._bot = SimpleNamespace(send_message=mock_send_message)
+
+    result = await adapter.send(
+        chat_id="123",
+        content="anchor required topic",
+        metadata={
+            "thread_id": "20197",
+            "telegram_dm_topic_reply_fallback": True,
+            "telegram_reply_to_message_id": "462",
+            "strict_topic_delivery": True,
+        },
+    )
+
+    assert result.success is False
+    assert result.error_kind == "not_found"
+    assert len(call_log) == 1
+    assert call_log[0]["message_thread_id"] == 20197
 
 
 @pytest.mark.asyncio

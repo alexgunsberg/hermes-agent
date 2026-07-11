@@ -1007,12 +1007,20 @@ async def _send_to_platform(platform, pconfig, chat_id, message, thread_id=None,
 
 
 def _is_telegram_thread_not_found(error: Exception) -> bool:
-    """Check if a Telegram error is a thread-not-found failure.
+    """Check if a Telegram error is a topic/thread-not-found failure.
 
-    Matches the gateway adapter's ``_is_thread_not_found_error`` for
-    the standalone ``_send_telegram`` path (issue #27012).
+    Matches the gateway adapter's ``_is_topic_or_thread_not_found_error`` for
+    the standalone ``_send_telegram`` path (issue #27012 + strict topic delivery).
     """
-    return "thread not found" in str(error).lower()
+    err_lower = str(error).lower()
+    markers = (
+        "message thread not found",
+        "thread not found",
+        "topic_closed",
+        "topic_deleted",
+        "topic not found",
+    )
+    return any(marker in err_lower for marker in markers)
 
 
 async def _send_telegram(token, chat_id, message, media_files=None, thread_id=None, disable_link_previews=False, force_document=False, strict_topic_delivery=False):
@@ -1160,6 +1168,7 @@ async def _send_telegram(token, chat_id, message, media_files=None, thread_id=No
                                             f"Strict topic delivery failed for thread "
                                             f"{requested_tid}: {retry_err}"
                                         ),
+                                        "error_kind": "not_found",
                                     }
                                 raise
                         else:
@@ -1267,6 +1276,7 @@ async def _send_telegram(token, chat_id, message, media_files=None, thread_id=No
                                                 f"Strict topic delivery failed for thread "
                                                 f"{requested_tid}: {retry_err}"
                                             ),
+                                            "error_kind": "not_found",
                                         }
                                     raise
                             else:

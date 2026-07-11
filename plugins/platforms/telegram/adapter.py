@@ -226,6 +226,20 @@ from plugins.platforms.telegram.telegram_network import (
 from utils import atomic_replace, env_float, env_int
 
 _TELEGRAM_IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".webp", ".gif"}
+
+
+class StrictTopicDeliveryError(Exception):
+    """Raised by media send helpers when strict topic delivery fails closed.
+
+    Carries a ready-to-return :class:`SendResult` so media methods can abort
+    without format/base/per-image/root fallbacks.
+    """
+
+    def __init__(self, result: SendResult):
+        self.result = result
+        super().__init__(result.error or "strict topic delivery failed")
+
+
 _TELEGRAM_IMAGE_MIME_TO_EXT = {
     "image/png": ".png",
     "image/jpeg": ".jpg",
@@ -1028,6 +1042,19 @@ class TelegramAdapter(BasePlatformAdapter):
         return "thread not found" in str(error).lower()
 
     @staticmethod
+    def _is_topic_or_thread_not_found_error(error: Exception) -> bool:
+        """True for Bot API topic/thread disappearance (strict media contract)."""
+        err_lower = str(error).lower()
+        markers = (
+            "message thread not found",
+            "thread not found",
+            "topic_closed",
+            "topic_deleted",
+            "topic not found",
+        )
+        return any(marker in err_lower for marker in markers)
+
+    @staticmethod
     def _wants_strict_topic_delivery(metadata: Optional[Dict[str, Any]]) -> bool:
         """Opt-in: refuse root-chat/General fallback when a topic send fails.
 
@@ -1038,6 +1065,21 @@ class TelegramAdapter(BasePlatformAdapter):
         replies omit the flag and keep the legacy soft fallback.
         """
         return bool(metadata and metadata.get("strict_topic_delivery"))
+
+    def _strict_topic_not_found_result(
+        self,
+        thread_id: Any,
+        error: Exception,
+    ) -> "SendResult":
+        """Structured fail-closed result for strict topic/thread disappearance."""
+        safe = _redact_telegram_error_text(error)
+        tid = thread_id if thread_id is not None else "?"
+        return SendResult(
+            success=False,
+            error=f"Strict topic delivery failed for thread {tid}: {safe}",
+            retryable=False,
+            error_kind="not_found",
+        )
 
     def _prune_stale_dm_topic_binding(
         self, chat_id: Any, thread_id: Any,
@@ -1148,10 +1190,54 @@ class TelegramAdapter(BasePlatformAdapter):
         media_label: str,
         reset_media: Optional[Any] = None,
     ) -> Any:
-        """Retry stale private-topic media replies once without the topic anchor."""
+        """Send media under topic-delivery policy.
+
+        - ``strict_topic_delivery`` + topic/thread-not-found: retry the
+          identical topic once, then raise :class:`StrictTopicDeliveryError`
+          (no root/General strip, no format/base fallback here).
+        - Non-strict DM-topic reply-fallback: existing strip-and-retry when
+          the reply anchor / topic id is rejected.
+        - Everything else: re-raise for the caller's normal error path.
+        """
+        has_topic_route = (
+            send_kwargs.get("message_thread_id") is not None
+            or send_kwargs.get("direct_messages_topic_id") is not None
+        )
+        strict = self._wants_strict_topic_delivery(metadata) and has_topic_route
+
         try:
             return await send_fn(**send_kwargs)
         except Exception as send_err:
+            if strict and self._is_topic_or_thread_not_found_error(send_err):
+                requested_tid = (
+                    send_kwargs.get("message_thread_id")
+                    or send_kwargs.get("direct_messages_topic_id")
+                )
+                logger.warning(
+                    "[%s] Thread/topic %s not found for Telegram %s (strict), "
+                    "retrying once with same topic route",
+                    self.name,
+                    requested_tid,
+                    media_label,
+                )
+                if reset_media is not None:
+                    reset_media()
+                try:
+                    return await send_fn(**send_kwargs)
+                except Exception as retry_err:
+                    if self._is_topic_or_thread_not_found_error(retry_err):
+                        self._prune_stale_dm_topic_binding(
+                            send_kwargs.get("chat_id"), requested_tid,
+                        )
+                        result = self._strict_topic_not_found_result(
+                            requested_tid, retry_err,
+                        )
+                        logger.error(
+                            "[%s] %s; refusing media fallback outside topic",
+                            self.name, result.error,
+                        )
+                        raise StrictTopicDeliveryError(result) from retry_err
+                    raise
             if not self._should_retry_without_dm_topic_reply_anchor(
                 send_err,
                 metadata,
@@ -3723,18 +3809,17 @@ class TelegramAdapter(BasePlatformAdapter):
                                     private_dm_topic_send
                                     or bool(metadata and metadata.get("telegram_dm_topic_created_for_send"))
                                 )
-                                # Created / private DM topic lanes must never
-                                # leak into All Messages / root chat. Without
-                                # the strict opt-in they fail closed on the
-                                # first thread-not-found (existing contract).
-                                # Strict topic sends get one identical-topic
-                                # retry for transient flakes, then fail closed
-                                # with no General fallback.
-                                if private_or_created_topic and not strict_topic:
+                                # Hermes-created / anchor-required private DM
+                                # topic lanes must never leak into All Messages
+                                # and must NOT take the strict identical-topic
+                                # retry — fail closed on the first
+                                # thread-not-found (existing contract).
+                                if private_or_created_topic:
                                     return SendResult(
                                         success=False,
                                         error=str(send_err),
                                         retryable=False,
+                                        error_kind="not_found",
                                     )
                                 # Telegram has been observed to return a
                                 # one-off "thread not found" that recovers on
@@ -3751,30 +3836,22 @@ class TelegramAdapter(BasePlatformAdapter):
                                         self.name, effective_thread_id,
                                     )
                                     continue
-                                if strict_topic or private_or_created_topic:
-                                    # Second failure under a topic-bound
-                                    # contract: refuse General/root fallback
-                                    # so an explicit topic that disappeared
-                                    # after validation cannot leak into the
-                                    # parent chat.
+                                if strict_topic:
+                                    # Second failure under strict topic delivery:
+                                    # refuse General/root fallback so an explicit
+                                    # topic that disappeared after validation
+                                    # cannot leak into the parent chat.
                                     self._prune_stale_dm_topic_binding(
                                         chat_id, effective_thread_id,
                                     )
-                                    safe_topic_error = _redact_telegram_error_text(send_err)
-                                    if strict_topic:
-                                        safe_topic_error = (
-                                            f"Strict topic delivery failed for thread "
-                                            f"{effective_thread_id}: {safe_topic_error}"
-                                        )
-                                        logger.error(
-                                            "[%s] %s; refusing fallback to parent chat",
-                                            self.name, safe_topic_error,
-                                        )
-                                    return SendResult(
-                                        success=False,
-                                        error=safe_topic_error,
-                                        retryable=False,
+                                    result = self._strict_topic_not_found_result(
+                                        effective_thread_id, send_err,
                                     )
+                                    logger.error(
+                                        "[%s] %s; refusing fallback to parent chat",
+                                        self.name, result.error,
+                                    )
+                                    return result
                                 # Second failure: the thread is genuinely gone.
                                 # Retry without ``message_thread_id`` so the
                                 # message still reaches the chat, and prune
@@ -5938,6 +6015,8 @@ class TelegramAdapter(BasePlatformAdapter):
                         metadata=metadata,
                     )
             return SendResult(success=True, message_id=str(msg.message_id))
+        except StrictTopicDeliveryError as e:
+            return e.result
         except Exception as e:
             logger.error(
                 "[%s] Failed to send Telegram voice/audio, falling back to base adapter: %s",
@@ -6065,6 +6144,14 @@ class TelegramAdapter(BasePlatformAdapter):
                     "media group",
                     reset_media=_reset_opened_files,
                 )
+            except StrictTopicDeliveryError as e:
+                logger.error(
+                    "[%s] Strict topic media group failed (chunk %d/%d): %s",
+                    self.name, chunk_idx + 1, len(chunks), e.result.error,
+                )
+                # Fail closed — do NOT fall back to per-image sends that could
+                # land outside the requested topic.
+                return
             except Exception as e:
                 logger.warning(
                     "[%s] send_media_group failed (chunk %d/%d), falling back to per-image: %s",
@@ -6125,6 +6212,8 @@ class TelegramAdapter(BasePlatformAdapter):
                     reset_media=lambda: image_file.seek(0),
                 )
             return SendResult(success=True, message_id=str(msg.message_id))
+        except StrictTopicDeliveryError as e:
+            return e.result
         except Exception as e:
             error_str = str(e)
             # Dimension-related errors are the expected case for valid image
@@ -6222,6 +6311,8 @@ class TelegramAdapter(BasePlatformAdapter):
                     reset_media=lambda: f.seek(0),
                 )
             return SendResult(success=True, message_id=str(msg.message_id))
+        except StrictTopicDeliveryError as e:
+            return e.result
         except Exception as e:
             logger.warning(
                 "[%s] Failed to send document: %s",
@@ -6272,6 +6363,8 @@ class TelegramAdapter(BasePlatformAdapter):
                     reset_media=lambda: f.seek(0),
                 )
             return SendResult(success=True, message_id=str(msg.message_id))
+        except StrictTopicDeliveryError as e:
+            return e.result
         except Exception as e:
             logger.warning(
                 "[%s] Failed to send video: %s",
@@ -6326,6 +6419,8 @@ class TelegramAdapter(BasePlatformAdapter):
                 "URL photo",
             )
             return SendResult(success=True, message_id=str(msg.message_id))
+        except StrictTopicDeliveryError as e:
+            return e.result
         except Exception as e:
             logger.warning(
                 "[%s] URL-based send_photo failed, trying file upload: %s",
@@ -6363,6 +6458,8 @@ class TelegramAdapter(BasePlatformAdapter):
                     "uploaded photo",
                 )
                 return SendResult(success=True, message_id=str(msg.message_id))
+            except StrictTopicDeliveryError as e:
+                return e.result
             except Exception as e2:
                 logger.error(
                     "[%s] File upload send_photo also failed: %s",
@@ -6410,6 +6507,8 @@ class TelegramAdapter(BasePlatformAdapter):
                 "animation",
             )
             return SendResult(success=True, message_id=str(msg.message_id))
+        except StrictTopicDeliveryError as e:
+            return e.result
         except Exception as e:
             logger.error(
                 "[%s] Failed to send Telegram animation, falling back to photo: %s",
