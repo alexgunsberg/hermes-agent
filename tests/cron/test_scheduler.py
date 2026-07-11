@@ -3962,6 +3962,79 @@ class TestDeliverResultTimeoutCancelsFuture:
         assert standalone.await_count >= 1
         assert standalone.await_args.kwargs.get("strict_topic_delivery") is True
 
+    def test_live_adapter_strict_media_failure_appended_to_delivery_errors(
+        self, tmp_path, monkeypatch,
+    ):
+        """Live cron media strict failure must surface in delivery_errors while
+        text delivery still succeeds (local output remains saved upstream)."""
+        from gateway.config import Platform
+        from gateway.platforms.base import SendResult
+        from concurrent.futures import Future
+
+        media_root = tmp_path / "media-cache"
+        media_file = media_root / "report.png"
+        media_file.parent.mkdir(parents=True, exist_ok=True)
+        media_file.write_bytes(b"media")
+        monkeypatch.setattr(
+            "gateway.platforms.base.MEDIA_DELIVERY_SAFE_ROOTS",
+            (media_root,),
+        )
+        media_path = media_file.resolve()
+
+        class _ForumAdapter(AsyncMock):
+            async def get_chat_info(self, chat_id):
+                return {"name": "Reports", "type": "supergroup", "is_forum": True}
+
+        adapter = _ForumAdapter()
+        adapter.send.return_value = SendResult(success=True, message_id="1")
+        adapter.send_image_file.return_value = SendResult(
+            success=False,
+            error="Strict topic delivery failed for thread 4242: Message thread not found",
+            retryable=False,
+            error_kind="not_found",
+        )
+
+        pconfig = MagicMock()
+        pconfig.enabled = True
+        mock_cfg = MagicMock()
+        mock_cfg.platforms = {Platform.TELEGRAM: pconfig}
+        mock_cfg.filter_silence_narration = False
+
+        loop = MagicMock()
+        loop.is_running.return_value = True
+
+        job = {
+            "id": "strict-media-fail-job",
+            "deliver": "telegram:-1001234567890:4242",
+        }
+
+        def fake_run_coro(coro, _loop):
+            import asyncio as _asyncio
+            future = Future()
+            try:
+                future.set_result(_asyncio.run(coro))
+            except BaseException as _e:  # noqa: BLE001
+                future.set_exception(_e)
+            return future
+
+        with patch("gateway.config.load_gateway_config", return_value=mock_cfg), \
+             patch("cron.scheduler.load_config", return_value={"cron": {"wrap_response": False}}), \
+             patch("asyncio.run_coroutine_threadsafe", side_effect=fake_run_coro):
+            result = _deliver_result(
+                job,
+                f"Daily report\nMEDIA:{media_path}",
+                adapters={Platform.TELEGRAM: adapter},
+                loop=loop,
+            )
+
+        assert result is not None
+        assert "media send failed" in result.lower()
+        assert "strict topic delivery failed" in result.lower()
+        adapter.send.assert_called_once()
+        adapter.send_image_file.assert_called_once()
+        media_metadata = adapter.send_image_file.call_args[1]["metadata"]
+        assert media_metadata.get("strict_topic_delivery") is True
+
 
 class TestDeliverResultLiveAdapterUnconfirmed:
     """Regression for #47056.
