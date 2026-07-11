@@ -578,7 +578,11 @@ async def test_strict_media_retries_identical_topic_then_fails_without_fallback(
         raise FakeBadRequest("Message thread not found")
 
     # If format/base fallbacks fire, these will be called — assert they are not.
-    adapter.send_document = AsyncMock(side_effect=AssertionError("document fallback must not run"))
+    # Do not shadow the method under test itself (send_document case).
+    if method_name != "send_document":
+        adapter.send_document = AsyncMock(
+            side_effect=AssertionError("document fallback must not run")
+        )
     adapter._bot = SimpleNamespace(**{bot_method_name: mock_send_media})
 
     result = await getattr(adapter, method_name)(
