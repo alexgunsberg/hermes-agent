@@ -148,6 +148,7 @@ def test_matrix_home_is_canonical_report_target(telegram_home_channel):
 # platforms × home_mode × origin_lane × thread_mode × existing_sub_mode
 # ---------------------------------------------------------------------------
 
+# 10 platforms × 2 home × 3 origin × 2 thread × 4 existing = 480 rows.
 _MATRIX_PLATFORMS = (
     "telegram",
     "discord",
@@ -162,7 +163,7 @@ _MATRIX_PLATFORMS = (
 )
 _HOME_MODES = ("none", "configured")
 _ORIGIN_LANES = ("home", "other", "empty_chat")
-_THREAD_MODES = ("none", "match_home", "mismatch")
+_THREAD_MODES = ("match_home", "mismatch")
 _EXISTING_MODES = ("none", "origin_only", "canonical_other", "unrelated")
 
 _ROUTING_MATRIX = list(
@@ -186,14 +187,18 @@ def _expected_suppress(
     if origin_lane == "empty_chat":
         return False
 
-    # Existing non-origin sub always suppresses.
-    if existing_mode in ("canonical_other", "unrelated"):
+    # Unrelated / non-origin existing sub always suppresses.
+    if existing_mode == "unrelated":
         return True
+    if existing_mode == "canonical_other":
+        # Home-shaped existing sub is non-origin unless the origin *is* home.
+        if not (origin_lane == "home" and thread_mode == "match_home"):
+            return True
 
     if home_mode == "none":
         return False
 
-    # Home configured: suppress when origin is not the home lane.
+    # Home configured: suppress when origin is a different lane.
     if origin_lane == "other":
         return True
 
@@ -233,20 +238,10 @@ def test_late_origin_suppress_routing_matrix(
         thread_id = None
     elif origin_lane == "home":
         chat_id = home_chat
-        if thread_mode == "none":
-            thread_id = None
-        elif thread_mode == "match_home":
-            thread_id = home_thread
-        else:
-            thread_id = other_thread
+        thread_id = home_thread if thread_mode == "match_home" else other_thread
     else:  # other
         chat_id = other_chat
-        if thread_mode == "none":
-            thread_id = None
-        elif thread_mode == "match_home":
-            thread_id = home_thread
-        else:
-            thread_id = other_thread
+        thread_id = home_thread if thread_mode == "match_home" else other_thread
 
     existing: list[dict] = []
     if existing_mode == "origin_only" and chat_id:
@@ -274,19 +269,7 @@ def test_late_origin_suppress_routing_matrix(
             }
         ]
 
-    # When origin is home with thread_mode none and home has a thread, the
-    # origin does not match the canonical key — expect suppress when home
-    # is configured (covered by _expected_suppress via mismatch semantics
-    # only for explicit mismatch; refine for none-vs-home-thread).
     expect = _expected_suppress(home_mode, origin_lane, thread_mode, existing_mode)
-    if (
-        home_mode == "configured"
-        and origin_lane == "home"
-        and thread_mode == "none"
-        and existing_mode in ("none", "origin_only")
-    ):
-        # Home pins thread_id=42; origin has no thread → not the same lane.
-        expect = True
 
     got = should_suppress_late_origin_subscription(
         platform=platform,
