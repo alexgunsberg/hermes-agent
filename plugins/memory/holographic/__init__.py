@@ -38,36 +38,27 @@ logger = logging.getLogger(__name__)
 FACT_STORE_SCHEMA = {
     "name": "fact_store",
     "description": (
-        "Deep structured memory with algebraic reasoning. "
-        "Use alongside the memory tool — memory for always-on context, "
-        "fact_store for deep recall and compositional queries.\n\n"
-        "ACTIONS (simple → powerful):\n"
-        "• add — Store a fact the user would expect you to remember.\n"
-        "• search — Keyword lookup ('editor config', 'deploy process').\n"
-        "• probe — Entity recall: ALL facts about a person/thing.\n"
-        "• related — What connects to an entity? Structural adjacency.\n"
-        "• reason — Compositional: facts connected to MULTIPLE entities simultaneously.\n"
-        "• contradict — Memory hygiene: find facts making conflicting claims.\n"
-        "• update/remove/list — CRUD operations.\n\n"
-        "IMPORTANT: Before answering questions about the user, ALWAYS probe or reason first."
+        "Structured local facts: add; lexical search; entity probe/related; "
+        "multi-entity reason; contradict; update/remove/list; trust feedback."
     ),
     "parameters": {
         "type": "object",
         "properties": {
             "action": {
                 "type": "string",
-                "enum": ["add", "search", "probe", "related", "reason", "contradict", "update", "remove", "list"],
+                "enum": ["add", "search", "probe", "related", "reason", "contradict", "update", "remove", "list", "feedback"],
             },
-            "content": {"type": "string", "description": "Fact content (required for 'add')."},
-            "query": {"type": "string", "description": "Search query (required for 'search')."},
-            "entity": {"type": "string", "description": "Entity name for 'probe'/'related'."},
-            "entities": {"type": "array", "items": {"type": "string"}, "description": "Entity names for 'reason'."},
-            "fact_id": {"type": "integer", "description": "Fact ID for 'update'/'remove'."},
+            "content": {"type": "string"},
+            "query": {"type": "string"},
+            "entity": {"type": "string"},
+            "entities": {"type": "array", "items": {"type": "string"}},
+            "fact_id": {"type": "integer"},
             "category": {"type": "string", "enum": ["user_pref", "project", "tool", "general"]},
-            "tags": {"type": "string", "description": "Comma-separated tags."},
-            "trust_delta": {"type": "number", "description": "Trust adjustment for 'update'."},
-            "min_trust": {"type": "number", "description": "Minimum trust filter (default: 0.3)."},
-            "limit": {"type": "integer", "description": "Max results (default: 10)."},
+            "tags": {"type": "string"},
+            "trust_delta": {"type": "number"},
+            "min_trust": {"type": "number"},
+            "limit": {"type": "integer"},
+            "feedback": {"type": "string", "enum": ["helpful", "unhelpful"]},
         },
         "required": ["action"],
     },
@@ -76,8 +67,7 @@ FACT_STORE_SCHEMA = {
 FACT_FEEDBACK_SCHEMA = {
     "name": "fact_feedback",
     "description": (
-        "Rate a fact after using it. Mark 'helpful' if accurate, 'unhelpful' if outdated. "
-        "This trains the memory — good facts rise, bad facts sink."
+        "Rate a recalled fact helpful or unhelpful to adjust trust."
     ),
     "parameters": {
         "type": "object",
@@ -194,13 +184,13 @@ class HolographicMemoryProvider(MemoryProvider):
                 "# Holographic Memory\n"
                 "Active. Empty fact store — proactively add facts the user would expect you to remember.\n"
                 "Use fact_store(action='add') to store durable structured facts about people, projects, preferences, decisions.\n"
-                "Use fact_feedback to rate facts after using them (trains trust scores)."
+                "Use fact_store(action='feedback') after recall to adjust trust."
             )
         return (
             f"# Holographic Memory\n"
             f"Active. {total} facts stored with entity resolution and trust scoring.\n"
             f"Use fact_store to search, probe entities, reason across entities, or add facts.\n"
-            f"Use fact_feedback to rate facts after using them (trains trust scores)."
+            f"Use fact_store(action='feedback') after recall to adjust trust."
         )
 
     def prefetch(self, query: str, *, session_id: str = "") -> str:
@@ -225,7 +215,10 @@ class HolographicMemoryProvider(MemoryProvider):
         pass
 
     def get_tool_schemas(self) -> List[Dict[str, Any]]:
-        return [FACT_STORE_SCHEMA, FACT_FEEDBACK_SCHEMA]
+        # Feedback is folded into fact_store to avoid paying for a second
+        # service-gated schema on every request. Keep the legacy handler below
+        # so resumed sessions containing old fact_feedback calls still work.
+        return [FACT_STORE_SCHEMA]
 
     def handle_tool_call(self, tool_name: str, args: Dict[str, Any], **kwargs) -> str:
         if tool_name == "fact_store":
@@ -346,6 +339,11 @@ class HolographicMemoryProvider(MemoryProvider):
                 )
                 return json.dumps({"facts": facts, "count": len(facts)})
 
+            elif action == "feedback":
+                helpful = args["feedback"] == "helpful"
+                result = store.record_feedback(int(args["fact_id"]), helpful=helpful)
+                return json.dumps(result)
+
             else:
                 return tool_error(f"Unknown action: {action}")
 
@@ -368,15 +366,33 @@ class HolographicMemoryProvider(MemoryProvider):
     # -- Auto-extraction (on_session_end) ------------------------------------
 
     def _auto_extract_facts(self, messages: list) -> None:
-        _PREF_PATTERNS = [
-            re.compile(r'\bI\s+(?:prefer|like|love|use|want|need)\s+(.+)', re.IGNORECASE),
-            re.compile(r'\bmy\s+(?:favorite|preferred|default)\s+\w+\s+is\s+(.+)', re.IGNORECASE),
-            re.compile(r'\bI\s+(?:always|never|usually)\s+(.+)', re.IGNORECASE),
+        """Capture explicit stable user preferences without a manual command.
+
+        This is deliberately narrower than generic conversation extraction.
+        Transient phrases such as "I want you to fix this" and project
+        decisions belong in the active task / PMB, not personal layer-2
+        memory. The background memory-review agent remains the semantic path;
+        this session-end pass is a deterministic safety net for explicit
+        preference language.
+        """
+        clause = r"([^.!?\n]{2,300})"
+        simple_patterns = [
+            (
+                re.compile(rf"\bI\s+prefer\s+{clause}", re.IGNORECASE),
+                lambda m: f"User prefers {m.group(1)}",
+            ),
+            (
+                re.compile(rf"\bI\s+(always|never|usually)\s+{clause}", re.IGNORECASE),
+                lambda m: f"User {m.group(1).lower()} {m.group(2)}",
+            ),
         ]
-        _DECISION_PATTERNS = [
-            re.compile(r'\bwe\s+(?:decided|agreed|chose)\s+(?:to\s+)?(.+)', re.IGNORECASE),
-            re.compile(r'\bthe\s+project\s+(?:uses|needs|requires)\s+(.+)', re.IGNORECASE),
-        ]
+        named_pattern = re.compile(
+            rf"\bmy\s+(favorite|preferred|default)\s+([\w -]{{2,80}}?)\s+is\s+{clause}",
+            re.IGNORECASE,
+        )
+
+        def _clean(value: str) -> str:
+            return " ".join(value.strip(" \t,;:-").split())
 
         extracted = 0
         for msg in messages:
@@ -386,23 +402,25 @@ class HolographicMemoryProvider(MemoryProvider):
             if not isinstance(content, str) or len(content) < 10:
                 continue
 
-            for pattern in _PREF_PATTERNS:
-                if pattern.search(content):
-                    try:
-                        self._store.add_fact(content[:400], category="user_pref")
-                        extracted += 1
-                    except Exception:
-                        pass
-                    break
+            candidates: list[str] = []
+            for pattern, render in simple_patterns:
+                match = pattern.search(content)
+                if match:
+                    candidates.append(_clean(render(match)))
 
-            for pattern in _DECISION_PATTERNS:
-                if pattern.search(content):
-                    try:
-                        self._store.add_fact(content[:400], category="project")
-                        extracted += 1
-                    except Exception:
-                        pass
-                    break
+            named = named_pattern.search(content)
+            if named:
+                candidates.append(_clean(
+                    f"User's {named.group(1).lower()} {_clean(named.group(2))} "
+                    f"is {_clean(named.group(3))}"
+                ))
+
+            for fact in dict.fromkeys(c for c in candidates if c):
+                try:
+                    self._store.add_fact(fact, category="user_pref")
+                    extracted += 1
+                except Exception:
+                    logger.debug("Holographic preference extraction failed", exc_info=True)
 
         if extracted:
             logger.info("Auto-extracted %d facts from conversation", extracted)
