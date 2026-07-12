@@ -28,6 +28,17 @@ def _write_script(tmp_path: Path, name: str, body: str) -> Path:
     return path
 
 
+def _ok_spawn_result() -> dict:
+    return {
+        "returncode": 0,
+        "stdout": "",
+        "stderr": "",
+        "timed_out": False,
+        "elapsed_seconds": 0.0,
+        "error": None,
+    }
+
+
 def _allowlist_pair(monkeypatch, tmp_path, event: str, command: str) -> None:
     monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes_home"))
     shell_hooks._record_approval(event, command)
@@ -212,6 +223,60 @@ class TestSerializePayload:
         assert value["original_chars"] > shell_hooks.MAX_HOOK_FIELD_CHARS
         assert len(raw) <= shell_hooks.MAX_HOOK_PAYLOAD_CHARS
 
+    def test_blocking_observer_event_hook_receives_complete_payload(self):
+        # `blocking: true` on an observer event keeps the historical
+        # complete-payload contract — a formatter reading write_file content
+        # must never receive a truncation stub.
+        big = "x" * (shell_hooks.MAX_HOOK_FIELD_CHARS * 3)
+        raw = shell_hooks._serialize_payload(
+            "post_tool_call",
+            {"tool_name": "write_file", "args": {"content": big}, "result": big},
+            bounded=False,
+        )
+        payload = json.loads(raw)
+        assert payload["tool_input"]["content"] == big
+        assert payload["extra"]["result"] == big
+
+    def test_escape_heavy_string_field_respects_encoded_bound(self):
+        # Every raw char here encodes to two JSON chars; a raw-character
+        # slice would produce a "truncated" field ~2x over the limit.
+        raw = shell_hooks._serialize_payload(
+            "post_tool_call",
+            {"tool_name": "terminal", "result": '"' * 16_000},
+            bounded=True,
+        )
+        field = json.loads(raw)["extra"]["result"]
+        encoded_len = len(json.dumps(field, ensure_ascii=False)) - 2
+        assert encoded_len <= shell_hooks.MAX_HOOK_FIELD_CHARS
+        assert field.endswith("[truncated by Hermes shell-hook payload limit]")
+
+    def test_control_char_structured_preview_respects_encoded_bound(self):
+        # Control characters encode 6x (); the preview of an oversized
+        # structured field must stay bounded after that re-escaping and never
+        # silently displace the whole field.
+        raw = shell_hooks._serialize_payload(
+            "post_llm_call",
+            {"conversation_history": [{"content": "" * 30_000}]},
+            bounded=True,
+        )
+        assert len(raw) <= shell_hooks.MAX_HOOK_PAYLOAD_CHARS
+        value = json.loads(raw)["extra"]["conversation_history"]
+        assert value["_hermes_truncated"] is True
+        preview_encoded = len(json.dumps(value["preview"], ensure_ascii=False)) - 2
+        assert preview_encoded <= shell_hooks.MAX_HOOK_FIELD_CHARS
+
+    def test_many_large_extras_are_omitted_with_marker_and_total_cap_holds(self):
+        kwargs = {f"field_{i:02d}": "y" * 10_000 for i in range(20)}
+        kwargs["tool_name"] = "terminal"
+        raw = shell_hooks._serialize_payload("post_tool_call", kwargs, bounded=True)
+        assert len(raw) <= shell_hooks.MAX_HOOK_PAYLOAD_CHARS
+        extra = json.loads(raw)["extra"]
+        omitted = extra.get("_hermes_truncated_fields")
+        assert omitted, "expected some fields to be omitted with a marker"
+        kept = [k for k in extra if k.startswith("field_")]
+        assert kept, "expected at least one field to survive the total cap"
+        assert set(omitted).isdisjoint(kept)
+
 
 # ── Matcher behaviour ─────────────────────────────────────────────────────
 
@@ -294,21 +359,15 @@ class TestCallbackSubprocess:
         assert cb(tool_name="terminal") is None
 
     def test_observer_hook_returns_without_waiting(self, monkeypatch):
-        completed = threading.Event()
+        entered = threading.Event()
+        release = threading.Event()
 
-        def slow_spawn(_spec, _stdin_json):
-            time.sleep(0.4)
-            completed.set()
-            return {
-                "returncode": 0,
-                "stdout": "",
-                "stderr": "",
-                "timed_out": False,
-                "elapsed_seconds": 0.4,
-                "error": None,
-            }
+        def gated_spawn(_spec, _stdin_json):
+            entered.set()
+            release.wait(timeout=10)
+            return _ok_spawn_result()
 
-        monkeypatch.setattr(shell_hooks, "_spawn", slow_spawn)
+        monkeypatch.setattr(shell_hooks, "_spawn", gated_spawn)
         spec = shell_hooks.ShellHookSpec(
             event="on_session_end", command="observer-command", timeout=10,
             blocking=False,
@@ -316,8 +375,12 @@ class TestCallbackSubprocess:
         cb = shell_hooks._make_callback(spec)
         started = time.monotonic()
         assert cb(session_id="s") is None
-        assert time.monotonic() - started < 0.2
-        assert completed.wait(timeout=2)
+        elapsed = time.monotonic() - started
+        assert entered.wait(timeout=5), "observer worker never started"
+        # The subprocess is still parked on `release`, so a blocking callback
+        # could not have returned yet — no wall-clock race involved.
+        assert elapsed < 5
+        release.set()
 
     def test_behavior_hook_remains_synchronous(self, tmp_path):
         script = _write_script(
@@ -334,26 +397,120 @@ class TestCallbackSubprocess:
         assert time.monotonic() - started >= 0.2
 
     def test_nonblocking_observer_drops_while_previous_run_is_active(
-        self, tmp_path,
+        self, monkeypatch,
     ):
-        calls = tmp_path / "calls"
-        script = _write_script(
-            tmp_path, "single-flight.sh",
-            f"#!/usr/bin/env bash\necho call >> {calls}\nsleep 0.3\n",
-        )
+        entered = threading.Event()
+        release = threading.Event()
+        spawn_calls: list[str] = []
+
+        def gated_spawn(_spec, stdin_json):
+            spawn_calls.append(stdin_json)
+            entered.set()
+            release.wait(timeout=10)
+            return _ok_spawn_result()
+
+        monkeypatch.setattr(shell_hooks, "_spawn", gated_spawn)
         cb = shell_hooks._make_callback(shell_hooks.ShellHookSpec(
-            event="post_tool_call", command=str(script), timeout=10,
+            event="post_tool_call", command="observer-command", timeout=10,
             blocking=False,
         ))
         cb(tool_name="terminal")
-        time.sleep(0.05)
+        assert entered.wait(timeout=5)
+        # First run is provably still in flight (parked on `release`).
         cb(tool_name="terminal")
-        for _ in range(100):
-            if calls.exists():
-                time.sleep(0.4)
-                break
-            time.sleep(0.05)
-        assert calls.read_text().splitlines() == ["call"]
+        assert len(spawn_calls) == 1
+        release.set()
+
+    def test_nonblocking_observer_recovers_after_previous_run_completes(
+        self, monkeypatch,
+    ):
+        # Single-flight must clear its in-flight flag once a run finishes —
+        # a stuck flag would silently drop every future event.
+        release = threading.Event()
+        spawn_calls: list[str] = []
+
+        def gated_spawn(_spec, stdin_json):
+            spawn_calls.append(stdin_json)
+            release.wait(timeout=10)
+            return _ok_spawn_result()
+
+        monkeypatch.setattr(shell_hooks, "_spawn", gated_spawn)
+        cb = shell_hooks._make_callback(shell_hooks.ShellHookSpec(
+            event="post_tool_call", command="observer-command", timeout=10,
+            blocking=False,
+        ))
+        cb(tool_name="terminal")
+        release.set()
+        deadline = time.monotonic() + 5
+        while len(spawn_calls) < 2 and time.monotonic() < deadline:
+            cb(tool_name="terminal")
+            time.sleep(0.01)
+        assert len(spawn_calls) >= 2, "observer never recovered after first run"
+
+    def test_concurrent_observer_invocations_spawn_exactly_one_subprocess(
+        self, monkeypatch,
+    ):
+        release = threading.Event()
+        spawn_calls: list[str] = []
+
+        def gated_spawn(_spec, stdin_json):
+            spawn_calls.append(stdin_json)
+            release.wait(timeout=10)
+            return _ok_spawn_result()
+
+        monkeypatch.setattr(shell_hooks, "_spawn", gated_spawn)
+        cb = shell_hooks._make_callback(shell_hooks.ShellHookSpec(
+            event="post_tool_call", command="observer-command", timeout=10,
+            blocking=False,
+        ))
+        callers = [
+            threading.Thread(target=cb, kwargs={"tool_name": "terminal"})
+            for _ in range(8)
+        ]
+        for t in callers:
+            t.start()
+        for t in callers:
+            t.join(timeout=5)
+        deadline = time.monotonic() + 1
+        while not spawn_calls and time.monotonic() < deadline:
+            time.sleep(0.01)
+        release.set()
+        time.sleep(0.05)
+        assert len(spawn_calls) == 1
+
+    def test_thread_start_failure_does_not_wedge_single_flight(
+        self, monkeypatch,
+    ):
+        spawn_calls: list[str] = []
+
+        def instant_spawn(_spec, stdin_json):
+            spawn_calls.append(stdin_json)
+            return _ok_spawn_result()
+
+        monkeypatch.setattr(shell_hooks, "_spawn", instant_spawn)
+        cb = shell_hooks._make_callback(shell_hooks.ShellHookSpec(
+            event="post_tool_call", command="observer-command", timeout=10,
+            blocking=False,
+        ))
+        real_thread = threading.Thread
+
+        class ExhaustedThread:
+            def __init__(self, *args, **kwargs):
+                pass
+
+            def start(self):
+                raise RuntimeError("can't start new thread")
+
+        monkeypatch.setattr(shell_hooks.threading, "Thread", ExhaustedThread)
+        with pytest.raises(RuntimeError):
+            cb(tool_name="terminal")
+        monkeypatch.setattr(shell_hooks.threading, "Thread", real_thread)
+
+        cb(tool_name="terminal")
+        deadline = time.monotonic() + 5
+        while not spawn_calls and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert len(spawn_calls) == 1, "in_flight flag wedged after start() failure"
 
     def test_malformed_json_stdout_returns_none(self, tmp_path):
         script = _write_script(

@@ -597,7 +597,9 @@ def _make_callback(spec: ShellHookSpec) -> Callable[..., Optional[Dict[str, Any]
             if not spec.matches_tool(kwargs.get("tool_name")):
                 return None
 
-        stdin_json = _serialize_payload(spec.event, kwargs)
+        stdin_json = _serialize_payload(
+            spec.event, kwargs, bounded=not spec.runs_blocking
+        )
         if spec.runs_blocking:
             return _execute(stdin_json)
 
@@ -613,12 +615,19 @@ def _make_callback(spec: ShellHookSpec) -> Callable[..., Optional[Dict[str, Any]
                 )
                 return None
             in_flight = True
-        threading.Thread(
-            target=_execute_nonblocking,
-            args=(stdin_json,),
-            name=f"hermes-shell-hook-{spec.event}",
-            daemon=True,
-        ).start()
+        try:
+            threading.Thread(
+                target=_execute_nonblocking,
+                args=(stdin_json,),
+                name=f"hermes-shell-hook-{spec.event}",
+                daemon=True,
+            ).start()
+        except Exception:
+            # Thread exhaustion must not wedge the hook: leaving in_flight
+            # set would silently drop every future event for this process.
+            with in_flight_lock:
+                in_flight = False
+            raise
         return None
 
     _callback.__name__ = f"shell_hook[{spec.event}:{spec.command}]"
@@ -626,24 +635,31 @@ def _make_callback(spec: ShellHookSpec) -> Callable[..., Optional[Dict[str, Any]
     return _callback
 
 
-def _serialize_payload(event: str, kwargs: Dict[str, Any]) -> str:
+def _serialize_payload(
+    event: str, kwargs: Dict[str, Any], *, bounded: Optional[bool] = None
+) -> str:
     """Render the stdin JSON payload.  Unserialisable values are
     stringified via ``default=str`` rather than dropped.
 
-    Observer payloads bound each potentially user/model-controlled field and
-    the final JSON document. This prevents a multi-megabyte tool result or
-    conversation from being copied wholesale into notification/audit hooks.
+    Nonblocking observer payloads bound each potentially user/model-controlled
+    field and the final JSON document. This prevents a multi-megabyte tool
+    result or conversation from being copied wholesale into notification/audit
+    hooks.
 
-    Behavior-affecting hooks deliberately receive the complete payload. A
-    policy hook must never fail open because the command or arguments it is
-    supposed to inspect were replaced by a truncation preview.
+    Synchronous hooks — policy hooks, and observer-event hooks that keep the
+    default ``blocking: true`` delivery — deliberately receive the complete
+    payload. A hook must never fail open (or misbehave, like a formatter fed
+    a preview instead of file content) because the data it inspects was
+    replaced by a truncation stub.
     """
+    if bounded is None:
+        bounded = event in _NONBLOCKING_OBSERVER_EVENTS
     try:
         cwd = str(Path.cwd())
     except OSError:
         cwd = ""
 
-    if event not in _NONBLOCKING_OBSERVER_EVENTS:
+    if not bounded:
         extras = {
             k: v for k, v in kwargs.items()
             if k not in _TOP_LEVEL_PAYLOAD_KEYS
@@ -666,17 +682,36 @@ def _serialize_payload(event: str, kwargs: Dict[str, Any]) -> str:
         }
         return json.dumps(payload, ensure_ascii=False, default=str)
 
+    def _fit_encoded(value: str, limit: int) -> str:
+        """Truncate ``value`` so its JSON *encoding* (sans quotes) fits limit.
+
+        Slicing raw characters against an encoded-length limit undercounts
+        escape expansion (a raw ``"`` encodes to two chars, control chars to
+        six), so shrink iteratively against the measured encoded length.
+        """
+        truncated = value[:limit]
+        while truncated:
+            encoded_len = len(json.dumps(truncated, ensure_ascii=False)) - 2
+            overshoot = encoded_len - limit
+            if overshoot <= 0:
+                return truncated
+            # Each raw char encodes to 1–6 chars; removing ceil(overshoot/6)
+            # makes progress every pass and converges geometrically.
+            truncated = truncated[: -max(1, (overshoot + 5) // 6)]
+        return truncated
+
     def _bounded(value: Any, limit: int = MAX_HOOK_FIELD_CHARS) -> Any:
         encoded = json.dumps(value, ensure_ascii=False, default=str)
         if len(encoded) <= limit:
             return json.loads(encoded)
+        suffix = "\n… [truncated by Hermes shell-hook payload limit]"
         if isinstance(value, str):
-            suffix = "\n… [truncated by Hermes shell-hook payload limit]"
-            return value[: limit - len(suffix)] + suffix
+            keep = max(0, limit - len(json.dumps(suffix, ensure_ascii=False)) + 2)
+            return _fit_encoded(value, keep) + suffix
         return {
             "_hermes_truncated": True,
             "original_chars": len(encoded),
-            "preview": encoded[:limit],
+            "preview": _fit_encoded(encoded, max(0, limit - 256)),
         }
 
     extras = {
@@ -1094,7 +1129,9 @@ def run_once(
 
     Returns the :func:`_spawn` diagnostic dict plus a ``parsed`` field
     holding the canonical Hermes-wire-shape response."""
-    stdin_json = _serialize_payload(spec.event, kwargs)
+    stdin_json = _serialize_payload(
+        spec.event, kwargs, bounded=not spec.runs_blocking
+    )
     result = _spawn(spec, stdin_json)
     result["parsed"] = _parse_response(spec.event, result["stdout"])
     return result
