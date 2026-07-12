@@ -10,13 +10,17 @@ from typing import Dict
 # read_file=inf prevents infinite persist->read->persist loops.
 PINNED_THRESHOLDS: Dict[str, float] = {
     "read_file": float("inf"),
+    # Instructional tools must be read completely; pagination/persistence
+    # previews invite models to stop after page one. Size is controlled at
+    # skill creation/install time instead.
+    "skill_view": float("inf"),
 }
 
 # Defaults matching the current hardcoded values in tool_result_storage.py.
 # Kept here as the single source of truth; tool_result_storage.py imports these.
-DEFAULT_RESULT_SIZE_CHARS: int = 100_000
-DEFAULT_TURN_BUDGET_CHARS: int = 200_000
-DEFAULT_PREVIEW_SIZE_CHARS: int = 1_500
+DEFAULT_RESULT_SIZE_CHARS: int = 16_000
+DEFAULT_TURN_BUDGET_CHARS: int = 32_000
+DEFAULT_PREVIEW_SIZE_CHARS: int = 800
 
 
 @dataclass(frozen=True)
@@ -72,13 +76,13 @@ _CHARS_PER_TOKEN: int = 4
 # output may occupy. Tool output is not the only thing in the window (system
 # prompt, tool schemas, conversation history, the model's own reply all
 # compete), so these stay well under 1.0.
-_PER_RESULT_WINDOW_FRACTION: float = 0.15
-_PER_TURN_WINDOW_FRACTION: float = 0.30
+_PER_RESULT_WINDOW_FRACTION: float = 0.05
+_PER_TURN_WINDOW_FRACTION: float = 0.10
 
 # Floor so even a tiny-but-admitted model still gets a usable preview/result
 # rather than a 0-char budget.
-_MIN_RESULT_SIZE_CHARS: int = 8_000
-_MIN_TURN_BUDGET_CHARS: int = 16_000
+_MIN_RESULT_SIZE_CHARS: int = 4_000
+_MIN_TURN_BUDGET_CHARS: int = 8_000
 
 
 def budget_for_context_window(context_length: int | None) -> BudgetConfig:

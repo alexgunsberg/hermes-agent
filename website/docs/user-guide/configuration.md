@@ -624,7 +624,7 @@ Controls how much content Hermes loads from each automatic context file before a
 context_file_max_chars: 20000  # default
 ```
 
-Raise it when you intentionally keep larger identity or project-context files and run models with enough context window to carry them:
+Raise it only when the recurring prompt cost is intentional and your model has enough context window to carry it:
 
 ```yaml
 context_file_max_chars: 25000
@@ -635,17 +635,17 @@ context_file_max_chars: 25000
 Controls how much content a single `read_file` call can return. Reads that exceed the limit are rejected with an error telling the agent to use `offset` and `limit` for a smaller range. This prevents a single read of a minified JS bundle or large data file from flooding the context window.
 
 ```yaml
-file_read_max_chars: 100000  # default — ~25-35K tokens
+file_read_max_chars: 20000  # default — ~5-7K tokens
 ```
 
-Raise it if you're on a model with a large context window and frequently read big files. Lower it for small-context models to keep reads efficient:
+Raise it only when repeatedly returning larger file regions is worth the token cost. Lower it further for small-context models:
 
 ```yaml
-# Large context model (200K+)
-file_read_max_chars: 200000
+# Explicit larger-read override
+file_read_max_chars: 40000
 
 # Small local model (16K context)
-file_read_max_chars: 30000
+file_read_max_chars: 10000
 ```
 
 The agent also deduplicates file reads automatically — if the same file region is read twice and the file hasn't changed, a lightweight stub is returned instead of re-sending the content. This resets on context compression so the agent can re-read files after their content is summarized away.

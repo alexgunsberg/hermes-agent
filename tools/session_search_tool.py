@@ -54,6 +54,10 @@ _DEMOTED_SESSION_SOURCES = ("cron",)
 # interactive matches buried under a wall of cron hits, so this is well above
 # the handful of distinct sessions a typical query returns.
 _DISCOVER_SCAN_LIMIT = 300
+_MESSAGE_CONTENT_CHARS = 600
+_DISCOVERY_WINDOW = 2
+_DISCOVERY_BOOKEND = 1
+_SCROLL_MAX_WINDOW = 10
 
 
 def _format_timestamp(ts: Union[int, float, str, None]) -> str:
@@ -122,20 +126,29 @@ def _order_for_recall(raw_results: List[Dict[str, Any]]) -> List[Dict[str, Any]]
 
 def _shape_message(m: Dict[str, Any], anchor_id: Optional[int] = None) -> Dict[str, Any]:
     """Slim a message row for the tool response. Keeps content even if empty."""
+    raw_content = m.get("content")
+    content = raw_content
+    content_chars = len(raw_content) if isinstance(raw_content, str) else 0
+    if isinstance(raw_content, str) and content_chars > _MESSAGE_CONTENT_CHARS:
+        content = raw_content[:_MESSAGE_CONTENT_CHARS].rstrip() + "…"
     entry = {
         "id": m.get("id"),
         "role": m.get("role"),
-        "content": m.get("content"),
+        "content": content,
         "timestamp": m.get("timestamp"),
     }
     if m.get("tool_name"):
         entry["tool_name"] = m.get("tool_name")
     if m.get("tool_calls"):
-        entry["tool_calls"] = m.get("tool_calls")
+        calls = m.get("tool_calls")
+        entry["tool_call_count"] = len(calls) if isinstance(calls, list) else 1
     if m.get("tool_call_id"):
         entry["tool_call_id"] = m.get("tool_call_id")
     if anchor_id is not None and m.get("id") == anchor_id:
         entry["anchor"] = True
+    if content_chars > _MESSAGE_CONTENT_CHARS:
+        entry["content_truncated"] = True
+        entry["content_chars"] = content_chars
     # Strip None values to keep payload tight, but always keep content
     # (absent content is meaningful — tool-call-only assistant turns).
     return {k: v for k, v in entry.items() if v is not None or k in ("content",)}
@@ -208,7 +221,7 @@ def _locate_session_db(session_id: str):
     return None, None
 
 
-def _read_session(db, session_id: str, head: int = 20, tail: int = 10) -> str:
+def _read_session(db, session_id: str, head: int = 8, tail: int = 5) -> str:
     """Read shape: dump a whole session by id (head + tail when large).
 
     Serves the linked-session case — the user dropped an @session reference and
@@ -304,7 +317,7 @@ def _scroll(
     db,
     session_id: str,
     around_message_id: int,
-    window: int = 5,
+    window: int = 3,
     current_session_id: str = None,
 ) -> str:
     """Scroll shape: return a window of messages centered on an anchor.
@@ -322,13 +335,13 @@ def _scroll(
     except (TypeError, ValueError):
         return tool_error("scroll requires integer around_message_id", success=False)
 
-    # Window clamp [1, 20]
+    # Window clamp [1, 10]
     if not isinstance(window, int):
         try:
             window = int(window)
         except (TypeError, ValueError):
-            window = 5
-    window = max(1, min(window, 20))
+            window = 3
+    window = max(1, min(window, _SCROLL_MAX_WINDOW))
 
     # Reject scrolling inside the active session lineage — those messages are
     # already in context.
@@ -468,7 +481,10 @@ def _title_match_result(
     anchor_id = messages[0].get("id") if messages else None
     if anchor_id is not None:
         try:
-            view = db.get_anchored_view(session_id, anchor_id, window=5, bookend=3)
+            view = db.get_anchored_view(
+                session_id, anchor_id,
+                window=_DISCOVERY_WINDOW, bookend=_DISCOVERY_BOOKEND,
+            )
         except Exception:
             logging.debug("get_anchored_view failed for title match %s/%s", session_id, anchor_id, exc_info=True)
             view = {}
@@ -484,11 +500,11 @@ def _title_match_result(
         "matched_role": "session_title",
         "match_message_id": anchor_id,
         "snippet": f"Session title matched: {session_meta.get('title') or title_query}",
-        "bookend_start": [_shape_message(m) for m in (view.get("bookend_start") or messages[:3])],
-        "messages": [_shape_message(m, anchor_id=anchor_id) for m in (view.get("window") or messages[:5])],
-        "bookend_end": [_shape_message(m) for m in (view.get("bookend_end") or messages[-3:])],
+        "bookend_start": [_shape_message(m) for m in (view.get("bookend_start") or messages[:_DISCOVERY_BOOKEND])],
+        "messages": [_shape_message(m, anchor_id=anchor_id) for m in (view.get("window") or messages[:_DISCOVERY_WINDOW + 1])],
+        "bookend_end": [_shape_message(m) for m in (view.get("bookend_end") or messages[-_DISCOVERY_BOOKEND:])],
         "messages_before": view.get("messages_before", 0),
-        "messages_after": view.get("messages_after", max(len(messages) - 5, 0)),
+        "messages_after": view.get("messages_after", max(len(messages) - (_DISCOVERY_WINDOW + 1), 0)),
         "_lineage_root": lineage_root,
     }
     if lineage_root and lineage_root != session_id:
@@ -575,7 +591,10 @@ def _discover(
         hit_sid = match_info.get("session_id") or lineage_root
         msg_id = match_info.get("id")
         try:
-            view = db.get_anchored_view(hit_sid, msg_id, window=5, bookend=3)
+            view = db.get_anchored_view(
+                hit_sid, msg_id,
+                window=_DISCOVERY_WINDOW, bookend=_DISCOVERY_BOOKEND,
+            )
         except Exception as e:
             logging.warning("get_anchored_view failed for %s/%s: %s", hit_sid, msg_id, e, exc_info=True)
             continue
@@ -625,7 +644,7 @@ def session_search(
     # Scroll shape
     session_id: str = None,
     around_message_id: int = None,
-    window: int = 5,
+    window: int = 3,
     # Discovery shape
     sort: str = None,
     # Cross-profile (any shape)
@@ -896,6 +915,36 @@ SESSION_SEARCH_SCHEMA = {
     },
 }
 
+# Keep the long-form calling guide in source/docs, but send a compact API
+# contract on every model request. This overlay is static and therefore
+# byte-stable for the lifetime of a conversation.
+SESSION_SEARCH_SCHEMA["description"] = (
+    "No LLM: search actual Hermes conversation history only in SQLite. "
+    "DISCOVERY: pass query. SCROLL: pass session_id+around_message_id; use "
+    "messages[-1].id to scroll FORWARD. READ: pass session_id alone. BROWSE: "
+    "pass no arguments. SOURCE-FIRST LIMIT: inspect user-provided direct sources "
+    "when accessible; use session_search as secondary context and never infer "
+    "current-world 'not found' from history alone."
+)
+_session_props = SESSION_SEARCH_SCHEMA["parameters"]["properties"]
+_session_props["query"]["description"] = (
+    "FTS5 query; supports quoted phrases, OR, NOT, and prefix *. Omit to browse."
+)
+_session_props["limit"]["description"] = "Maximum discovery/browse results (default 3, max 10)."
+_session_props["sort"]["description"] = "Optional newest/oldest bias; omit for relevance order."
+_session_props["session_id"]["description"] = (
+    "Session to read, or to scroll when paired with around_message_id."
+)
+_session_props["around_message_id"]["description"] = (
+    "Message ID to center a scroll window; use first/last returned ID to move backward/forward."
+)
+_session_props["window"]["description"] = "Messages on each side of a scroll anchor (default 3, range 1–10)."
+_session_props["window"]["default"] = 3
+_session_props["role_filter"]["description"] = (
+    "Comma-separated roles; defaults to user,assistant. Include tool only for tool-output debugging."
+)
+_session_props["profile"]["description"] = "Optional source profile for read-only cross-profile lookup."
+
 
 # --- Registry ---
 from tools.registry import registry, tool_error
@@ -910,7 +959,7 @@ registry.register(
         limit=args.get("limit", 3),
         session_id=args.get("session_id"),
         around_message_id=args.get("around_message_id"),
-        window=args.get("window", 5),
+        window=args.get("window", 3),
         sort=args.get("sort"),
         profile=args.get("profile"),
         db=kw.get("db"),

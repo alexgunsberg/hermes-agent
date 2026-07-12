@@ -1275,16 +1275,15 @@ DEFAULT_CONFIG = {
 
     # Hard cap (chars) for a single automatic context file such as SOUL.md,
     # AGENTS.md, CLAUDE.md, .hermes.md, or .cursorrules before Hermes applies
-    # head/tail truncation. ``null`` (the default) lets the cap scale with the
-    # model's context window (floor 20K, ceiling 500K) so large-context models
-    # rarely truncate a project doc. Set a positive integer to pin a fixed cap
-    # and override the dynamic behavior. Separate from read_file tool limits.
+    # head/tail truncation. ``null`` (the default) uses the fixed 20K safety
+    # cap. Set a positive integer only when the recurring prompt cost is
+    # intentional. Separate from read_file tool limits.
     "context_file_max_chars": None,
 
     # Maximum characters returned by a single read_file call.  Reads that
     # exceed this are rejected with guidance to use offset+limit.
-    # 100K chars ≈ 25–35K tokens across typical tokenisers.
-    "file_read_max_chars": 100_000,
+    # 20K chars ≈ 5–7K tokens across typical tokenisers.
+    "file_read_max_chars": 20_000,
 
     # Seconds to wait at agent-build time for in-flight MCP server discovery
     # to finish before the agent snapshots its tool list.  MCP discovery runs

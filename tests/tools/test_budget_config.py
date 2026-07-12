@@ -31,13 +31,13 @@ class TestModuleConstants:
     """Verify documented default values haven't drifted."""
 
     def test_default_result_size(self):
-        assert DEFAULT_RESULT_SIZE_CHARS == 100_000
+        assert DEFAULT_RESULT_SIZE_CHARS == 16_000
 
     def test_default_turn_budget(self):
-        assert DEFAULT_TURN_BUDGET_CHARS == 200_000
+        assert DEFAULT_TURN_BUDGET_CHARS == 32_000
 
     def test_default_preview_size(self):
-        assert DEFAULT_PREVIEW_SIZE_CHARS == 1_500
+        assert DEFAULT_PREVIEW_SIZE_CHARS == 800
 
 
 class TestPinnedThresholds:
@@ -151,15 +151,15 @@ class TestResolveThreshold:
         assert result == 42
 
     @patch("tools.registry.registry")
-    def test_falls_back_to_registry(self, mock_registry):
-        """When not pinned and not in overrides, delegate to registry."""
+    def test_registry_value_is_capped_by_default_budget(self, mock_registry):
+        """Registry declarations cannot expand the active context budget."""
         mock_registry.get_max_result_size.return_value = 77_777
         cfg = BudgetConfig()
         result = cfg.resolve_threshold("some_tool")
         mock_registry.get_max_result_size.assert_called_once_with(
             "some_tool", default=DEFAULT_RESULT_SIZE_CHARS
         )
-        assert result == 77_777
+        assert result == DEFAULT_RESULT_SIZE_CHARS
 
     @patch("tools.registry.registry")
     def test_registry_receives_custom_default(self, mock_registry):
@@ -175,6 +175,11 @@ class TestResolveThreshold:
         """Canonical case: read_file must always return inf."""
         cfg = BudgetConfig()
         assert cfg.resolve_threshold("read_file") == float("inf")
+
+    def test_pinned_skill_view_returns_inf(self):
+        """Mandatory instructions are bounded at install, never previewed."""
+        cfg = BudgetConfig(tool_overrides={"skill_view": 1})
+        assert cfg.resolve_threshold("skill_view") == float("inf")
 
     @patch("tools.registry.registry")
     def test_registry_value_capped_at_default(self, mock_registry):
@@ -195,11 +200,11 @@ class TestResolveThreshold:
         assert cfg.resolve_threshold("some_tool") == float("inf")
 
     @patch("tools.registry.registry")
-    def test_default_budget_unchanged_for_100k_tool(self, mock_registry):
-        """Default budget keeps 100K registry tools at 100K (no behavior change)."""
+    def test_default_budget_caps_legacy_100k_tool(self, mock_registry):
+        """The default context budget caps legacy 100K registry declarations."""
         mock_registry.get_max_result_size.return_value = 100_000
-        cfg = BudgetConfig()  # default_result_size == 100_000
-        assert cfg.resolve_threshold("web_search") == 100_000
+        cfg = BudgetConfig()
+        assert cfg.resolve_threshold("web_search") == DEFAULT_RESULT_SIZE_CHARS
 
 
 # ---------------------------------------------------------------------------
@@ -232,20 +237,20 @@ class TestBudgetForContextWindow:
     def test_small_model_scaled_down(self):
         """A 65K-token model gets a budget proportional to its window.
 
-        window_chars = 65_536*4 = 262_144; per_result = 15% = 39_321;
-        per_turn = 30% = 78_643. Both below the 100K/200K defaults.
+        window_chars = 65_536*4 = 262_144; per_result = 5% = 13_107;
+        per_turn = 10% = 26_214. Both remain below the fixed defaults.
         """
         cfg = budget_for_context_window(65_536)
         assert cfg.default_result_size < DEFAULT_RESULT_SIZE_CHARS
         assert cfg.turn_budget < DEFAULT_TURN_BUDGET_CHARS
-        assert cfg.default_result_size == int(65_536 * 4 * 0.15)
-        assert cfg.turn_budget == int(65_536 * 4 * 0.30)
+        assert cfg.default_result_size == int(65_536 * 4 * 0.05)
+        assert cfg.turn_budget == int(65_536 * 4 * 0.10)
 
     def test_tiny_model_floored(self):
         """A tiny window can't drop below the floor (usable preview survives)."""
         cfg = budget_for_context_window(8_000)
-        assert cfg.default_result_size >= 8_000
-        assert cfg.turn_budget >= 16_000
+        assert cfg.default_result_size >= 4_000
+        assert cfg.turn_budget >= 8_000
 
     def test_scaled_budget_constrains_oversized_result(self):
         """A 279K-char result against a 65K model exceeds the scaled per-result

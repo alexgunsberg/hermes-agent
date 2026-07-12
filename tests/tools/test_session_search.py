@@ -319,7 +319,7 @@ class TestScrollShape:
         assert "bookend_start" not in result
         assert "bookend_end" not in result
 
-    def test_scroll_window_clamped_to_20(self, db):
+    def test_scroll_window_clamped_to_10(self, db):
         _seed_modpack_sessions(db)
         disc = json.loads(session_search(query="modpack", limit=1, db=db))
         anchor_sid = disc["results"][0]["session_id"]
@@ -327,7 +327,7 @@ class TestScrollShape:
         result = json.loads(session_search(
             session_id=anchor_sid, around_message_id=anchor_mid, window=999, db=db
         ))
-        assert result["window"] == 20
+        assert result["window"] == 10
 
     def test_scroll_window_floor_to_1(self, db):
         _seed_modpack_sessions(db)
@@ -486,7 +486,17 @@ class TestReadShape:
         assert result["mode"] == "read"
         assert result["message_count"] == 50
         assert result["truncated"] is True
-        assert len(result["messages"]) == 30  # head 20 + tail 10
+        assert len(result["messages"]) == 13  # head 8 + tail 5
+
+    def test_read_bounds_large_message_content(self, db):
+        db.create_session("s_large_message", source="cli")
+        db.append_message("s_large_message", role="user", content="x" * 10_000)
+        db._conn.commit()
+        result = json.loads(session_search(session_id="s_large_message", db=db))
+        message = result["messages"][0]
+        assert len(message["content"]) <= 601
+        assert message["content_truncated"] is True
+        assert message["content_chars"] == 10_000
 
 
 # =========================================================================
