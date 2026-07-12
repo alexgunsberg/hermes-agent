@@ -1,8 +1,11 @@
 # Event-Driven Performance & Usage Monitoring
 
-> **Status:** phase 1 implemented (`agent/perf_monitor.py`, `hermes monitor`),
-> plus the cron per-run token ceiling (`cron.max_run_tokens`) from phase 2;
-> remaining phase 2/3 items are proposals
+> **Status:** implemented. Phase 1 (`agent/perf_monitor.py`, `hermes monitor`);
+> phase 2 bounds — cron/subagent token ceilings (`cron.max_run_tokens`,
+> `delegation.max_run_tokens`), alert-only context/session/tool thresholds
+> (`monitor.alert_*`), and the shell-hook circuit breaker; phase 3 —
+> automatic daily FTS optimize/WAL checkpoint, compression-outcome tracking,
+> and operator-confirmed maintenance proposals in the report
 > **Audience:** Hermes operators and contributors working on the agent loop, gateway, and cron
 > **Related:** `docs/observability/README.md` (observer hook contract),
 > `docs/chronos-managed-cron-contract.md` (scale-to-zero precedent),

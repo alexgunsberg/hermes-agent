@@ -442,6 +442,55 @@ def compress_context(
     focus_topic: Optional[str] = None,
     force: bool = False,
 ) -> Tuple[list, str]:
+    """Compress context (see :func:`_compress_context_impl`) and record the
+    attempt's outcome in the performance monitor.
+
+    A compression no-op (aux LLM failed; callers detect it via
+    ``len(returned) == len(input)``) is recorded as a failure — repeated
+    failures mean oversized sessions are silently staying oversized, which
+    is exactly the degradation the monitor exists to surface.
+    """
+    result = _compress_context_impl(
+        agent,
+        messages,
+        system_message,
+        approx_tokens=approx_tokens,
+        task_id=task_id,
+        focus_topic=focus_topic,
+        force=force,
+    )
+    try:
+        from agent.perf_monitor import record_compression
+
+        compressed_messages = result[0]
+        ok = len(compressed_messages) != len(messages)
+        tokens_after = None
+        if ok:
+            try:
+                tokens_after = estimate_request_tokens_rough(compressed_messages)
+            except Exception:
+                tokens_after = None
+        record_compression(
+            session_id=getattr(agent, "session_id", "") or "",
+            ok=ok,
+            tokens_before=approx_tokens,
+            tokens_after=tokens_after,
+        )
+    except Exception:
+        pass
+    return result
+
+
+def _compress_context_impl(
+    agent: Any,
+    messages: list,
+    system_message: str,
+    *,
+    approx_tokens: Optional[int] = None,
+    task_id: str = "default",
+    focus_topic: Optional[str] = None,
+    force: bool = False,
+) -> Tuple[list, str]:
     """Compress conversation context and split the session in SQLite.
 
     Args:

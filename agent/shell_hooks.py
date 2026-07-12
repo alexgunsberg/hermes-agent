@@ -547,14 +547,70 @@ def _spawn(spec: ShellHookSpec, stdin_json: str) -> Dict[str, Any]:
     return result
 
 
+# Circuit breaker for non-blocking observer hooks: after this many
+# consecutive timeouts/errors the hook is skipped for the cooldown, then
+# retried (half-open). A dead notification bridge otherwise costs a full
+# subprocess timeout per lifecycle event, indefinitely. Blocking policy
+# hooks are deliberately exempt — a policy hook must never be silently
+# skipped because its target is slow.
+_BREAKER_THRESHOLD = 3
+_BREAKER_COOLDOWN_S = 300.0
+
+
+def _record_hook_telemetry(spec: "ShellHookSpec", r: Dict[str, Any]) -> None:
+    """Report hook runtime to the performance monitor. Never raises."""
+    try:
+        from agent.perf_monitor import record_hook_event
+
+        record_hook_event(
+            event=spec.event,
+            command=spec.command,
+            duration_ms=int((r.get("elapsed_seconds") or 0.0) * 1000),
+            timed_out=bool(r.get("timed_out")),
+            error=r.get("error"),
+        )
+    except Exception:
+        pass
+
+
 def _make_callback(spec: ShellHookSpec) -> Callable[..., Optional[Dict[str, Any]]]:
     """Build the closure that ``invoke_hook()`` will call per firing."""
 
     in_flight_lock = threading.Lock()
     in_flight = False
+    breaker_lock = threading.Lock()
+    breaker_failures = 0
+    breaker_open_until = 0.0
+
+    def _breaker_allows() -> bool:
+        if spec.runs_blocking:
+            return True
+        with breaker_lock:
+            return time.monotonic() >= breaker_open_until
+
+    def _breaker_record(failed: bool) -> None:
+        nonlocal breaker_failures, breaker_open_until
+        if spec.runs_blocking:
+            return
+        with breaker_lock:
+            if not failed:
+                breaker_failures = 0
+                return
+            breaker_failures += 1
+            if breaker_failures >= _BREAKER_THRESHOLD:
+                breaker_open_until = time.monotonic() + _BREAKER_COOLDOWN_S
+                breaker_failures = 0
+                logger.warning(
+                    "shell hook circuit opened for %.0fs after %d consecutive "
+                    "failures (event=%s command=%s)",
+                    _BREAKER_COOLDOWN_S, _BREAKER_THRESHOLD,
+                    spec.event, spec.command,
+                )
 
     def _execute(stdin_json: str) -> Optional[Dict[str, Any]]:
         r = _spawn(spec, stdin_json)
+        _record_hook_telemetry(spec, r)
+        _breaker_record(failed=bool(r["error"] or r["timed_out"]))
 
         if r["error"]:
             logger.warning(
@@ -600,6 +656,15 @@ def _make_callback(spec: ShellHookSpec) -> Callable[..., Optional[Dict[str, Any]
         stdin_json = _serialize_payload(spec.event, kwargs)
         if spec.runs_blocking:
             return _execute(stdin_json)
+
+        # Circuit breaker: skip a repeatedly failing/timing-out observer hook
+        # for a cooldown instead of paying a subprocess timeout per event.
+        if not _breaker_allows():
+            logger.debug(
+                "shell hook circuit open; skipping (event=%s command=%s)",
+                spec.event, spec.command,
+            )
+            return None
 
         # Observer hooks cannot influence the operation that emitted them.
         # Keep at most one subprocess per configured hook in flight: a dead

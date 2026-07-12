@@ -351,6 +351,22 @@ def _normalize_role(r: Optional[str]) -> str:
     return "leaf"
 
 
+def _get_subagent_max_run_tokens() -> int:
+    """Read ``delegation.max_run_tokens`` from config (0 = unlimited)."""
+    cfg = _load_config()
+    val = cfg.get("max_run_tokens")
+    if val is None:
+        return 0
+    try:
+        return max(0, int(val))
+    except (TypeError, ValueError):
+        logger.warning(
+            "delegation.max_run_tokens=%r is not a valid integer; "
+            "token ceiling disabled", val,
+        )
+        return 0
+
+
 def _get_max_concurrent_children() -> int:
     """Read delegation.max_concurrent_children from config, falling back to
     DELEGATION_MAX_CONCURRENT_CHILDREN env var, then the default (3).
@@ -1336,6 +1352,11 @@ def _build_child_agent(
     child_session_ref["session_id"] = getattr(child, "session_id", "") or ""
     # Set delegation depth so children can't spawn grandchildren
     child._delegate_depth = child_depth
+    # Unattended token ceiling (delegation.max_run_tokens): bounds each
+    # subagent's cumulative non-cache-read token spend — max_iterations
+    # bounds call count but not cost. Crossing it exhausts the child's
+    # iteration budget so the run ends through the normal graceful path.
+    child.max_run_tokens = _get_subagent_max_run_tokens()
     # Stash the post-degrade role for introspection (leaf if the
     # kill switch or depth bounded the caller's requested role).
     child._delegate_role = effective_role

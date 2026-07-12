@@ -209,3 +209,241 @@ class TestCronMaxRunTokens:
 
         assert _resolve_cron_max_run_tokens({"max_run_tokens": "junk"}, {}) == 0
         assert _resolve_cron_max_run_tokens({"max_run_tokens": -5}, {}) == 0
+
+
+class TestAlerts:
+    def test_context_alert_fires_and_dedups(self):
+        big = dict(_api_kwargs()["usage"], prompt_tokens=200_000)
+        perf_monitor.on_post_api_request(**_api_kwargs(usage=big))
+        perf_monitor.on_post_api_request(**_api_kwargs(usage=big))
+
+        conn = sqlite3.connect(perf_monitor._db_path())
+        rows = conn.execute(
+            "SELECT COUNT(*) FROM alerts WHERE kind = 'context_size'"
+        ).fetchone()[0]
+        conn.close()
+        assert rows == 1  # second one deduped within the hour
+
+    def test_session_token_alert(self):
+        usage = dict(_api_kwargs()["usage"], total_tokens=3_000_000)
+        perf_monitor.on_post_api_request(**_api_kwargs(usage=usage))
+
+        conn = sqlite3.connect(perf_monitor._db_path())
+        kinds = [r[0] for r in conn.execute("SELECT kind FROM alerts")]
+        conn.close()
+        assert "session_tokens" in kinds
+
+    def test_slow_tool_alert(self):
+        perf_monitor.on_post_tool_call(
+            tool_name="cursor_agent", session_id="s", duration_ms=300_000,
+            status="success", result="",
+        )
+        conn = sqlite3.connect(perf_monitor._db_path())
+        kinds = [r[0] for r in conn.execute("SELECT kind FROM alerts")]
+        conn.close()
+        assert "slow_tool" in kinds
+
+    def test_tool_error_rate_alert_needs_min_calls(self):
+        for _ in range(9):
+            perf_monitor.on_post_tool_call(
+                tool_name="patch", duration_ms=10, status="error",
+                error_type="E", result="",
+            )
+        conn = sqlite3.connect(perf_monitor._db_path())
+        kinds = [r[0] for r in conn.execute("SELECT kind FROM alerts")]
+        assert "tool_error_rate" not in kinds  # only 9 calls
+        conn.close()
+        perf_monitor.on_post_tool_call(
+            tool_name="patch", duration_ms=10, status="error",
+            error_type="E", result="",
+        )
+        conn = sqlite3.connect(perf_monitor._db_path())
+        kinds = [r[0] for r in conn.execute("SELECT kind FROM alerts")]
+        conn.close()
+        assert "tool_error_rate" in kinds
+
+
+class TestCompressionEvents:
+    def test_failure_streak_raises_alert(self):
+        perf_monitor.record_compression("s", ok=True, tokens_before=300_000,
+                                        tokens_after=50_000)
+        for _ in range(3):
+            perf_monitor.record_compression("s", ok=False, tokens_before=300_000)
+
+        conn = sqlite3.connect(perf_monitor._db_path())
+        conn.row_factory = sqlite3.Row
+        events = conn.execute("SELECT COUNT(*) FROM compression_events").fetchone()[0]
+        kinds = [r["kind"] for r in conn.execute("SELECT kind FROM alerts")]
+        conn.close()
+        assert events == 4
+        assert "compression_failures" in kinds
+
+    def test_report_includes_compression_stats(self):
+        perf_monitor.record_compression("s", ok=True, tokens_before=100_000,
+                                        tokens_after=20_000)
+        report = perf_monitor.generate_report(days=1)
+        assert report["compression"]["attempts"] == 1
+        assert report["compression"]["successes"] == 1
+
+
+class TestHookEvents:
+    def test_recorded_and_reported(self):
+        for _ in range(6):
+            perf_monitor.record_hook_event(
+                "post_tool_call", "notify-bridge.sh", 5000, timed_out=True,
+            )
+        report = perf_monitor.generate_report(days=1)
+        assert report["hooks"][0]["command"] == "notify-bridge.sh"
+        assert report["hooks"][0]["timeouts"] == 6
+        assert any("circuit breaker" in p for p in report["proposals"])
+
+
+class TestMaintenance:
+    def test_runs_once_per_day_and_fails_open(self):
+        home = get_hermes_home()
+        home.mkdir(parents=True, exist_ok=True)
+        # A plain sqlite file without FTS tables: optimize statements must
+        # fail open, the checkpoint succeeds, and the meta stamp is written.
+        sqlite3.connect(home / "state.db").close()
+
+        perf_monitor._run_maintenance()
+
+        conn = sqlite3.connect(perf_monitor._db_path())
+        stamp = conn.execute(
+            "SELECT value FROM meta WHERE key = 'last_maintenance_at'"
+        ).fetchone()
+        conn.close()
+        assert stamp is not None
+        perf_monitor._run_maintenance()  # within a day: early return, no error
+
+    def test_catchup_alert_after_idle_gap(self):
+        from datetime import datetime, timedelta, timezone
+
+        old = (datetime.now(timezone.utc) - timedelta(days=10)).isoformat()
+        conn = perf_monitor._connect()
+        conn.execute(
+            "INSERT INTO api_events (created_at, session_id) VALUES (?, 's')",
+            (old,),
+        )
+        conn.commit()
+        conn.close()
+
+        perf_monitor._check_catchup()
+
+        conn = sqlite3.connect(perf_monitor._db_path())
+        kinds = [r[0] for r in conn.execute("SELECT kind FROM alerts")]
+        conn.close()
+        assert "catchup" in kinds
+
+
+class TestProposals:
+    def test_oversized_gauges_produce_proposals(self):
+        conn = perf_monitor._connect()
+        conn.executemany(
+            "INSERT INTO gauges (created_at, name, value) VALUES (?, ?, ?)",
+            [
+                (perf_monitor._utc_now(), "logs_dir_bytes", 900e6),
+                (perf_monitor._utc_now(), "state_db_bytes", 2e9),
+                (perf_monitor._utc_now(), "skills_count", 300),
+            ],
+        )
+        conn.commit()
+        conn.close()
+
+        proposals = perf_monitor.generate_report(days=1)["proposals"]
+        text = "\n".join(proposals)
+        assert "logs directory" in text
+        assert "state.db" in text
+        assert "curation" in text
+
+
+class TestShellHookCircuitBreaker:
+    @staticmethod
+    def _make_observer_spec():
+        from agent import shell_hooks
+
+        return shell_hooks.ShellHookSpec(
+            event="post_tool_call", command="/bin/false-bridge",
+            matcher=None, timeout=1, blocking=False,
+        )
+
+    def _run_synchronously(self, monkeypatch, spawn_results):
+        from agent import shell_hooks
+
+        calls = {"n": 0}
+
+        def fake_spawn(spec, stdin_json):
+            calls["n"] += 1
+            return spawn_results(calls["n"])
+
+        class SyncThread:
+            def __init__(self, target=None, args=(), **kwargs):
+                self._target, self._args = target, args
+
+            def start(self):
+                self._target(*self._args)
+
+        monkeypatch.setattr(shell_hooks, "_spawn", fake_spawn)
+        monkeypatch.setattr(shell_hooks.threading, "Thread", SyncThread)
+        cb = shell_hooks._make_callback(self._make_observer_spec())
+        return cb, calls
+
+    def test_opens_after_three_consecutive_failures(self, monkeypatch):
+        timeout_result = {
+            "returncode": None, "stdout": "", "stderr": "",
+            "timed_out": True, "elapsed_seconds": 1.0, "error": None,
+        }
+        cb, calls = self._run_synchronously(monkeypatch, lambda n: dict(timeout_result))
+        for _ in range(6):
+            cb(tool_name="terminal")
+        # Three real spawns, then the circuit opens and skips the rest.
+        assert calls["n"] == 3
+
+    def test_success_resets_failure_count(self, monkeypatch):
+        ok_result = {
+            "returncode": 0, "stdout": "", "stderr": "",
+            "timed_out": False, "elapsed_seconds": 0.1, "error": None,
+        }
+        timeout_result = dict(ok_result, timed_out=True)
+
+        def results(n):
+            return dict(timeout_result if n % 3 else ok_result)  # every 3rd ok
+
+        cb, calls = self._run_synchronously(monkeypatch, results)
+        for _ in range(9):
+            cb(tool_name="terminal")
+        assert calls["n"] == 9  # breaker never opens: streak keeps resetting
+
+    def test_blocking_hooks_are_never_skipped(self, monkeypatch):
+        from agent import shell_hooks
+
+        spec = shell_hooks.ShellHookSpec(
+            event="pre_tool_call", command="/bin/policy",
+            matcher=None, timeout=1, blocking=True,
+        )
+        calls = {"n": 0}
+
+        def fake_spawn(_spec, _stdin):
+            calls["n"] += 1
+            return {
+                "returncode": None, "stdout": "", "stderr": "",
+                "timed_out": True, "elapsed_seconds": 1.0, "error": None,
+            }
+
+        monkeypatch.setattr(shell_hooks, "_spawn", fake_spawn)
+        cb = shell_hooks._make_callback(spec)
+        for _ in range(6):
+            cb(tool_name="terminal")
+        assert calls["n"] == 6  # policy hooks always run
+
+
+class TestDelegationMaxRunTokens:
+    def test_resolver(self, monkeypatch):
+        import tools.delegate_tool as dt
+
+        monkeypatch.setattr(dt, "_load_config", lambda: {"max_run_tokens": 400_000})
+        assert dt._get_subagent_max_run_tokens() == 400_000
+        monkeypatch.setattr(dt, "_load_config", lambda: {})
+        assert dt._get_subagent_max_run_tokens() == 0
+        monkeypatch.setattr(dt, "_load_config", lambda: {"max_run_tokens": "junk"})
+        assert dt._get_subagent_max_run_tokens() == 0

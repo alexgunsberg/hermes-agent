@@ -2144,6 +2144,10 @@ DEFAULT_CONFIG = {
         "inherit_mcp_toolsets": True,
         "max_iterations": 50,  # per-subagent iteration cap (each subagent gets its own budget,
                                # independent of the parent's max_iterations)
+        # Per-subagent token ceiling on non-cache-read tokens. max_iterations
+        # bounds call count, not cost; crossing this ends the child's run
+        # through the normal graceful path. 0 = unlimited.
+        "max_run_tokens": 0,
         # Subagent summaries return to the parent's context verbatim. A batch
         # fan-out (N children) returns N summaries at once, which can exceed
         # the parent's context window and trigger a compression/429 death
@@ -2565,6 +2569,14 @@ DEFAULT_CONFIG = {
         # gauges at startup, and powers `hermes monitor`. Zero cost while
         # idle; recording is fail-open and never affects the agent loop.
         "enabled": True,
+        # Daily startup maintenance: passive WAL checkpoint + FTS optimize on
+        # state.db (segment fragmentation is its documented decay mode).
+        "maintenance": True,
+        # Alert thresholds (alert-only — never interrupt a run; 0 disables):
+        "alert_context_tokens": 150000,   # single-request prompt size
+        "alert_session_tokens": 2000000,  # cumulative per-session tokens
+        "alert_tool_seconds": 120,        # single tool call runtime
+        "alert_tool_error_rate": 0.3,     # per-tool 24h error rate (min 10 calls)
     },
 
     "cron": {
