@@ -198,6 +198,37 @@ def test_cross_turn_skill_view_suppresses_when_full_result_remains_in_history():
     assert len(tool_messages[1]["content"]) < 1_000
 
 
+def test_concurrent_path_skill_view_suppresses_when_full_result_remains_in_history():
+    # The parallel executor post-processes results on the main thread; it must
+    # apply the same retention-gated suppression as the sequential path.
+    agent = _make_agent("skill_view")
+    args = {"name": "software-development-workflows"}
+    full_result = json.dumps({"success": True, "content": "x" * 20_000})
+
+    first = SimpleNamespace(
+        content="",
+        tool_calls=[_mock_tool_call("skill_view", json.dumps(args), "c-conc-1")],
+    )
+    second = SimpleNamespace(
+        content="",
+        tool_calls=[_mock_tool_call("skill_view", json.dumps(args), "c-conc-2")],
+    )
+    messages = [_assistant_tool_history("skill_view", args, "c-conc-1")]
+
+    with patch("run_agent.handle_function_call", return_value=full_result) as mock_hfc:
+        agent._execute_tool_calls_concurrent(first, messages, "task-1")
+        agent._tool_guardrails.reset_for_turn()
+        messages.append(_assistant_tool_history("skill_view", args, "c-conc-2"))
+        agent._execute_tool_calls_concurrent(second, messages, "task-1")
+
+    assert mock_hfc.call_count == 2
+    tool_messages = [m for m in messages if m.get("role") == "tool"]
+    assert len(tool_messages[0]["content"]) == len(full_result)
+    compact = json.loads(tool_messages[1]["content"])
+    assert compact["unchanged"] is True
+    assert compact["guardrail"]["code"] == "unchanged_result_suppressed"
+
+
 def test_post_compression_skill_view_returns_full_content_again():
     agent = _make_agent("skill_view")
     args = {"name": "software-development-workflows"}
