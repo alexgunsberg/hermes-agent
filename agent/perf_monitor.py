@@ -206,6 +206,14 @@ _DEFAULT_THRESHOLDS = {
 }
 _ALERT_DEDUP_WINDOW_S = 3600  # one alert per (kind, session) per hour
 
+# post_tool_call statuses that count as tool FAILURES. The full status set
+# emitted by model_tools/tool_executor is: "ok" (success), "error",
+# "timeout", "blocked" (policy veto), "cancelled" (interruption). Only
+# genuine malfunctions belong in error rates — a policy block or a user
+# cancel is not a failing tool.
+_TOOL_FAILURE_STATUSES = ("error", "timeout")
+_TOOL_FAILURE_SQL = "status IN ('error', 'timeout')"
+
 
 def _threshold(key: str):
     try:
@@ -356,7 +364,7 @@ def on_post_tool_call(**kwargs: Any) -> None:
                         duration_ms / 1000, slow_s,
                     )
                 status = str(kwargs.get("status") or "")
-                if status not in ("success", ""):
+                if status in _TOOL_FAILURE_STATUSES:
                     rate_ceiling = float(_threshold("alert_tool_error_rate") or 0)
                     if rate_ceiling > 0 and tool_name:
                         day_ago = (
@@ -364,7 +372,7 @@ def on_post_tool_call(**kwargs: Any) -> None:
                         ).isoformat()
                         calls, errors = conn.execute(
                             "SELECT COUNT(*),"
-                            " SUM(CASE WHEN status NOT IN ('success', '')"
+                            f" SUM(CASE WHEN {_TOOL_FAILURE_SQL}"
                             " THEN 1 ELSE 0 END)"
                             " FROM tool_events WHERE tool_name = ? AND created_at >= ?",
                             (tool_name, day_ago),
@@ -741,7 +749,7 @@ def generate_report(days: int = 7) -> Dict[str, Any]:
                            COUNT(*) AS calls,
                            SUM(duration_ms) AS total_ms,
                            MAX(duration_ms) AS max_ms,
-                           SUM(CASE WHEN status NOT IN ('success', '') THEN 1 ELSE 0 END) AS errors,
+                           SUM(CASE WHEN status IN ('error', 'timeout') THEN 1 ELSE 0 END) AS errors,
                            SUM(output_chars) AS output_chars
                     FROM tool_events WHERE created_at >= ?
                     GROUP BY tool_name ORDER BY total_ms DESC LIMIT 15
