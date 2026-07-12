@@ -8,10 +8,15 @@ Instructions for AI coding assistants and developers working on the hermes-agent
 
 Durable cross-service knowledge for this project lives in the private repo
 `alexgunsberg/hermes-ops` (start with `docs/memory-system.md` and `AGENTS.md`).
-Treat it as layer 3 of the memory system: the accumulated, version-controlled
-source of truth for contracts, workflows, runbooks, and prompts.
+Treat it as the git-distributed part of layer 3: the accumulated,
+version-controlled source of truth for sanitized contracts, workflows,
+runbooks, and prompts. Project-scoped source evidence, facts, decisions, and
+tasks live in local Project Memory Bundles (PMB); use the read-only `pmb` MCP
+retrieval tools when they are available.
 
-- Facts found there are authoritative over anything remembered from a session.
+- Facts found in accepted PMB records or `hermes-ops` are authoritative over
+  anything merely remembered from a session.
+- Automatically captured PMB L0 sources are evidence, not accepted facts.
 - If this session produces a durable insight (decision, runbook, workflow,
   config pattern), propose promoting a sanitized version of it to `hermes-ops`
   rather than leaving it in session memory.
