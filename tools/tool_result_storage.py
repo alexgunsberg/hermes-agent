@@ -17,7 +17,7 @@ Defense against context-window overflow operates at three levels:
 
 3. **Per-turn aggregate budget** (enforce_turn_budget): After all tool
    results in a single assistant turn are collected, if the total exceeds
-   MAX_TURN_BUDGET_CHARS (200K), the largest non-persisted results are
+   the configured turn budget (32K by default), the largest non-persisted results are
    spilled to disk until the aggregate is under budget. This catches cases
    where many medium-sized results combine to overflow context.
 """
@@ -79,15 +79,32 @@ def _safe_result_filename(tool_use_id: str) -> str:
     return f"{safe_stem}.txt"
 
 
+_PREVIEW_OMISSION = "\n\n... [middle omitted; full output saved] ...\n\n"
+
+
 def generate_preview(content: str, max_chars: int = DEFAULT_PREVIEW_SIZE_CHARS) -> tuple[str, bool]:
-    """Truncate at last newline within max_chars. Returns (preview, has_more)."""
+    """Return a bounded head-and-tail preview and whether content was omitted."""
     if len(content) <= max_chars:
         return content, False
-    truncated = content[:max_chars]
-    last_nl = truncated.rfind("\n")
-    if last_nl > max_chars // 2:
-        truncated = truncated[:last_nl + 1]
-    return truncated, True
+
+    if max_chars <= len(_PREVIEW_OMISSION) + 2:
+        return content[:max_chars], True
+
+    available = max_chars - len(_PREVIEW_OMISSION)
+    head_budget = max(1, int(available * 0.6))
+    tail_budget = max(1, available - head_budget)
+
+    head = content[:head_budget]
+    last_nl = head.rfind("\n")
+    if last_nl > head_budget // 2:
+        head = head[:last_nl + 1]
+
+    tail = content[-tail_budget:]
+    first_nl = tail.find("\n")
+    if 0 <= first_nl < tail_budget // 2:
+        tail = tail[first_nl + 1:]
+
+    return head + _PREVIEW_OMISSION + tail, True
 
 
 def _heredoc_marker(content: str) -> str:
@@ -133,7 +150,7 @@ def _build_persisted_message(
     msg += f"This tool result was too large ({original_size:,} characters, {size_str}).\n"
     msg += f"Full output saved to: {file_path}\n"
     msg += "Use the read_file tool with offset and limit to access specific sections of this output.\n\n"
-    msg += f"Preview (first {len(preview)} chars):\n"
+    msg += f"Preview (head + tail, {len(preview)} chars):\n"
     msg += preview
     if has_more:
         msg += "\n..."

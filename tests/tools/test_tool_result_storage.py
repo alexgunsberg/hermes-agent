@@ -39,18 +39,19 @@ class TestGeneratePreview:
         assert len(preview) <= 2000
         assert has_more is True
 
-    def test_truncates_at_newline_boundary(self):
-        # 1500 chars + newline + 600 chars  (past halfway)
-        text = "a" * 1500 + "\n" + "b" * 600
+    def test_keeps_both_head_and_tail(self):
+        text = "HEAD\n" + "x" * 5000 + "\nTAIL"
         preview, has_more = generate_preview(text, max_chars=2000)
-        assert preview == "a" * 1500 + "\n"
+        assert preview.startswith("HEAD\n")
+        assert preview.endswith("\nTAIL")
+        assert "middle omitted" in preview
         assert has_more is True
 
-    def test_ignores_early_newline(self):
-        # Newline at position 100, well before halfway of 2000
-        text = "a" * 100 + "\n" + "b" * 3000
+    def test_preview_never_exceeds_budget(self):
+        text = "a" * 100 + "\n" + "b" * 3000 + "\n" + "c" * 100
         preview, has_more = generate_preview(text, max_chars=2000)
-        assert len(preview) == 2000
+        assert len(preview) <= 2000
+        assert preview.endswith("c" * 100)
         assert has_more is True
 
     def test_empty_content(self):

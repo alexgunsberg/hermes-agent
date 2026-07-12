@@ -54,7 +54,6 @@ _DEMOTED_SESSION_SOURCES = ("cron",)
 # interactive matches buried under a wall of cron hits, so this is well above
 # the handful of distinct sessions a typical query returns.
 _DISCOVER_SCAN_LIMIT = 300
-_MESSAGE_CONTENT_CHARS = 600
 _DISCOVERY_WINDOW = 2
 _DISCOVERY_BOOKEND = 1
 _SCROLL_MAX_WINDOW = 10
@@ -125,30 +124,27 @@ def _order_for_recall(raw_results: List[Dict[str, Any]]) -> List[Dict[str, Any]]
 
 
 def _shape_message(m: Dict[str, Any], anchor_id: Optional[int] = None) -> Dict[str, Any]:
-    """Slim a message row for the tool response. Keeps content even if empty."""
-    raw_content = m.get("content")
-    content = raw_content
-    content_chars = len(raw_content) if isinstance(raw_content, str) else 0
-    if isinstance(raw_content, str) and content_chars > _MESSAGE_CONTENT_CHARS:
-        content = raw_content[:_MESSAGE_CONTENT_CHARS].rstrip() + "…"
+    """Shape a lossless message row for the tool response.
+
+    Window sizes bound ordinary results. Oversized messages are deliberately
+    left intact so the shared tool-result persistence layer can save the full
+    payload and expose a head/tail preview plus a readable artifact path.
+    Producer-side clipping made the omitted evidence unrecoverable.
+    """
     entry = {
         "id": m.get("id"),
         "role": m.get("role"),
-        "content": content,
+        "content": m.get("content"),
         "timestamp": m.get("timestamp"),
     }
     if m.get("tool_name"):
         entry["tool_name"] = m.get("tool_name")
     if m.get("tool_calls"):
-        calls = m.get("tool_calls")
-        entry["tool_call_count"] = len(calls) if isinstance(calls, list) else 1
+        entry["tool_calls"] = m.get("tool_calls")
     if m.get("tool_call_id"):
         entry["tool_call_id"] = m.get("tool_call_id")
     if anchor_id is not None and m.get("id") == anchor_id:
         entry["anchor"] = True
-    if content_chars > _MESSAGE_CONTENT_CHARS:
-        entry["content_truncated"] = True
-        entry["content_chars"] = content_chars
     # Strip None values to keep payload tight, but always keep content
     # (absent content is meaningful — tool-call-only assistant turns).
     return {k: v for k, v in entry.items() if v is not None or k in ("content",)}

@@ -488,15 +488,21 @@ class TestReadShape:
         assert result["truncated"] is True
         assert len(result["messages"]) == 13  # head 8 + tail 5
 
-    def test_read_bounds_large_message_content(self, db):
+    def test_read_preserves_large_message_content_for_shared_persistence(self, db):
         db.create_session("s_large_message", source="cli")
         db.append_message("s_large_message", role="user", content="x" * 10_000)
         db._conn.commit()
         result = json.loads(session_search(session_id="s_large_message", db=db))
         message = result["messages"][0]
-        assert len(message["content"]) <= 601
-        assert message["content_truncated"] is True
-        assert message["content_chars"] == 10_000
+        assert message["content"] == "x" * 10_000
+
+    def test_read_preserves_tool_call_arguments(self, db):
+        db.create_session("s_tool_call", source="cli")
+        calls = [{"id": "call_1", "function": {"name": "terminal", "arguments": {"command": "pytest -q"}}}]
+        db.append_message("s_tool_call", role="assistant", content="", tool_calls=calls)
+        db._conn.commit()
+        result = json.loads(session_search(session_id="s_tool_call", db=db))
+        assert result["messages"][0]["tool_calls"] == calls
 
 
 # =========================================================================

@@ -46,9 +46,8 @@ class BudgetConfig:
         The registry per-tool value is capped at ``default_result_size`` so a
         context-scaled budget (small model) actually constrains tools that
         register a large fixed ``max_result_size_chars`` (web/terminal/x_search
-        all register 100K). For the default budget this is a no-op because both
-        equal 100K; for a scaled-down budget it prevents a per-tool registry
-        value from re-inflating the cap past the model's window (#23767).
+        commonly register 100K). This prevents a registry value from
+        re-inflating the active 16K safety cap past the model's budget.
         """
         if tool_name in PINNED_THRESHOLDS:
             return PINNED_THRESHOLDS[tool_name]
@@ -88,11 +87,8 @@ _MIN_TURN_BUDGET_CHARS: int = 8_000
 def budget_for_context_window(context_length: int | None) -> BudgetConfig:
     """Return a BudgetConfig scaled to the active model's context window.
 
-    The fixed defaults (100K result / 200K turn chars) are correct for large
-    (200K+ token) models but blind to small ones: on a 65K-token model a single
-    tool result persisted at the 100K-char threshold, or a 200K-char turn
-    budget (~50K tokens), can by itself approach or exceed the whole window and
-    force an oversized request (#23767).
+    The fixed defaults (16K result / 32K turn chars) bound recurring history
+    cost on large models while proportional scaling protects smaller ones.
 
     Scaling keeps large models byte-identical to today (the proportional value
     is clamped to the existing defaults as a CAP) while shrinking the budget for
@@ -106,8 +102,7 @@ def budget_for_context_window(context_length: int | None) -> BudgetConfig:
     per_result = int(window_chars * _PER_RESULT_WINDOW_FRACTION)
     per_turn = int(window_chars * _PER_TURN_WINDOW_FRACTION)
 
-    # Clamp: never exceed the historical defaults (so large models are
-    # unchanged), never drop below the floor (so tiny models stay usable).
+    # Clamp to the configured defaults and retain a usable floor.
     per_result = max(_MIN_RESULT_SIZE_CHARS, min(per_result, DEFAULT_RESULT_SIZE_CHARS))
     per_turn = max(_MIN_TURN_BUDGET_CHARS, min(per_turn, DEFAULT_TURN_BUDGET_CHARS))
 
