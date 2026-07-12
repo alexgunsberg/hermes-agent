@@ -181,4 +181,3 @@ When 3+ open PRs try to integrate the same *category* of thing (memory
 backends, providers, notifiers), don't merge them one at a time — design an
 ABC + orchestrator, wrap the existing built-in as the first provider, and turn
 the competing PRs into plugins against that interface.
-

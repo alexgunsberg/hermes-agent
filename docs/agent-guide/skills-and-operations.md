@@ -272,4 +272,3 @@ Isolation model:
 Full user-facing docs: `website/docs/user-guide/features/kanban.md`.
 
 ---
-

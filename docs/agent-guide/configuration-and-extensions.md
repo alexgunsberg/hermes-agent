@@ -341,4 +341,3 @@ plug into `agent/context_engine.py`; image-gen providers into
 companion repo, not in this tree.
 
 ---
-
