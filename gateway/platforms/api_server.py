@@ -780,6 +780,7 @@ def _derive_chat_session_id(
 _CRON_AVAILABLE = False
 try:
     from cron.jobs import (
+        MAX_JOB_MAX_ITERATIONS as _CRON_MAX_ITERATIONS_CEILING,
         list_jobs as _cron_list,
         get_job as _cron_get,
         create_job as _cron_create,
@@ -791,6 +792,7 @@ try:
     )
     _CRON_AVAILABLE = True
 except ImportError:
+    _CRON_MAX_ITERATIONS_CEILING = 500
     _cron_list = None
     _cron_get = None
     _cron_create = None
@@ -3608,10 +3610,15 @@ class APIServerAdapter(BasePlatformAdapter):
             if max_iterations is not None and (
                 isinstance(max_iterations, bool)
                 or not isinstance(max_iterations, int)
-                or max_iterations < 1
+                or not 1 <= max_iterations <= _CRON_MAX_ITERATIONS_CEILING
             ):
                 return web.json_response(
-                    {"error": "max_iterations must be a positive integer"},
+                    {
+                        "error": (
+                            "max_iterations must be an integer between 1 and "
+                            f"{_CRON_MAX_ITERATIONS_CEILING}"
+                        )
+                    },
                     status=400,
                 )
 
@@ -3684,14 +3691,21 @@ class APIServerAdapter(BasePlatformAdapter):
                 scan_error = _scan_cron_prompt(sanitized["prompt"])
                 if scan_error:
                     return web.json_response({"error": scan_error}, status=400)
+            # Explicit JSON null clears the override back to the config
+            # default; validation applies only to non-null values.
             max_iterations = sanitized.get("max_iterations")
             if max_iterations is not None and (
                 isinstance(max_iterations, bool)
                 or not isinstance(max_iterations, int)
-                or max_iterations < 1
+                or not 1 <= max_iterations <= _CRON_MAX_ITERATIONS_CEILING
             ):
                 return web.json_response(
-                    {"error": "max_iterations must be a positive integer"},
+                    {
+                        "error": (
+                            "max_iterations must be an integer between 1 and "
+                            f"{_CRON_MAX_ITERATIONS_CEILING}"
+                        )
+                    },
                     status=400,
                 )
             job = _cron_update(job_id, sanitized)

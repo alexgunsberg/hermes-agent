@@ -135,6 +135,72 @@ async def test_create_cron_job_normalizes_representative_core_fields(
 
 
 @pytest.mark.asyncio
+async def test_create_cron_job_persists_max_iterations(isolated_profiles):
+    from hermes_cli import web_server
+
+    job = await web_server.create_cron_job(
+        web_server.CronJobCreate(
+            prompt="bounded job",
+            schedule="every 1h",
+            name="bounded",
+            max_iterations=12,
+        ),
+        profile="worker_alpha",
+    )
+
+    assert job["max_iterations"] == 12
+
+
+@pytest.mark.asyncio
+async def test_create_cron_job_rejects_out_of_range_max_iterations(
+    isolated_profiles,
+):
+    from fastapi import HTTPException
+
+    from hermes_cli import web_server
+
+    with pytest.raises(HTTPException) as exc_info:
+        await web_server.create_cron_job(
+            web_server.CronJobCreate(
+                prompt="runaway job",
+                schedule="every 1h",
+                max_iterations=100_000,
+            ),
+            profile="worker_alpha",
+        )
+
+    assert exc_info.value.status_code == 400
+    assert "max_iterations" in str(exc_info.value.detail)
+
+
+@pytest.mark.asyncio
+async def test_update_cron_job_sets_and_clears_max_iterations(isolated_profiles):
+    from hermes_cli import web_server
+
+    job = await web_server.create_cron_job(
+        web_server.CronJobCreate(
+            prompt="mutable job",
+            schedule="every 1h",
+            name="mutable",
+        ),
+        profile="worker_alpha",
+    )
+
+    updated = await web_server.update_cron_job(
+        job["id"],
+        web_server.CronJobUpdate(updates={"max_iterations": 25}),
+    )
+    assert updated["max_iterations"] == 25
+
+    # The dashboard clear sentinel (0) returns the job to the config default.
+    cleared = await web_server.update_cron_job(
+        job["id"],
+        web_server.CronJobUpdate(updates={"max_iterations": 0}),
+    )
+    assert cleared["max_iterations"] is None
+
+
+@pytest.mark.asyncio
 async def test_cron_mutation_without_profile_finds_named_profile_job(isolated_profiles):
     from hermes_cli import web_server
 

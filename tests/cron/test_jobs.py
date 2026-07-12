@@ -351,16 +351,30 @@ class TestJobCRUD:
         assert job["max_iterations"] == 12
         assert get_job(job["id"])["max_iterations"] == 12
 
-    @pytest.mark.parametrize("value", [0, -1, True, "not-a-number"])
-    def test_per_job_iteration_cap_must_be_positive_integer(
+    @pytest.mark.parametrize(
+        "value",
+        # Digit strings and floats are rejected too — core validation is as
+        # strict as the HTTP API so no surface silently coerces. 501 exceeds
+        # the anti-footgun ceiling.
+        [0, -1, True, "not-a-number", "12", 12.5, 501],
+    )
+    def test_per_job_iteration_cap_must_be_bounded_integer(
         self, tmp_cron_dir, value
     ):
-        with pytest.raises(ValueError, match="positive integer"):
+        with pytest.raises(ValueError, match="integer between 1 and 500"):
             create_job(
                 prompt="Invalid owner",
                 schedule="every 1h",
                 max_iterations=value,
             )
+
+    def test_per_job_iteration_cap_accepts_ceiling_value(self, tmp_cron_dir):
+        job = create_job(
+            prompt="Ceiling owner",
+            schedule="every 1h",
+            max_iterations=500,
+        )
+        assert job["max_iterations"] == 500
 
 
 class TestUpdateJob:
@@ -389,8 +403,18 @@ class TestUpdateJob:
     def test_update_iteration_cap_rejects_zero(self, tmp_cron_dir):
         job = create_job(prompt="Owner", schedule="every 1h")
 
-        with pytest.raises(ValueError, match="positive integer"):
+        with pytest.raises(ValueError, match="integer between 1 and 500"):
             update_job(job["id"], {"max_iterations": 0})
+
+    def test_update_iteration_cap_none_clears_override(self, tmp_cron_dir):
+        job = create_job(
+            prompt="Owner", schedule="every 1h", max_iterations=12,
+        )
+
+        updated = update_job(job["id"], {"max_iterations": None})
+
+        assert updated["max_iterations"] is None
+        assert get_job(job["id"])["max_iterations"] is None
 
     def test_update_schedule(self, tmp_cron_dir):
         job = create_job(prompt="Daily report", schedule="every 1h")

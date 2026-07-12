@@ -414,8 +414,18 @@ cron:
 ```
 
 For an intentionally complex job, set a per-job override with
-`hermes cron create --max-iterations N` (or `hermes cron edit`). Prefer a
-script wake gate or `--no-agent` for recurring checks that do not need an LLM.
+`hermes cron create --max-iterations N` (or `hermes cron edit`); overrides are
+capped at 500. To remove an override and return the job to the config default,
+pass `--max-iterations 0` to `hermes cron edit` (the HTTP API accepts an
+explicit JSON `null` for the same purpose). Prefer a script wake gate or
+`--no-agent` for recurring checks that do not need an LLM.
+
+> **Upgrade note:** cron previously inherited the interactive `agent.max_turns`
+> budget (90 by default) and now ignores `agent.max_turns` entirely — jobs
+> without a per-job override run with `cron.max_iterations` (30). A job that
+> hits the cap still delivers a fallback summary of the work done so far, but
+> if you have legitimately long-running jobs, set `--max-iterations` on them
+> explicitly.
 
 ## Script timeout
 

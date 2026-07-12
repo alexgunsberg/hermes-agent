@@ -257,7 +257,7 @@ class TestCreateJob:
                 assert mock_create.call_args.kwargs["max_iterations"] == 12
 
     @pytest.mark.asyncio
-    @pytest.mark.parametrize("value", [0, -1, True, "12"])
+    @pytest.mark.parametrize("value", [0, -1, True, "12", 501, 10_000_000])
     async def test_create_job_rejects_invalid_iteration_cap(self, adapter, value):
         app = _create_app(adapter)
         mock_create = MagicMock(return_value=SAMPLE_JOB)

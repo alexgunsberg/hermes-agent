@@ -77,6 +77,18 @@ def _resolve_cron_max_iterations(job: dict, cfg: dict) -> int:
             _DEFAULT_CRON_MAX_ITERATIONS,
         )
         return _DEFAULT_CRON_MAX_ITERATIONS
+    from cron.jobs import MAX_JOB_MAX_ITERATIONS
+
+    if value > MAX_JOB_MAX_ITERATIONS:
+        # Values persisted before the ceiling existed (or hand-edited stores)
+        # are clamped rather than dropped to the default: the intent to run
+        # long is preserved, the unbounded-run footgun is not.
+        logger.warning(
+            "cron max_iterations=%r exceeds ceiling %d; clamping",
+            raw,
+            MAX_JOB_MAX_ITERATIONS,
+        )
+        return MAX_JOB_MAX_ITERATIONS
     return value
 
 
