@@ -32,15 +32,28 @@ class IterationBudget:
     def __init__(self, max_total: int):
         self.max_total = max_total
         self._used = 0
+        self._exhausted = False
         self._lock = threading.Lock()
 
     def consume(self) -> bool:
         """Try to consume one iteration.  Returns True if allowed."""
         with self._lock:
-            if self._used >= self.max_total:
+            if self._exhausted or self._used >= self.max_total:
                 return False
             self._used += 1
             return True
+
+    def exhaust(self) -> None:
+        """Spend the entire remaining budget immediately.
+
+        Used when a non-iteration bound (e.g. an unattended run's token
+        ceiling) is crossed: the run then ends through the same graceful
+        max-iterations path, including its final summary call. Unlike
+        setting ``_used``, an exhausted budget cannot be revived by
+        ``refund``.
+        """
+        with self._lock:
+            self._exhausted = True
 
     def refund(self) -> None:
         """Give back one iteration (e.g. for execute_code turns)."""
@@ -56,6 +69,8 @@ class IterationBudget:
     @property
     def remaining(self) -> int:
         with self._lock:
+            if self._exhausted:
+                return 0
             return max(0, self.max_total - self._used)
 
 

@@ -299,6 +299,7 @@ from hermes_cli.subcommands.memory import build_memory_parser
 from hermes_cli.subcommands.acp import build_acp_parser
 from hermes_cli.subcommands.tools import build_tools_parser
 from hermes_cli.subcommands.insights import build_insights_parser
+from hermes_cli.subcommands.monitor import build_monitor_parser
 from hermes_cli.subcommands.skills import build_skills_parser
 from hermes_cli.subcommands.pairing import build_pairing_parser
 from hermes_cli.subcommands.plugins import build_plugins_parser
@@ -12663,6 +12664,15 @@ def cmd_insights(args):
         print(f"Error generating insights: {e}")
 
 
+def cmd_monitor(args):
+    try:
+        from agent.perf_monitor import format_report, generate_report
+
+        print(format_report(generate_report(days=args.days)))
+    except Exception as e:
+        print(f"Error generating monitor report: {e}")
+
+
 def cmd_skills(args):
     # Route 'config' action to skills_config module
     if getattr(args, "skills_action", None) == "config":
@@ -14410,6 +14420,11 @@ def main():
     # insights command  (parser built in hermes_cli/subcommands/insights.py)
     # =========================================================================
     build_insights_parser(subparsers, cmd_insights=cmd_insights)
+
+    # =========================================================================
+    # monitor command  (parser built in hermes_cli/subcommands/monitor.py)
+    # =========================================================================
+    build_monitor_parser(subparsers, cmd_monitor=cmd_monitor)
 
     # =========================================================================
     # claw command  (parser built in hermes_cli/subcommands/claw.py)

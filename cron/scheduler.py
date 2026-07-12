@@ -80,6 +80,32 @@ def _resolve_cron_max_iterations(job: dict, cfg: dict) -> int:
     return value
 
 
+_DEFAULT_CRON_MAX_RUN_TOKENS = 0  # 0 = unlimited
+
+
+def _resolve_cron_max_run_tokens(job: dict, cfg: dict) -> int:
+    """Resolve the per-run token ceiling for an unattended cron run.
+
+    ``max_iterations`` bounds call count but not cost — a run under the
+    iteration cap can still consume unbounded tokens.  Counts non-cache-read
+    tokens.  Per-job ``max_run_tokens`` overrides ``cron.max_run_tokens``;
+    0 (the default) disables the ceiling.
+    """
+    cron_cfg = (cfg or {}).get("cron") or {}
+    raw = job.get("max_run_tokens")
+    if raw is None:
+        raw = cron_cfg.get("max_run_tokens", _DEFAULT_CRON_MAX_RUN_TOKENS)
+    try:
+        value = int(raw)
+    except (TypeError, ValueError):
+        logger.warning("Invalid cron max_run_tokens=%r; ceiling disabled", raw)
+        return _DEFAULT_CRON_MAX_RUN_TOKENS
+    if value < 0:
+        logger.warning("Invalid cron max_run_tokens=%r; ceiling disabled", raw)
+        return _DEFAULT_CRON_MAX_RUN_TOKENS
+    return value
+
+
 def _summarize_cron_failure_for_delivery(job: dict, error: str | None) -> str:
     """Return a compact one-line failure message for chat delivery.
 
@@ -3059,7 +3085,11 @@ def run_job(
             session_id=_cron_session_id,
             session_db=_session_db,
         )
-        
+        # Unattended token ceiling — enforced in the conversation loop by
+        # exhausting the iteration budget once the run's non-cached token
+        # spend crosses it (0 = unlimited).
+        agent.max_run_tokens = _resolve_cron_max_run_tokens(job, _cfg)
+
         # Run the agent with an *inactivity*-based timeout: the job can run
         # for hours if it's actively calling tools / receiving stream tokens,
         # but a hung API call or stuck tool with no activity for the configured
