@@ -10968,6 +10968,49 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     or _msg_count >= _HARD_MSG_LIMIT
                 )
 
+                # Honor the same durable, session-scoped compression-failure
+                # cooldown as the normal turn preflight.  Hygiene runs before
+                # the main AIAgent is built and used to call _compress_context
+                # directly, bypassing ContextCompressor.should_compress().  On
+                # an oversized gateway transcript whose summary LLM had just
+                # failed, every inbound message therefore constructed a second
+                # AIAgent and re-entered compression even though the session row
+                # explicitly said to pause retries.  Besides wasting startup
+                # work on the hottest sessions, direct re-entry could turn a
+                # persisted cooldown into a deterministic fallback compaction.
+                # Query through AsyncSessionDB when present; tests and degraded
+                # SQLite-free gateways simply retain the established behavior.
+                _hyg_failure_cooldown = None
+                if _needs_compress and self._session_db is not None:
+                    try:
+                        _get_cooldown = getattr(
+                            self._session_db,
+                            "get_compression_failure_cooldown",
+                            None,
+                        )
+                        if callable(_get_cooldown):
+                            _hyg_failure_cooldown = _get_cooldown(
+                                session_entry.session_id
+                            )
+                            if inspect.isawaitable(_hyg_failure_cooldown):
+                                _hyg_failure_cooldown = await _hyg_failure_cooldown
+                    except Exception:
+                        logger.debug(
+                            "Session hygiene cooldown lookup failed for %s",
+                            session_entry.session_id,
+                            exc_info=True,
+                        )
+                        _hyg_failure_cooldown = None
+
+                if _needs_compress and _hyg_failure_cooldown:
+                    logger.info(
+                        "Session hygiene: deferring compression for session %s "
+                        "during summary-failure cooldown (~%s seconds remaining)",
+                        session_entry.session_id,
+                        int(_hyg_failure_cooldown.get("remaining_seconds", 0.0)),
+                    )
+                    _needs_compress = False
+
                 if _needs_compress:
                     logger.info(
                         "Session hygiene: %s messages, ~%s tokens (%s) — auto-compressing "
