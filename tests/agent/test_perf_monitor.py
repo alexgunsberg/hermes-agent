@@ -139,6 +139,7 @@ def test_report_math_and_formatting():
     assert report["api"]["median_ms"] == 3000.0
     assert report["api"]["max_ms"] == 10000.0
     assert report["api"]["total_tokens"] == 5 * 1170
+    assert report["api"]["cache_read_tokens"] == 5 * 1000
     # non-cache-read tokens: (1170 - 1000) per call
     assert report["api"]["uncached_tokens"] == 5 * 170
     assert report["tools"][0]["tool_name"] == "terminal"
@@ -146,6 +147,8 @@ def test_report_math_and_formatting():
 
     text = perf_monitor.format_report(report)
     assert "Model requests: 5" in text
+    assert "Active context per request" in text
+    assert "Cumulative processed tokens across 5 requests" in text
     assert "terminal" in text
 
 

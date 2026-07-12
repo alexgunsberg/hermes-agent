@@ -726,6 +726,7 @@ def generate_report(days: int = 7) -> Dict[str, Any]:
                 ),
                 "max_prompt_tokens": max((r["prompt_tokens"] for r in rows), default=0),
                 "total_tokens": sum(r["total_tokens"] for r in rows),
+                "cache_read_tokens": sum(r["cache_read_tokens"] for r in rows),
                 "uncached_tokens": sum(
                     max(0, r["total_tokens"] - r["cache_read_tokens"]) for r in rows
                 ),
@@ -882,11 +883,13 @@ def format_report(report: Dict[str, Any]) -> str:
         f" / p90 {api['p90_ms'] / 1000:.1f}s / max {api['max_ms'] / 1000:.1f}s"
     )
     lines.append(
-        f"Context size (prompt tokens): mean {api['mean_prompt_tokens']:,.0f}"
+        f"Active context per request (prompt tokens): mean {api['mean_prompt_tokens']:,.0f}"
         f" / max {api['max_prompt_tokens']:,}"
     )
     lines.append(
-        f"Tokens: total {api['total_tokens']:,} (uncached {api['uncached_tokens']:,})"
+        f"Cumulative processed tokens across {api['calls']} requests: "
+        f"{api['total_tokens']:,} total / {api['cache_read_tokens']:,} cache-read "
+        f"/ {api['uncached_tokens']:,} uncached"
     )
     origins = report.get("origins") or []
     if origins:
