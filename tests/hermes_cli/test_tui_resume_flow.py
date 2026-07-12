@@ -383,6 +383,34 @@ def test_termux_fast_cli_launch_oneshot_uses_light_parser(monkeypatch, main_mod)
     }
 
 
+def test_fast_oneshot_launch_is_available_outside_termux(monkeypatch, main_mod):
+    captured = {}
+    prepared = []
+    monkeypatch.delenv("TERMUX_VERSION", raising=False)
+    monkeypatch.setenv("PREFIX", "/usr")
+    monkeypatch.setattr(sys, "argv", ["hermes", "--oneshot=hello"])
+    monkeypatch.setattr(
+        main_mod, "_prepare_agent_startup", lambda args: prepared.append(args.command)
+    )
+    monkeypatch.setitem(
+        sys.modules,
+        "hermes_cli.oneshot",
+        types.SimpleNamespace(
+            run_oneshot=lambda prompt, **kwargs: captured.update(
+                {"prompt": prompt, **kwargs}
+            )
+            or 23
+        ),
+    )
+
+    with pytest.raises(SystemExit) as exc:
+        main_mod._try_fast_oneshot_launch()
+
+    assert exc.value.code == 23
+    assert prepared == [None]
+    assert captured["prompt"] == "hello"
+
+
 def test_termux_fast_cli_launch_version_skips_update_check(monkeypatch, main_mod):
     captured = []
 

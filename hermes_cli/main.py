@@ -12432,6 +12432,46 @@ def _set_chat_arg_defaults(args) -> None:
             setattr(args, attr, default)
 
 
+def _try_fast_oneshot_launch() -> bool:
+    """Dispatch ``-z/--oneshot`` before constructing every CLI subparser.
+
+    Oneshot is a built-in, non-interactive surface. Plugin CLI commands,
+    dashboard parsers, setup flows, and dozens of command modules cannot affect
+    its argparse shape, yet the normal path imported all of them before agent
+    construction. Agent/plugin/tool discovery still runs through
+    ``_prepare_agent_startup`` before the tool snapshot is frozen.
+    """
+    argv = sys.argv[1:]
+    if "-h" in argv or "--help" in argv:
+        return False
+    if not any(
+        arg in {"-z", "--oneshot"} or arg.startswith("--oneshot=")
+        for arg in argv
+    ):
+        return False
+
+    from hermes_cli._parser import build_top_level_parser
+
+    parser, _subparsers, chat_parser = build_top_level_parser()
+    chat_parser.set_defaults(func=cmd_chat)
+    args = parser.parse_args(_coalesce_session_name_args(argv))
+    if not getattr(args, "oneshot", None):
+        return False
+
+    _prepare_agent_startup(args)
+    from hermes_cli.oneshot import run_oneshot
+
+    raise SystemExit(
+        run_oneshot(
+            args.oneshot,
+            model=getattr(args, "model", None),
+            provider=getattr(args, "provider", None),
+            toolsets=getattr(args, "toolsets", None),
+            usage_file=getattr(args, "usage_file", None),
+        )
+    )
+
+
 def _try_termux_fast_cli_launch() -> bool:
     """Run obvious Termux non-TUI chat/oneshot/version paths on a light parser."""
     if not _is_termux_startup_environment():
@@ -12747,6 +12787,8 @@ def main():
     except Exception:
         pass
 
+    if _try_fast_oneshot_launch():
+        return
     if _try_termux_fast_tui_launch():
         return
     if _try_termux_fast_cli_launch():
