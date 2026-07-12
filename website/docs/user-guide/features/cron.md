@@ -401,6 +401,22 @@ Otherwise, report the issue.
 
 Failed jobs always deliver regardless of the `[SILENT]` marker — only successful runs can be silenced. For quiet monitoring jobs, prompt the agent to reply with only `[SILENT]` when there is nothing to report.
 
+## Agent iteration budget
+
+Cron agents default to 30 model/tool iterations per run, independently of the
+larger interactive-agent budget. This bounds the repeated cost of an
+unattended job whose prompt or tool loop stops making progress. Configure the
+default for all jobs in `config.yaml`:
+
+```yaml
+cron:
+  max_iterations: 30
+```
+
+For an intentionally complex job, set a per-job override with
+`hermes cron create --max-iterations N` (or `hermes cron edit`). Prefer a
+script wake gate or `--no-agent` for recurring checks that do not need an LLM.
+
 ## Script timeout
 
 Pre-run scripts (attached via the `script` parameter) have a default timeout of 3600 seconds (1 hour). This bounds the **script only** — skill-based / LLM-driven jobs run on a separate inactivity budget and are not capped by this value. If your scripts need a different limit, you can change it:

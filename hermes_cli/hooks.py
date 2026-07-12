@@ -80,9 +80,10 @@ def _cmd_list(_args) -> None:
             is_approved = (spec.event, spec.command) in approved
             status = "✓ allowed" if is_approved else "✗ not allowlisted"
             matcher_part = f" matcher={spec.matcher!r}" if spec.matcher else ""
+            mode = "blocking" if spec.runs_blocking else "nonblocking"
             print(
                 f"    - {spec.command}{matcher_part} "
-                f"(timeout={spec.timeout}s, {status})"
+                f"(timeout={spec.timeout}s, {mode}, {status})"
             )
 
             if is_approved:

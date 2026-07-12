@@ -58,7 +58,7 @@ class TestHooksList:
                     {"matcher": "terminal", "command": str(script), "timeout": 30},
                 ],
                 "on_session_start": [
-                    {"command": str(script)},
+                    {"command": str(script), "blocking": False},
                 ],
             }
         }
@@ -73,6 +73,8 @@ class TestHooksList:
         assert "[on_session_start]" in out
         assert "✓ allowed" in out
         assert "✗ not allowlisted" in out
+        assert "blocking" in out
+        assert "nonblocking" in out
         assert str(script) in out
 
 

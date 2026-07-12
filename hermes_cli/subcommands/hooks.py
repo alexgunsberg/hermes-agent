@@ -26,7 +26,7 @@ def build_hooks_parser(subparsers, *, cmd_hooks: Callable) -> None:
     hooks_subparsers.add_parser(
         "list",
         aliases=["ls"],
-        help="List configured hooks with matcher, timeout, and consent status",
+        help="List configured hooks with matcher, timeout, blocking mode, and consent status",
     )
 
     _hk_test = hooks_subparsers.add_parser(

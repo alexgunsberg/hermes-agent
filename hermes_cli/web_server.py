@@ -10383,6 +10383,7 @@ async def list_hooks():
             "matcher": spec.matcher,
             "command": spec.command,
             "timeout": spec.timeout,
+            "blocking": spec.runs_blocking,
             "allowed": entry is not None,
             "approved_at": (entry or {}).get("approved_at"),
             "executable": executable,

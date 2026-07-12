@@ -264,6 +264,42 @@ class TestUnifiedCronjobTool:
         assert listing["jobs"][0]["name"] == "Server Check"
         assert listing["jobs"][0]["state"] == "scheduled"
 
+    def test_create_and_update_per_job_iteration_cap(self):
+        created = json.loads(
+            cronjob(
+                action="create",
+                prompt="Bounded owner",
+                schedule="every 1h",
+                max_iterations=11,
+            )
+        )
+
+        assert created["success"] is True
+        assert created["job"]["max_iterations"] == 11
+
+        updated = json.loads(
+            cronjob(
+                action="update",
+                job_id=created["job_id"],
+                max_iterations=6,
+            )
+        )
+        assert updated["success"] is True
+        assert updated["job"]["max_iterations"] == 6
+
+    def test_iteration_cap_validation_surfaces_as_tool_error(self):
+        created = json.loads(
+            cronjob(
+                action="create",
+                prompt="Invalid owner",
+                schedule="every 1h",
+                max_iterations=0,
+            )
+        )
+
+        assert created["success"] is False
+        assert "positive integer" in created["error"]
+
     def test_list_handles_partial_legacy_job_records(self):
         from cron.jobs import save_jobs
 

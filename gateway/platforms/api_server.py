@@ -3524,7 +3524,10 @@ class APIServerAdapter(BasePlatformAdapter):
 
     _JOB_ID_RE = __import__("re").compile(r"[a-f0-9]{12}")
     # Allowed fields for update — prevents clients injecting arbitrary keys
-    _UPDATE_ALLOWED_FIELDS = {"name", "schedule", "prompt", "deliver", "skills", "skill", "repeat", "enabled"}
+    _UPDATE_ALLOWED_FIELDS = {
+        "name", "schedule", "prompt", "deliver", "skills", "skill",
+        "repeat", "enabled", "max_iterations",
+    }
     _MAX_NAME_LENGTH = 200
     _MAX_PROMPT_LENGTH = 5000
 
@@ -3582,6 +3585,7 @@ class APIServerAdapter(BasePlatformAdapter):
             deliver = body.get("deliver", "local")
             skills = body.get("skills")
             repeat = body.get("repeat")
+            max_iterations = body.get("max_iterations")
 
             if not name:
                 return web.json_response({"error": "Name is required"}, status=400)
@@ -3601,6 +3605,15 @@ class APIServerAdapter(BasePlatformAdapter):
                     return web.json_response({"error": scan_error}, status=400)
             if repeat is not None and (not isinstance(repeat, int) or repeat < 1):
                 return web.json_response({"error": "Repeat must be a positive integer"}, status=400)
+            if max_iterations is not None and (
+                isinstance(max_iterations, bool)
+                or not isinstance(max_iterations, int)
+                or max_iterations < 1
+            ):
+                return web.json_response(
+                    {"error": "max_iterations must be a positive integer"},
+                    status=400,
+                )
 
             kwargs = {
                 "prompt": prompt,
@@ -3613,6 +3626,8 @@ class APIServerAdapter(BasePlatformAdapter):
                 kwargs["skills"] = skills
             if repeat is not None:
                 kwargs["repeat"] = repeat
+            if max_iterations is not None:
+                kwargs["max_iterations"] = max_iterations
 
             job = _cron_create(**kwargs)
             _notify_cron_provider_jobs_changed()
@@ -3669,6 +3684,16 @@ class APIServerAdapter(BasePlatformAdapter):
                 scan_error = _scan_cron_prompt(sanitized["prompt"])
                 if scan_error:
                     return web.json_response({"error": scan_error}, status=400)
+            max_iterations = sanitized.get("max_iterations")
+            if max_iterations is not None and (
+                isinstance(max_iterations, bool)
+                or not isinstance(max_iterations, int)
+                or max_iterations < 1
+            ):
+                return web.json_response(
+                    {"error": "max_iterations must be a positive integer"},
+                    status=400,
+                )
             job = _cron_update(job_id, sanitized)
             if not job:
                 return web.json_response({"error": "Job not found"}, status=404)

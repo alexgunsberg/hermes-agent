@@ -11,7 +11,7 @@ from __future__ import annotations
 import hashlib
 import json
 from dataclasses import dataclass, field
-from typing import Any, Mapping
+from typing import Any, Mapping, Sequence
 
 from utils import safe_json_loads
 from agent.tool_result_classification import file_mutation_result_landed
@@ -21,6 +21,7 @@ IDEMPOTENT_TOOL_NAMES = frozenset(
     {
         "read_file",
         "search_files",
+        "skill_view",
         "web_search",
         "web_extract",
         "session_search",
@@ -37,6 +38,14 @@ IDEMPOTENT_TOOL_NAMES = frozenset(
         "mcp_filesystem_search_files",
     }
 )
+
+# Instructional tools must still execute on a repeated call: the underlying
+# file may have changed since the previous read.  Once the fresh result proves
+# it is unchanged, however, replaying the full document into the conversation
+# only grows context.  These tools therefore use post-execution suppression
+# instead of the pre-execution no-progress block used by other idempotent
+# tools.
+UNCHANGED_RESULT_SUPPRESSION_TOOL_NAMES = frozenset({"skill_view"})
 
 MUTATING_TOOL_NAMES = frozenset(
     {
@@ -260,7 +269,10 @@ class ToolCallGuardrailController:
             self._halt_decision = decision
             return decision
 
-        if self._is_idempotent(tool_name):
+        if (
+            self._is_idempotent(tool_name)
+            and tool_name not in UNCHANGED_RESULT_SUPPRESSION_TOOL_NAMES
+        ):
             record = self._no_progress.get(signature)
             if record is not None:
                 _result_hash, repeat_count = record
@@ -289,6 +301,7 @@ class ToolCallGuardrailController:
         result: str | None,
         *,
         failed: bool | None = None,
+        retained_messages: Sequence[Mapping[str, Any]] | None = None,
     ) -> ToolGuardrailDecision:
         args = _coerce_args(args)
         signature = ToolCallSignature.from_call(tool_name, args)
@@ -354,9 +367,59 @@ class ToolCallGuardrailController:
         result_hash = _result_hash(result)
         previous = self._no_progress.get(signature)
         repeat_count = 1
-        if previous is not None and previous[0] == result_hash:
+        if tool_name in UNCHANGED_RESULT_SUPPRESSION_TOOL_NAMES:
+            # Unlike ordinary read-only calls, suppressing an instructional
+            # document is safe only while the earlier full result is provably
+            # retained in model-visible history. This also makes a resumed
+            # agent correct without process-local cache state and fails open
+            # after compression removes the original tool result.
+            if retained_tool_result_matches(
+                retained_messages,
+                tool_name,
+                args,
+                result,
+            ):
+                repeat_count = (
+                    previous[1] + 1
+                    if previous is not None and previous[0] == result_hash
+                    else 2
+                )
+        elif previous is not None and previous[0] == result_hash:
             repeat_count = previous[1] + 1
         self._no_progress[signature] = (result_hash, repeat_count)
+
+        if (
+            tool_name in UNCHANGED_RESULT_SUPPRESSION_TOOL_NAMES
+            and repeat_count >= self.config.no_progress_warn_after
+        ):
+            message = (
+                f"{tool_name} returned unchanged content {repeat_count} times. "
+                "The full content is already available in retained conversation "
+                "history; use it or load a different skill or linked file."
+            )
+            if (
+                self.config.hard_stop_enabled
+                and repeat_count >= self.config.no_progress_block_after
+            ):
+                decision = ToolGuardrailDecision(
+                    action="halt",
+                    code="unchanged_result_halt",
+                    message=message,
+                    tool_name=tool_name,
+                    count=repeat_count,
+                    signature=signature,
+                )
+                self._halt_decision = decision
+                return decision
+            if self.config.warnings_enabled:
+                return ToolGuardrailDecision(
+                    action="warn",
+                    code="unchanged_result_suppressed",
+                    message=message,
+                    tool_name=tool_name,
+                    count=repeat_count,
+                    signature=signature,
+                )
 
         if self.config.warnings_enabled and repeat_count >= self.config.no_progress_warn_after:
             return ToolGuardrailDecision(
@@ -389,6 +452,92 @@ def toolguard_synthetic_result(decision: ToolGuardrailDecision) -> str:
         },
         ensure_ascii=False,
     )
+
+
+def toolguard_suppressed_result(decision: ToolGuardrailDecision) -> str:
+    """Build a compact result for a successful but unchanged tool read."""
+    return json.dumps(
+        {
+            "success": True,
+            "unchanged": True,
+            "message": decision.message,
+            "guardrail": decision.to_metadata(),
+        },
+        ensure_ascii=False,
+    )
+
+
+def retained_tool_result_matches(
+    messages: Sequence[Mapping[str, Any]] | None,
+    tool_name: str,
+    args: Mapping[str, Any] | None,
+    result: str | None,
+) -> bool:
+    """Return whether an identical prior call/result remains in history.
+
+    Pairing by tool-call ID prevents a coincidentally identical result from a
+    different call from proving retention. Exact result hashing intentionally
+    fails open for truncated, persisted, summarized, or compressed tool
+    messages: those no longer contain the full document the model would need.
+    """
+    if not messages or not isinstance(result, str):
+        return False
+
+    signature = ToolCallSignature.from_call(tool_name, _coerce_args(args))
+    matching_call_ids: set[str] = set()
+    for message in messages:
+        if not isinstance(message, Mapping) or message.get("role") != "assistant":
+            continue
+        tool_calls = message.get("tool_calls")
+        if not isinstance(tool_calls, list):
+            continue
+        for tool_call in tool_calls:
+            call_id, call_name, call_args = _tool_call_parts(tool_call)
+            if (
+                call_id
+                and call_name == tool_name
+                and ToolCallSignature.from_call(call_name, call_args) == signature
+            ):
+                matching_call_ids.add(call_id)
+
+    if not matching_call_ids:
+        return False
+    expected_hash = _result_hash(result)
+    for message in messages:
+        if not isinstance(message, Mapping) or message.get("role") != "tool":
+            continue
+        if str(message.get("tool_call_id") or "") not in matching_call_ids:
+            continue
+        if message.get("name") not in {None, "", tool_name}:
+            continue
+        content = message.get("content")
+        if isinstance(content, str) and _result_hash(content) == expected_hash:
+            return True
+    return False
+
+
+def _tool_call_parts(tool_call: Any) -> tuple[str, str, Mapping[str, Any]]:
+    if isinstance(tool_call, Mapping):
+        call_id = str(tool_call.get("id") or tool_call.get("call_id") or "")
+        function = tool_call.get("function") or {}
+        if not isinstance(function, Mapping):
+            return call_id, "", {}
+        name = str(function.get("name") or "")
+        raw_args = function.get("arguments")
+    else:
+        call_id = str(getattr(tool_call, "id", "") or getattr(tool_call, "call_id", ""))
+        function = getattr(tool_call, "function", None)
+        name = str(getattr(function, "name", "") or "")
+        raw_args = getattr(function, "arguments", None)
+
+    if isinstance(raw_args, Mapping):
+        parsed_args = raw_args
+    elif isinstance(raw_args, str):
+        parsed = safe_json_loads(raw_args)
+        parsed_args = parsed if isinstance(parsed, Mapping) else {}
+    else:
+        parsed_args = {}
+    return call_id, name, parsed_args
 
 
 def append_toolguard_guidance(result: str, decision: ToolGuardrailDecision) -> str:

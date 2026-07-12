@@ -46,6 +46,39 @@ from hermes_time import now as _hermes_now
 
 logger = logging.getLogger(__name__)
 
+_DEFAULT_CRON_MAX_ITERATIONS = 30
+
+
+def _resolve_cron_max_iterations(job: dict, cfg: dict) -> int:
+    """Resolve the bounded tool-loop budget for an unattended cron run.
+
+    Cron previously inherited ``agent.max_turns`` (90 by default), so one
+    recurring job could consume the entire interactive allowance on every
+    tick.  A per-job override supports deliberately complex automations while
+    ``cron.max_iterations`` provides a safer unattended default.
+    """
+    cron_cfg = (cfg or {}).get("cron") or {}
+    raw = job.get("max_iterations")
+    if raw is None:
+        raw = cron_cfg.get("max_iterations", _DEFAULT_CRON_MAX_ITERATIONS)
+    try:
+        value = int(raw)
+    except (TypeError, ValueError):
+        logger.warning(
+            "Invalid cron max_iterations=%r; using default %d",
+            raw,
+            _DEFAULT_CRON_MAX_ITERATIONS,
+        )
+        return _DEFAULT_CRON_MAX_ITERATIONS
+    if value < 1:
+        logger.warning(
+            "Invalid cron max_iterations=%r; using default %d",
+            raw,
+            _DEFAULT_CRON_MAX_ITERATIONS,
+        )
+        return _DEFAULT_CRON_MAX_ITERATIONS
+    return value
+
 
 def _summarize_cron_failure_for_delivery(job: dict, error: str | None) -> str:
     """Return a compact one-line failure message for chat delivery.
@@ -2844,8 +2877,10 @@ def run_job(
                     logger.warning("Job '%s': failed to parse prefill messages file '%s': %s", job_id, pfpath, e)
                     prefill_messages = None
 
-        # Max iterations
-        max_iterations = _cfg.get("agent", {}).get("max_turns") or _cfg.get("max_turns") or 90
+        # Cron has its own unattended budget.  Do not inherit the much larger
+        # interactive allowance; recurring jobs otherwise repeat that entire
+        # spend on every tick when a prompt or tool loop makes no progress.
+        max_iterations = _resolve_cron_max_iterations(job, _cfg)
 
         # Provider routing
         pr = _cfg.get("provider_routing") or {}

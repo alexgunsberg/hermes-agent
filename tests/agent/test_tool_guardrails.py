@@ -8,7 +8,33 @@ from agent.tool_guardrails import (
     ToolCallSignature,
     canonical_tool_args,
     classify_tool_failure,
+    retained_tool_result_matches,
+    toolguard_suppressed_result,
 )
+
+
+def _retained_skill_messages(args: dict, result: str, call_id: str = "skill-call-1") -> list[dict]:
+    return [
+        {
+            "role": "assistant",
+            "tool_calls": [
+                {
+                    "id": call_id,
+                    "type": "function",
+                    "function": {
+                        "name": "skill_view",
+                        "arguments": json.dumps(args),
+                    },
+                }
+            ],
+        },
+        {
+            "role": "tool",
+            "name": "skill_view",
+            "tool_call_id": call_id,
+            "content": result,
+        },
+    ]
 
 
 def test_tool_call_signature_hashes_canonical_nested_unicode_args_without_exposing_raw_args():
@@ -203,6 +229,102 @@ def test_idempotent_no_progress_repeated_result_warns_without_blocking_by_defaul
     assert decision.code == "idempotent_no_progress_warning"
     assert controller.before_call("read_file", args).action == "allow"
     assert controller.halt_decision is None
+
+
+def test_unchanged_skill_view_result_is_suppressed_only_after_fresh_comparison():
+    controller = ToolCallGuardrailController()
+    args = {"name": "software-development-workflows"}
+    original = json.dumps({"success": True, "content": "large instructions"})
+
+    first = controller.after_call("skill_view", args, original, failed=False)
+    assert first.action == "allow"
+    assert controller.before_call("skill_view", args).action == "allow"
+
+    repeated = controller.after_call(
+        "skill_view",
+        args,
+        original,
+        failed=False,
+        retained_messages=_retained_skill_messages(args, original),
+    )
+    assert repeated.action == "warn"
+    assert repeated.code == "unchanged_result_suppressed"
+
+    compact = json.loads(toolguard_suppressed_result(repeated))
+    assert compact["success"] is True
+    assert compact["unchanged"] is True
+    assert compact["guardrail"]["count"] == 2
+    assert "large instructions" not in json.dumps(compact)
+
+
+def test_changed_skill_view_content_is_returned_and_starts_a_new_streak():
+    controller = ToolCallGuardrailController()
+    args = {"name": "software-development-workflows"}
+    original = json.dumps({"success": True, "content": "version one"})
+    changed = json.dumps({"success": True, "content": "version two"})
+
+    controller.after_call("skill_view", args, original, failed=False)
+    assert controller.after_call(
+        "skill_view",
+        args,
+        original,
+        failed=False,
+        retained_messages=_retained_skill_messages(args, original),
+    ).action == "warn"
+
+    assert controller.before_call("skill_view", args).action == "allow"
+    changed_decision = controller.after_call("skill_view", args, changed, failed=False)
+    assert changed_decision.action == "allow"
+    assert changed_decision.count == 1
+
+
+def test_skill_view_hard_stop_happens_after_latest_content_is_compared():
+    controller = ToolCallGuardrailController(
+        ToolCallGuardrailConfig(
+            hard_stop_enabled=True,
+            no_progress_warn_after=2,
+            no_progress_block_after=2,
+        )
+    )
+    args = {"name": "software-development-workflows"}
+    result = json.dumps({"success": True, "content": "same"})
+
+    controller.after_call("skill_view", args, result, failed=False)
+    # Unlike ordinary idempotent reads, skill_view executes again so an edited
+    # SKILL.md can never be hidden behind stale guardrail state.
+    assert controller.before_call("skill_view", args).action == "allow"
+    halted = controller.after_call(
+        "skill_view",
+        args,
+        result,
+        failed=False,
+        retained_messages=_retained_skill_messages(args, result),
+    )
+
+    assert halted.action == "halt"
+    assert halted.code == "unchanged_result_halt"
+    assert controller.halt_decision == halted
+
+
+def test_retained_skill_result_requires_matching_call_args_id_and_full_content():
+    args = {"name": "software-development-workflows"}
+    result = json.dumps({"success": True, "content": "full instructions"})
+    retained = _retained_skill_messages(args, result)
+
+    assert retained_tool_result_matches(retained, "skill_view", args, result) is True
+    assert retained_tool_result_matches(
+        retained,
+        "skill_view",
+        {"name": "another-skill"},
+        result,
+    ) is False
+
+    retained[1]["tool_call_id"] = "different-call"
+    assert retained_tool_result_matches(retained, "skill_view", args, result) is False
+
+    retained = _retained_skill_messages(args, result)
+    retained[1]["content"] = json.dumps({"success": True, "unchanged": True})
+    assert retained_tool_result_matches(retained, "skill_view", args, result) is False
 
 
 def test_hard_stop_enabled_blocks_idempotent_no_progress_future_repeat():

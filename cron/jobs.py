@@ -911,6 +911,7 @@ def create_job(
     workdir: Optional[str] = None,
     no_agent: bool = False,
     attach_to_session: Optional[bool] = None,
+    max_iterations: Optional[int] = None,
 ) -> Dict[str, Any]:
     """
     Create a new cron job.
@@ -955,6 +956,8 @@ def create_job(
                 and deliver its stdout directly. Empty stdout = silent (no
                 delivery). Requires ``script`` to be set. Ideal for classic
                 watchdogs and periodic alerts that don't need LLM reasoning.
+        max_iterations: Optional per-run agent iteration cap. When omitted,
+                ``cron.max_iterations`` from config.yaml is used.
 
     Returns:
         The created job dict
@@ -987,6 +990,16 @@ def create_job(
     normalized_workdir = _normalize_workdir(workdir)
     normalized_no_agent = bool(no_agent)
     normalized_attach = attach_to_session if isinstance(attach_to_session, bool) else None
+    normalized_max_iterations = None
+    if max_iterations is not None:
+        if isinstance(max_iterations, bool):
+            raise ValueError("max_iterations must be a positive integer")
+        try:
+            normalized_max_iterations = int(max_iterations)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("max_iterations must be a positive integer") from exc
+        if normalized_max_iterations < 1:
+            raise ValueError("max_iterations must be a positive integer")
 
     # no_agent jobs are meaningless without a script — the script IS the job.
     # Surface this as a clear ValueError at create time so bad configs never
@@ -1077,6 +1090,11 @@ def create_job(
         "enabled_toolsets": normalized_toolsets,
         "workdir": normalized_workdir,
     }
+    # Keep the common/default stored shape byte-stable. An absent key means
+    # the job follows ``cron.max_iterations``; persist only deliberate
+    # per-job overrides.
+    if normalized_max_iterations is not None:
+        job["max_iterations"] = normalized_max_iterations
     # Only persist attach_to_session when explicitly set, so existing jobs and
     # the common case stay byte-identical (absent key => fall back to the
     # global cron.mirror_delivery config, default off).
@@ -1171,6 +1189,21 @@ def update_job(job_id: str, updates: Dict[str, Any]) -> Optional[Dict[str, Any]]
                     updates["workdir"] = None
                 else:
                     updates["workdir"] = _normalize_workdir(_wd)
+
+            if "max_iterations" in updates:
+                _max_iter = updates["max_iterations"]
+                if _max_iter in {None, ""}:
+                    updates["max_iterations"] = None
+                else:
+                    if isinstance(_max_iter, bool):
+                        raise ValueError("max_iterations must be a positive integer")
+                    try:
+                        _max_iter = int(_max_iter)
+                    except (TypeError, ValueError) as exc:
+                        raise ValueError("max_iterations must be a positive integer") from exc
+                    if _max_iter < 1:
+                        raise ValueError("max_iterations must be a positive integer")
+                    updates["max_iterations"] = _max_iter
 
             previous_inference_axes = _normalized_inference_axes(job)
             updated = _apply_skill_fields({**job, **updates})

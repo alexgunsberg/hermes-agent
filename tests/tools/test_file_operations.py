@@ -457,6 +457,7 @@ class TestShellFileOpsHelpers:
         assert normalize_search_pagination(offset=-10, limit=-5) == (0, 1)
         assert normalize_search_pagination(offset="bad", limit="bad") == (0, 50)
         assert normalize_search_pagination(offset=3, limit=0) == (3, 1)
+        assert normalize_search_pagination(offset=7, limit=999999) == (7, 200)
 
     def test_escape_shell_arg_simple(self, file_ops):
         assert file_ops._escape_shell_arg("hello") == "'hello'"

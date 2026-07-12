@@ -136,8 +136,33 @@ logger = logging.getLogger(__name__)
 
 DEFAULT_TIMEOUT_SECONDS = 60
 MAX_TIMEOUT_SECONDS = 300
+MAX_HOOK_FIELD_CHARS = 16 * 1024
+MAX_HOOK_PAYLOAD_CHARS = 64 * 1024
 ALLOWLIST_FILENAME = "shell-hooks-allowlist.json"
 _DEFAULT_BLOCK_MESSAGE = "Blocked by shell hook."
+
+# Only hooks whose return value can change the current operation must hold up
+# that operation.  Everything else in VALID_HOOKS is an observer, but keep an
+# explicit allow-list so a newly-added event defaults to the conservative,
+# synchronous path until its contract is reviewed here.
+_NONBLOCKING_OBSERVER_EVENTS = {
+    "post_tool_call",
+    "post_llm_call",
+    "pre_api_request",
+    "post_api_request",
+    "api_request_error",
+    "on_session_start",
+    "on_session_end",
+    "on_session_finalize",
+    "on_session_reset",
+    "subagent_start",
+    "subagent_stop",
+    "pre_approval_request",
+    "post_approval_response",
+    "kanban_task_claimed",
+    "kanban_task_completed",
+    "kanban_task_blocked",
+}
 
 # (event, matcher, command) triples that have been wired to the plugin
 # manager in the current process.  Matcher is part of the key because
@@ -165,6 +190,7 @@ class ShellHookSpec:
     command: str
     matcher: Optional[str] = None
     timeout: int = DEFAULT_TIMEOUT_SECONDS
+    blocking: Optional[bool] = None
     compiled_matcher: Optional[re.Pattern] = field(default=None, repr=False)
 
     def __post_init__(self) -> None:
@@ -194,6 +220,17 @@ class ShellHookSpec:
         # compiled_matcher is None only when the regex failed to compile,
         # in which case we already warned and fall back to literal equality.
         return tool_name == self.matcher
+
+    @property
+    def runs_blocking(self) -> bool:
+        """Whether invocation must wait for this hook's subprocess."""
+        if self.blocking is not None:
+            return self.blocking
+        # Preserve the historical synchronous delivery contract. Observer
+        # hooks may explicitly opt out with ``blocking: false``; policy hooks
+        # are forced synchronous during parsing because their return value can
+        # affect the operation in progress.
+        return True
 
 
 # ---------------------------------------------------------------------------
@@ -277,8 +314,10 @@ def register_from_config(
             _registered.add(key)
             registered.append(spec)
             logger.info(
-                "shell hook registered: %s -> %s (matcher=%s, timeout=%ds)",
+                "shell hook registered: %s -> %s "
+                "(matcher=%s, timeout=%ds, blocking=%s)",
                 spec.event, spec.command, spec.matcher, spec.timeout,
+                spec.runs_blocking,
             )
 
     return registered
@@ -414,11 +453,30 @@ def _parse_single_entry(
         )
         timeout = MAX_TIMEOUT_SECONDS
 
+    blocking_raw = raw.get("blocking")
+    blocking: Optional[bool] = None
+    if blocking_raw is not None:
+        if not isinstance(blocking_raw, bool):
+            logger.warning(
+                "hooks.%s[%d].blocking must be a boolean; using the "
+                "event default", event, index,
+            )
+        elif not blocking_raw and event not in _NONBLOCKING_OBSERVER_EVENTS:
+            logger.warning(
+                "hooks.%s[%d].blocking=false is unsafe because this hook's "
+                "return value can affect behavior; keeping it synchronous",
+                event, index,
+            )
+            blocking = True
+        else:
+            blocking = blocking_raw
+
     return ShellHookSpec(
         event=event,
         command=command.strip(),
         matcher=matcher,
         timeout=timeout,
+        blocking=blocking,
     )
 
 
@@ -492,13 +550,11 @@ def _spawn(spec: ShellHookSpec, stdin_json: str) -> Dict[str, Any]:
 def _make_callback(spec: ShellHookSpec) -> Callable[..., Optional[Dict[str, Any]]]:
     """Build the closure that ``invoke_hook()`` will call per firing."""
 
-    def _callback(**kwargs: Any) -> Optional[Dict[str, Any]]:
-        # Matcher gate — only meaningful for tool-scoped events.
-        if spec.event in {"pre_tool_call", "post_tool_call"}:
-            if not spec.matches_tool(kwargs.get("tool_name")):
-                return None
+    in_flight_lock = threading.Lock()
+    in_flight = False
 
-        r = _spawn(spec, _serialize_payload(spec.event, kwargs))
+    def _execute(stdin_json: str) -> Optional[Dict[str, Any]]:
+        r = _spawn(spec, stdin_json)
 
         if r["error"]:
             logger.warning(
@@ -519,14 +575,51 @@ def _make_callback(spec: ShellHookSpec) -> Callable[..., Optional[Dict[str, Any]
                 "shell hook stderr (event=%s command=%s): %s",
                 spec.event, spec.command, stderr[:400],
             )
-        # Non-zero exits: log but still parse stdout so scripts that
-        # signal failure via exit code can also return a block directive.
         if r["returncode"] != 0:
             logger.warning(
                 "shell hook exited %d (event=%s command=%s); stderr=%s",
                 r["returncode"], spec.event, spec.command, stderr[:400],
             )
         return _parse_response(spec.event, r["stdout"])
+
+    def _execute_nonblocking(stdin_json: str) -> None:
+        nonlocal in_flight
+        try:
+            _execute(stdin_json)
+        finally:
+            with in_flight_lock:
+                in_flight = False
+
+    def _callback(**kwargs: Any) -> Optional[Dict[str, Any]]:
+        nonlocal in_flight
+        # Matcher gate — only meaningful for tool-scoped events.
+        if spec.event in {"pre_tool_call", "post_tool_call"}:
+            if not spec.matches_tool(kwargs.get("tool_name")):
+                return None
+
+        stdin_json = _serialize_payload(spec.event, kwargs)
+        if spec.runs_blocking:
+            return _execute(stdin_json)
+
+        # Observer hooks cannot influence the operation that emitted them.
+        # Keep at most one subprocess per configured hook in flight: a dead
+        # notification bridge must not turn rapid tool events into an
+        # unbounded local process or remote-notification queue.
+        with in_flight_lock:
+            if in_flight:
+                logger.debug(
+                    "shell hook observer still running; dropping event "
+                    "(event=%s command=%s)", spec.event, spec.command,
+                )
+                return None
+            in_flight = True
+        threading.Thread(
+            target=_execute_nonblocking,
+            args=(stdin_json,),
+            name=f"hermes-shell-hook-{spec.event}",
+            daemon=True,
+        ).start()
+        return None
 
     _callback.__name__ = f"shell_hook[{spec.event}:{spec.command}]"
     _callback.__qualname__ = _callback.__name__
@@ -535,21 +628,100 @@ def _make_callback(spec: ShellHookSpec) -> Callable[..., Optional[Dict[str, Any]
 
 def _serialize_payload(event: str, kwargs: Dict[str, Any]) -> str:
     """Render the stdin JSON payload.  Unserialisable values are
-    stringified via ``default=str`` rather than dropped."""
-    extras = {k: v for k, v in kwargs.items() if k not in _TOP_LEVEL_PAYLOAD_KEYS}
+    stringified via ``default=str`` rather than dropped.
+
+    Observer payloads bound each potentially user/model-controlled field and
+    the final JSON document. This prevents a multi-megabyte tool result or
+    conversation from being copied wholesale into notification/audit hooks.
+
+    Behavior-affecting hooks deliberately receive the complete payload. A
+    policy hook must never fail open because the command or arguments it is
+    supposed to inspect were replaced by a truncation preview.
+    """
     try:
         cwd = str(Path.cwd())
     except OSError:
         cwd = ""
+
+    if event not in _NONBLOCKING_OBSERVER_EVENTS:
+        extras = {
+            k: v for k, v in kwargs.items()
+            if k not in _TOP_LEVEL_PAYLOAD_KEYS
+        }
+        payload = {
+            "hook_event_name": event,
+            "tool_name": kwargs.get("tool_name"),
+            "tool_input": (
+                kwargs.get("args")
+                if isinstance(kwargs.get("args"), dict)
+                else None
+            ),
+            "session_id": (
+                kwargs.get("session_id")
+                or kwargs.get("parent_session_id")
+                or ""
+            ),
+            "cwd": cwd,
+            "extra": extras,
+        }
+        return json.dumps(payload, ensure_ascii=False, default=str)
+
+    def _bounded(value: Any, limit: int = MAX_HOOK_FIELD_CHARS) -> Any:
+        encoded = json.dumps(value, ensure_ascii=False, default=str)
+        if len(encoded) <= limit:
+            return json.loads(encoded)
+        if isinstance(value, str):
+            suffix = "\n… [truncated by Hermes shell-hook payload limit]"
+            return value[: limit - len(suffix)] + suffix
+        return {
+            "_hermes_truncated": True,
+            "original_chars": len(encoded),
+            "preview": encoded[:limit],
+        }
+
+    extras = {
+        k: _bounded(v)
+        for k, v in kwargs.items()
+        if k not in _TOP_LEVEL_PAYLOAD_KEYS
+    }
     payload = {
         "hook_event_name": event,
-        "tool_name": kwargs.get("tool_name"),
-        "tool_input": kwargs.get("args") if isinstance(kwargs.get("args"), dict) else None,
-        "session_id": kwargs.get("session_id") or kwargs.get("parent_session_id") or "",
-        "cwd": cwd,
+        "tool_name": _bounded(kwargs.get("tool_name"), 1024),
+        "tool_input": _bounded(kwargs.get("args")) if isinstance(kwargs.get("args"), dict) else None,
+        "session_id": _bounded(
+            kwargs.get("session_id") or kwargs.get("parent_session_id") or "",
+            1024,
+        ),
+        "cwd": _bounded(cwd, 4096),
         "extra": extras,
     }
-    return json.dumps(payload, ensure_ascii=False, default=str)
+    rendered = json.dumps(payload, ensure_ascii=False, default=str)
+    if len(rendered) <= MAX_HOOK_PAYLOAD_CHARS:
+        return rendered
+
+    # Preserve correlation fields and tool input.  Add extra fields only while
+    # they fit, recording exactly which fields were omitted.
+    bounded_extra: Dict[str, Any] = {}
+    omitted: List[str] = []
+    payload["extra"] = bounded_extra
+    for key, value in extras.items():
+        bounded_extra[key] = value
+        candidate = json.dumps(payload, ensure_ascii=False, default=str)
+        if len(candidate) > MAX_HOOK_PAYLOAD_CHARS - 512:
+            del bounded_extra[key]
+            omitted.append(key)
+    if omitted:
+        bounded_extra["_hermes_truncated_fields"] = omitted
+    rendered = json.dumps(payload, ensure_ascii=False, default=str)
+    if len(rendered) > MAX_HOOK_PAYLOAD_CHARS:
+        # An adversarial number of enormous field names can make even the
+        # omission list exceed the budget. Keep the wire valid JSON.
+        payload["extra"] = {
+            "_hermes_truncated": True,
+            "omitted_field_count": len(omitted),
+        }
+        rendered = json.dumps(payload, ensure_ascii=False, default=str)
+    return rendered
 
 
 def _block_message(primary: Any, secondary: Any) -> str:

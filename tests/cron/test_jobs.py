@@ -245,6 +245,7 @@ class TestJobCRUD:
         assert job["prompt"] == "Check server status"
         assert job["enabled"] is True
         assert job["schedule"]["kind"] == "once"
+        assert "max_iterations" not in job
 
         fetched = get_job(job["id"])
         assert fetched is not None
@@ -340,6 +341,27 @@ class TestJobCRUD:
         job = create_job(prompt="Test", schedule="30m")
         assert job["deliver"] == "local"
 
+    def test_per_job_iteration_cap_roundtrips(self, tmp_cron_dir):
+        job = create_job(
+            prompt="Bounded owner",
+            schedule="every 1h",
+            max_iterations=12,
+        )
+
+        assert job["max_iterations"] == 12
+        assert get_job(job["id"])["max_iterations"] == 12
+
+    @pytest.mark.parametrize("value", [0, -1, True, "not-a-number"])
+    def test_per_job_iteration_cap_must_be_positive_integer(
+        self, tmp_cron_dir, value
+    ):
+        with pytest.raises(ValueError, match="positive integer"):
+            create_job(
+                prompt="Invalid owner",
+                schedule="every 1h",
+                max_iterations=value,
+            )
+
 
 class TestUpdateJob:
     def test_update_name(self, tmp_cron_dir):
@@ -356,6 +378,19 @@ class TestUpdateJob:
         # Verify persisted to disk
         fetched = get_job(job["id"])
         assert fetched["name"] == "New Name"
+
+    def test_update_iteration_cap(self, tmp_cron_dir):
+        job = create_job(prompt="Owner", schedule="every 1h")
+
+        updated = update_job(job["id"], {"max_iterations": 7})
+
+        assert updated["max_iterations"] == 7
+
+    def test_update_iteration_cap_rejects_zero(self, tmp_cron_dir):
+        job = create_job(prompt="Owner", schedule="every 1h")
+
+        with pytest.raises(ValueError, match="positive integer"):
+            update_job(job["id"], {"max_iterations": 0})
 
     def test_update_schedule(self, tmp_cron_dir):
         job = create_job(prompt="Daily report", schedule="every 1h")

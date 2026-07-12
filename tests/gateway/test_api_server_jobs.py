@@ -239,6 +239,40 @@ class TestCreateJob:
                 data = await resp.json()
                 assert "schedule" in data["error"].lower() or "Schedule" in data["error"]
 
+    @pytest.mark.asyncio
+    async def test_create_job_passes_iteration_cap(self, adapter):
+        app = _create_app(adapter)
+        mock_create = MagicMock(return_value={**SAMPLE_JOB, "max_iterations": 12})
+        async with TestClient(TestServer(app)) as cli:
+            with patch(f"{_MOD}._CRON_AVAILABLE", True), patch(
+                f"{_MOD}._cron_create", mock_create,
+            ):
+                resp = await cli.post("/api/jobs", json={
+                    "name": "bounded-job",
+                    "schedule": "every 1h",
+                    "prompt": "do something",
+                    "max_iterations": 12,
+                })
+                assert resp.status == 200
+                assert mock_create.call_args.kwargs["max_iterations"] == 12
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("value", [0, -1, True, "12"])
+    async def test_create_job_rejects_invalid_iteration_cap(self, adapter, value):
+        app = _create_app(adapter)
+        mock_create = MagicMock(return_value=SAMPLE_JOB)
+        async with TestClient(TestServer(app)) as cli:
+            with patch(f"{_MOD}._CRON_AVAILABLE", True), patch(
+                f"{_MOD}._cron_create", mock_create,
+            ):
+                resp = await cli.post("/api/jobs", json={
+                    "name": "invalid-cap",
+                    "schedule": "every 1h",
+                    "max_iterations": value,
+                })
+                assert resp.status == 400
+                mock_create.assert_not_called()
+
 
 # ---------------------------------------------------------------------------
 # 8-10. test_get_job
@@ -368,6 +402,40 @@ class TestUpdateJob:
                 assert "name" in sanitized
                 assert "evil_field" not in sanitized
                 assert "__proto__" not in sanitized
+
+    @pytest.mark.asyncio
+    async def test_update_job_passes_iteration_cap(self, adapter):
+        app = _create_app(adapter)
+        updated_job = {**SAMPLE_JOB, "max_iterations": 8}
+        mock_update = MagicMock(return_value=updated_job)
+        async with TestClient(TestServer(app)) as cli:
+            with patch(f"{_MOD}._CRON_AVAILABLE", True), patch(
+                f"{_MOD}._cron_update", mock_update,
+            ):
+                resp = await cli.patch(
+                    f"/api/jobs/{VALID_JOB_ID}",
+                    json={"max_iterations": 8},
+                )
+                assert resp.status == 200
+                assert mock_update.call_args.args[1]["max_iterations"] == 8
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("value", [0, -1, True, "8"])
+    async def test_update_job_rejects_invalid_iteration_cap(
+        self, adapter, value,
+    ):
+        app = _create_app(adapter)
+        mock_update = MagicMock(return_value=SAMPLE_JOB)
+        async with TestClient(TestServer(app)) as cli:
+            with patch(f"{_MOD}._CRON_AVAILABLE", True), patch(
+                f"{_MOD}._cron_update", mock_update,
+            ):
+                resp = await cli.patch(
+                    f"/api/jobs/{VALID_JOB_ID}",
+                    json={"max_iterations": value},
+                )
+                assert resp.status == 400
+                mock_update.assert_not_called()
 
     @pytest.mark.asyncio
     async def test_update_job_no_valid_fields(self, adapter):
