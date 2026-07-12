@@ -1315,11 +1315,28 @@ hooks:
     - matcher: "<regex>"         # Optional; used for pre/post_tool_call only
       command: "<shell command>" # Required; runs via shlex.split, shell=False
       timeout: <seconds>         # Optional; default 60, capped at 300
+      blocking: <bool>           # Optional; default true; observers may set false
 
 hooks_auto_accept: false         # See "Consent model" below
 ```
 
 Event names must be one of the [plugin hook events](#plugin-hooks); typos produce a "Did you mean X?" warning and are skipped. Unknown keys inside a single entry are ignored; missing `command` is a skip-with-warning. `timeout > 300` is clamped with a warning.
+
+Shell hooks remain synchronous by default for backward-compatible delivery.
+Hooks whose return value affects behavior (`pre_tool_call`, `pre_llm_call`,
+`pre_verify`, gateway dispatch, and transform hooks) always stay synchronous.
+Observer-only lifecycle and post-event hooks may set `blocking: false` to run
+off the caller's critical path, with at most one invocation of each configured
+hook in flight; an event emitted while its previous invocation is still running
+is dropped. This is appropriate for fail-fast notifications such as an optional
+cmux bridge. `blocking: false` is rejected for behavior-affecting hooks.
+
+To keep observer audit and notification scripts from accidentally copying
+model-sized data, Hermes bounds each serialized observer field to 16 KiB and
+the complete observer stdin payload to 64 KiB. Oversized strings carry a
+truncation marker; oversized structured values carry `_hermes_truncated`,
+`original_chars`, and a `preview`. Behavior-affecting hooks receive complete
+payloads so security and policy decisions never fail open on truncated input.
 
 ### JSON wire protocol
 
@@ -1369,6 +1386,7 @@ hooks:
   post_tool_call:
     - matcher: "write_file|patch"
       command: "~/.hermes/agent-hooks/auto-format.sh"
+      blocking: true  # formatting must finish before the next tool call
 ```
 
 ```bash

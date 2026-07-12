@@ -9,6 +9,8 @@ covered in ``test_shell_hooks_consent.py``.
 from __future__ import annotations
 
 import json
+import threading
+import time
 from pathlib import Path
 
 import pytest
@@ -190,6 +192,26 @@ class TestSerializePayload:
         payload = json.loads(raw)
         assert payload["extra"]["obj"] == "<weird>"
 
+    def test_large_tool_result_is_bounded_and_marked(self):
+        raw = shell_hooks._serialize_payload(
+            "post_tool_call",
+            {"tool_name": "search_files", "result": "x" * 2_000_000},
+        )
+        payload = json.loads(raw)
+        assert len(raw) <= shell_hooks.MAX_HOOK_PAYLOAD_CHARS
+        assert len(payload["extra"]["result"]) <= shell_hooks.MAX_HOOK_FIELD_CHARS
+        assert "truncated by Hermes" in payload["extra"]["result"]
+
+    def test_large_structured_field_has_truncation_metadata(self):
+        raw = shell_hooks._serialize_payload(
+            "post_llm_call",
+            {"conversation_history": [{"content": "x" * 20_000}] * 100},
+        )
+        value = json.loads(raw)["extra"]["conversation_history"]
+        assert value["_hermes_truncated"] is True
+        assert value["original_chars"] > shell_hooks.MAX_HOOK_FIELD_CHARS
+        assert len(raw) <= shell_hooks.MAX_HOOK_PAYLOAD_CHARS
+
 
 # ── Matcher behaviour ─────────────────────────────────────────────────────
 
@@ -266,9 +288,72 @@ class TestCallbackSubprocess:
         )
         spec = shell_hooks.ShellHookSpec(
             event="post_tool_call", command=str(script), timeout=1,
+            blocking=True,
         )
         cb = shell_hooks._make_callback(spec)
         assert cb(tool_name="terminal") is None
+
+    def test_observer_hook_returns_without_waiting(self, monkeypatch):
+        completed = threading.Event()
+
+        def slow_spawn(_spec, _stdin_json):
+            time.sleep(0.4)
+            completed.set()
+            return {
+                "returncode": 0,
+                "stdout": "",
+                "stderr": "",
+                "timed_out": False,
+                "elapsed_seconds": 0.4,
+                "error": None,
+            }
+
+        monkeypatch.setattr(shell_hooks, "_spawn", slow_spawn)
+        spec = shell_hooks.ShellHookSpec(
+            event="on_session_end", command="observer-command", timeout=10,
+            blocking=False,
+        )
+        cb = shell_hooks._make_callback(spec)
+        started = time.monotonic()
+        assert cb(session_id="s") is None
+        assert time.monotonic() - started < 0.2
+        assert completed.wait(timeout=2)
+
+    def test_behavior_hook_remains_synchronous(self, tmp_path):
+        script = _write_script(
+            tmp_path, "slow-policy.sh",
+            "#!/usr/bin/env bash\nsleep 0.25\n"
+            "printf '{\"action\": \"block\", \"message\": \"no\"}\\n'\n",
+        )
+        spec = shell_hooks.ShellHookSpec(
+            event="pre_tool_call", command=str(script), timeout=10,
+        )
+        cb = shell_hooks._make_callback(spec)
+        started = time.monotonic()
+        assert cb(tool_name="terminal") == {"action": "block", "message": "no"}
+        assert time.monotonic() - started >= 0.2
+
+    def test_nonblocking_observer_drops_while_previous_run_is_active(
+        self, tmp_path,
+    ):
+        calls = tmp_path / "calls"
+        script = _write_script(
+            tmp_path, "single-flight.sh",
+            f"#!/usr/bin/env bash\necho call >> {calls}\nsleep 0.3\n",
+        )
+        cb = shell_hooks._make_callback(shell_hooks.ShellHookSpec(
+            event="post_tool_call", command=str(script), timeout=10,
+            blocking=False,
+        ))
+        cb(tool_name="terminal")
+        time.sleep(0.05)
+        cb(tool_name="terminal")
+        for _ in range(100):
+            if calls.exists():
+                time.sleep(0.4)
+                break
+            time.sleep(0.05)
+        assert calls.read_text().splitlines() == ["call"]
 
     def test_malformed_json_stdout_returns_none(self, tmp_path):
         script = _write_script(
@@ -497,6 +582,44 @@ class TestParseHooksBlock:
             ],
         })
         assert specs[0].timeout == shell_hooks.DEFAULT_TIMEOUT_SECONDS
+
+    def test_observer_defaults_blocking_and_can_opt_out(self):
+        default, nonblocking = shell_hooks._parse_hooks_block({
+            "on_session_end": [
+                {"command": "/tmp/notify.sh"},
+                {"command": "/tmp/notify-fast.sh", "blocking": False},
+            ],
+        })
+        assert default.runs_blocking is True
+        assert nonblocking.runs_blocking is False
+
+    def test_behavior_hook_rejects_nonblocking(self, caplog):
+        specs = shell_hooks._parse_hooks_block({
+            "pre_tool_call": [
+                {"command": "/tmp/policy.sh", "blocking": False},
+            ],
+        })
+        assert specs[0].runs_blocking is True
+        assert "unsafe" in caplog.text
+
+    def test_non_boolean_blocking_uses_event_default(self, caplog):
+        specs = shell_hooks._parse_hooks_block({
+            "on_session_end": [
+                {"command": "/tmp/notify.sh", "blocking": "false"},
+            ],
+        })
+        assert specs[0].runs_blocking is True
+        assert "must be a boolean" in caplog.text
+
+    def test_behavior_hook_keeps_complete_large_tool_input(self):
+        large_command = "x" * (shell_hooks.MAX_HOOK_FIELD_CHARS * 2)
+        raw = shell_hooks._serialize_payload(
+            "pre_tool_call",
+            {"tool_name": "terminal", "args": {"command": large_command}},
+        )
+        payload = json.loads(raw)
+        assert payload["tool_input"]["command"] == large_command
+        assert "_hermes_truncated" not in raw
 
     def test_non_list_event_skipped(self):
         specs = shell_hooks._parse_hooks_block({

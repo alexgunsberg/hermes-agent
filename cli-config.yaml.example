@@ -1292,6 +1292,9 @@ display:
 #   post_tool_call:
 #     - matcher: "write_file|patch"
 #       command: "~/.hermes/agent-hooks/auto-format.sh"
+#       # Hooks remain blocking by default. Observer events may opt out for
+#       # fail-fast notifications; decision/transform hooks always block.
+#       # blocking: false
 #   pre_llm_call:
 #     - command: "~/.hermes/agent-hooks/inject-cwd-context.sh"
 #   subagent_stop:
