@@ -1409,6 +1409,16 @@ class MultiplexConfigError(RuntimeError):
     """
 
 
+class _HygieneCooldownRecordedMidFlight(Exception):
+    """A compression-failure cooldown appeared between the session-hygiene
+    preflight check and the actual ``_compress_context`` call.
+
+    Raised from inside the hygiene executor so the caller can distinguish a
+    deliberate deferral from a real compression failure — the two must not
+    share the "auto-compress failed" warning path.
+    """
+
+
 @_contextmanager
 def _profile_runtime_scope(profile_home: "Path"):
     """Scope config/skills/memory AND credentials to a profile for one turn.
@@ -10963,9 +10973,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 # compression.hygiene_hard_message_limit.
                 # (#2153)
                 _HARD_MSG_LIMIT = _hyg_hard_msg_limit
+                _hard_limit_hit = _msg_count >= _HARD_MSG_LIMIT
                 _needs_compress = (
                     _approx_tokens >= _compress_token_threshold
-                    or _msg_count >= _HARD_MSG_LIMIT
+                    or _hard_limit_hit
                 )
 
                 # Honor the same durable, session-scoped compression-failure
@@ -11003,13 +11014,27 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         _hyg_failure_cooldown = None
 
                 if _needs_compress and _hyg_failure_cooldown:
-                    logger.info(
-                        "Session hygiene: deferring compression for session %s "
-                        "during summary-failure cooldown (~%s seconds remaining)",
-                        session_entry.session_id,
-                        int(_hyg_failure_cooldown.get("remaining_seconds", 0.0)),
-                    )
-                    _needs_compress = False
+                    if _hard_limit_hit:
+                        # The 5000-message valve exists precisely for sessions
+                        # whose compression pipeline is misbehaving (#2153); a
+                        # summary-failure cooldown must not park a session in
+                        # its death spiral, so the hard limit wins.
+                        logger.warning(
+                            "Session hygiene: %s messages reached the hard "
+                            "limit (%s) for session %s — compressing despite "
+                            "the summary-failure cooldown",
+                            _msg_count,
+                            _HARD_MSG_LIMIT,
+                            session_entry.session_id,
+                        )
+                    else:
+                        logger.info(
+                            "Session hygiene: deferring compression for session %s "
+                            "during summary-failure cooldown (~%s seconds remaining)",
+                            session_entry.session_id,
+                            int(_hyg_failure_cooldown.get("remaining_seconds", 0.0)),
+                        )
+                        _needs_compress = False
 
                 if _needs_compress:
                     logger.info(
@@ -11067,13 +11092,46 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                     _hyg_agent._end_session_on_close = False
                                     _hyg_agent._print_fn = lambda *a, **kw: None
 
-                                    loop = asyncio.get_running_loop()
-                                    _compressed, _ = await loop.run_in_executor(
-                                        None,
-                                        lambda: _hyg_agent._compress_context(
+                                    def _hyg_compress_with_recheck():
+                                        # Close the check-then-act window: a
+                                        # summary failure recorded by a
+                                        # concurrent turn between the preflight
+                                        # cooldown check and this point would
+                                        # otherwise still trigger the
+                                        # destructive in-cooldown fallback
+                                        # compaction. The hard message limit
+                                        # pierces cooldowns here too.
+                                        if not _hard_limit_hit and self._session_db is not None:
+                                            _raw_db = getattr(
+                                                self._session_db, "_db", self._session_db
+                                            )
+                                            _recheck = getattr(
+                                                _raw_db,
+                                                "get_compression_failure_cooldown",
+                                                None,
+                                            )
+                                            if callable(_recheck):
+                                                try:
+                                                    _mid_cd = _recheck(session_entry.session_id)
+                                                    if inspect.isawaitable(_mid_cd):
+                                                        # Worker thread can't await;
+                                                        # fail open like the preflight.
+                                                        _mid_cd.close()
+                                                        _mid_cd = None
+                                                    if _mid_cd:
+                                                        raise _HygieneCooldownRecordedMidFlight()
+                                                except _HygieneCooldownRecordedMidFlight:
+                                                    raise
+                                                except Exception:
+                                                    pass  # fail open, as the preflight does
+                                        return _hyg_agent._compress_context(
                                             _hyg_msgs, "",
                                             approx_tokens=_approx_tokens,
-                                        ),
+                                        )
+
+                                    loop = asyncio.get_running_loop()
+                                    _compressed, _ = await loop.run_in_executor(
+                                        None, _hyg_compress_with_recheck,
                                     )
 
                                     # _compress_context ends the old session and creates
@@ -11206,6 +11264,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                         _hyg_agent, context="session hygiene"
                                     )
 
+                    except _HygieneCooldownRecordedMidFlight:
+                        logger.info(
+                            "Session hygiene: deferring compression for "
+                            "session %s — summary-failure cooldown recorded "
+                            "while hygiene was starting",
+                            session_entry.session_id,
+                        )
                     except Exception as e:
                         logger.warning(
                             "Session hygiene auto-compress failed: %s", e

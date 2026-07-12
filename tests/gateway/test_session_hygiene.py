@@ -395,30 +395,40 @@ async def test_session_hygiene_messages_stay_in_originating_topic(monkeypatch, t
     FakeCompressAgent.last_instance.close.assert_called_once()
 
 
-@pytest.mark.asyncio
-async def test_session_hygiene_defers_during_persisted_compression_cooldown(
-    monkeypatch, tmp_path
-):
-    """An oversized gateway transcript must not start a second compressor
-    while the session's summary-failure cooldown is active.
+class TrackingCompressAgent:
+    """A working fake compressor that records construction + compression.
 
-    The ordinary AIAgent preflight already observes this durable cooldown.
-    Gateway hygiene runs before that agent exists, so this specifically guards
-    the duplicate pre-agent path that previously constructed an AIAgent and
-    called ``_compress_context`` directly on every inbound message.
+    Cooldown tests use a WORKING fake (not a raising one) so a regression of
+    the deferral gate produces a visible rotation + transcript rewrite instead
+    of an exception silently absorbed by the hygiene except-block — the
+    original raising sentinel passed even with the deferral removed.
     """
+
+    last_instance = None
+
+    def __init__(self, **kwargs):
+        self.session_id = kwargs.get("session_id", "fake-session")
+        self._print_fn = None
+        self.compress_calls = 0
+        self.shutdown_memory_provider = MagicMock()
+        self.close = MagicMock()
+        type(self).last_instance = self
+
+    def _compress_context(self, messages, *_args, **_kwargs):
+        self.compress_calls += 1
+        self.session_id = f"{self.session_id}_compressed"
+        return ([{"role": "assistant", "content": "compressed"}], None)
+
+
+def _build_cooldown_runner(monkeypatch, tmp_path, *, session_db, n_messages=6):
+    """Shared harness for the hygiene-cooldown scenarios below."""
     fake_dotenv = types.ModuleType("dotenv")
     fake_dotenv.load_dotenv = lambda *args, **kwargs: None
     monkeypatch.setitem(sys.modules, "dotenv", fake_dotenv)
 
-    class UnexpectedCompressAgent:
-        def __init__(self, **_kwargs):
-            raise AssertionError(
-                "hygiene compressor must not be constructed during cooldown"
-            )
-
+    TrackingCompressAgent.last_instance = None
     fake_run_agent = types.ModuleType("run_agent")
-    fake_run_agent.AIAgent = UnexpectedCompressAgent
+    fake_run_agent.AIAgent = TrackingCompressAgent
     monkeypatch.setitem(sys.modules, "run_agent", fake_run_agent)
 
     gateway_run = importlib.import_module("gateway.run")
@@ -442,7 +452,7 @@ async def test_session_hygiene_defers_during_persisted_compression_cooldown(
         chat_type="group",
     )
     runner.session_store.load_transcript.return_value = _make_history(
-        6, content_size=400
+        n_messages, content_size=400
     )
     runner.session_store.has_any_sessions.return_value = True
     runner.session_store.rewrite_transcript = MagicMock()
@@ -450,15 +460,7 @@ async def test_session_hygiene_defers_during_persisted_compression_cooldown(
     runner._running_agents = {}
     runner._pending_messages = {}
     runner._pending_approvals = {}
-    runner._session_db = SimpleNamespace(
-        get_compression_failure_cooldown=AsyncMock(
-            return_value={
-                "cooldown_until": 4_000_000_000.0,
-                "remaining_seconds": 55.0,
-                "error": "summary timeout",
-            }
-        )
-    )
+    runner._session_db = session_db
     runner._is_user_authorized = lambda _source: True
     runner._set_session_env = lambda _context: None
     runner._run_agent = AsyncMock(
@@ -470,6 +472,9 @@ async def test_session_hygiene_defers_during_persisted_compression_cooldown(
             "last_prompt_tokens": 0,
         }
     )
+    runner._sync_telegram_topic_binding = MagicMock()
+    runner._evict_cached_agent = MagicMock()
+    runner._cleanup_agent_resources_off_loop = AsyncMock()
 
     monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
     monkeypatch.setattr(
@@ -492,15 +497,155 @@ async def test_session_hygiene_defers_during_persisted_compression_cooldown(
         ),
         message_id="1",
     )
+    return runner, event
+
+
+_ACTIVE_COOLDOWN = {
+    "cooldown_until": 4_000_000_000.0,
+    "remaining_seconds": 55.0,
+    "error": "summary timeout",
+}
+
+
+@pytest.mark.asyncio
+async def test_session_hygiene_defers_during_persisted_compression_cooldown(
+    monkeypatch, tmp_path
+):
+    """An oversized gateway transcript must not start a second compressor
+    while the session's summary-failure cooldown is active.
+
+    The ordinary AIAgent preflight already observes this durable cooldown.
+    Gateway hygiene runs before that agent exists, so this specifically guards
+    the duplicate pre-agent path that previously constructed an AIAgent and
+    called ``_compress_context`` directly on every inbound message.
+    """
+    session_db = SimpleNamespace(
+        get_compression_failure_cooldown=AsyncMock(return_value=_ACTIVE_COOLDOWN)
+    )
+    runner, event = _build_cooldown_runner(
+        monkeypatch, tmp_path, session_db=session_db
+    )
 
     result = await runner._handle_message(event)
 
     assert result == "ok"
-    runner._session_db.get_compression_failure_cooldown.assert_awaited_once_with(
+    session_db.get_compression_failure_cooldown.assert_awaited_once_with(
         "sess-cooldown"
     )
+    # Mutation-resistant assertions: a working fake agent WOULD rotate and
+    # rewrite the transcript if the deferral were regressed away.
+    assert TrackingCompressAgent.last_instance is None
     runner.session_store.rewrite_transcript.assert_not_called()
     runner._run_agent.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_session_hygiene_cooldown_honored_from_sync_session_db(
+    monkeypatch, tmp_path
+):
+    """The cooldown lookup handles plain (non-awaitable) SessionDB results."""
+    session_db = SimpleNamespace(
+        get_compression_failure_cooldown=MagicMock(return_value=_ACTIVE_COOLDOWN)
+    )
+    runner, event = _build_cooldown_runner(
+        monkeypatch, tmp_path, session_db=session_db
+    )
+
+    result = await runner._handle_message(event)
+
+    assert result == "ok"
+    session_db.get_compression_failure_cooldown.assert_called_once_with(
+        "sess-cooldown"
+    )
+    assert TrackingCompressAgent.last_instance is None
+    runner.session_store.rewrite_transcript.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_session_hygiene_compresses_when_cooldown_expired(
+    monkeypatch, tmp_path
+):
+    """An expired cooldown (lookup returns None) must not defer compression."""
+    session_db = SimpleNamespace(
+        get_compression_failure_cooldown=AsyncMock(return_value=None)
+    )
+    runner, event = _build_cooldown_runner(
+        monkeypatch, tmp_path, session_db=session_db
+    )
+
+    result = await runner._handle_message(event)
+
+    assert result == "ok"
+    agent = TrackingCompressAgent.last_instance
+    assert agent is not None and agent.compress_calls == 1
+    runner.session_store.rewrite_transcript.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_session_hygiene_hard_message_limit_pierces_cooldown(
+    monkeypatch, tmp_path
+):
+    """The runaway-growth valve (#2153) exists precisely for sessions whose
+    compression pipeline is misbehaving — an active summary-failure cooldown
+    must not park such a session in its death spiral."""
+    cfg_path = tmp_path / "config.yaml"
+    cfg_path.write_text(
+        "compression:\n"
+        "  enabled: true\n"
+        "  hygiene_hard_message_limit: 10\n"
+    )
+    session_db = SimpleNamespace(
+        get_compression_failure_cooldown=AsyncMock(return_value=_ACTIVE_COOLDOWN)
+    )
+    runner, event = _build_cooldown_runner(
+        monkeypatch, tmp_path, session_db=session_db, n_messages=12
+    )
+
+    result = await runner._handle_message(event)
+
+    assert result == "ok"
+    agent = TrackingCompressAgent.last_instance
+    assert agent is not None and agent.compress_calls == 1, (
+        "hard message limit must force compression despite the cooldown"
+    )
+
+
+@pytest.mark.asyncio
+async def test_session_hygiene_defers_when_cooldown_recorded_mid_flight(
+    monkeypatch, tmp_path, caplog
+):
+    """Closes the check-then-act window: a failure recorded by a concurrent
+    turn AFTER the preflight cooldown check but BEFORE _compress_context must
+    still defer instead of running the destructive in-cooldown fallback."""
+    session_db = SimpleNamespace(
+        # Preflight (async wrapper) sees no cooldown…
+        get_compression_failure_cooldown=AsyncMock(return_value=None),
+        # …but the raw DB consulted inside the executor now reports one.
+        _db=SimpleNamespace(
+            get_compression_failure_cooldown=MagicMock(
+                return_value=_ACTIVE_COOLDOWN
+            )
+        ),
+    )
+    runner, event = _build_cooldown_runner(
+        monkeypatch, tmp_path, session_db=session_db
+    )
+
+    with caplog.at_level("INFO", logger="gateway.run"):
+        result = await runner._handle_message(event)
+
+    assert result == "ok"
+    agent = TrackingCompressAgent.last_instance
+    assert agent is not None and agent.compress_calls == 0
+    runner.session_store.rewrite_transcript.assert_not_called()
+    # A mid-flight deferral is not a failure — it must not hit the
+    # "auto-compress failed" warning path.
+    assert not any(
+        "auto-compress failed" in rec.message for rec in caplog.records
+    )
+    assert any(
+        "cooldown recorded" in rec.getMessage() for rec in caplog.records
+    )
 
 
 @pytest.mark.asyncio
