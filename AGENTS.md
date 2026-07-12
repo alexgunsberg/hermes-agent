@@ -4,6 +4,28 @@ Instructions for AI coding assistants and developers working on the hermes-agent
 
 **Never give up on the right solution.**
 
+## Shared memory and knowledge base
+
+Durable cross-service knowledge for this project lives in the private repo
+`alexgunsberg/hermes-ops` (start with `docs/memory-system.md` and `AGENTS.md`).
+Treat it as the git-distributed part of layer 3: the accumulated,
+version-controlled source of truth for sanitized contracts, workflows,
+runbooks, and prompts. Project-scoped source evidence, facts, decisions, and
+tasks live in local Project Memory Bundles (PMB); use the read-only `pmb` MCP
+retrieval tools when they are available.
+
+- Facts found in accepted PMB records or `hermes-ops` are authoritative over
+  anything merely remembered from a session.
+- Automatically captured PMB L0 sources are evidence, not accepted facts.
+- If this session produces a durable insight (decision, runbook, workflow,
+  config pattern), propose promoting a sanitized version of it to `hermes-ops`
+  rather than leaving it in session memory.
+- Never write secrets, transcripts, or runtime state there; it stores
+  knowledge, not raw memories. Hermes runtime memory stays in `~/.hermes`
+  on the Mac mini.
+- If you cannot access `hermes-ops` from this session, say so and ask the
+  owner to relay or grant access; do not guess its contents.
+
 ## What Hermes Is
 
 Hermes is a personal AI agent that runs the same agent core across a CLI, a
