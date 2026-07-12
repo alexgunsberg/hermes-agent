@@ -683,4 +683,3 @@ When refining the paper itself through autoreason:
 See [references/autoreason-methodology.md](references/autoreason-methodology.md) for complete prompts, Borda scoring details, model selection guide, scope constraint design patterns, and compute budget reference.
 
 ---
-

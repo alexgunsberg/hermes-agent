@@ -128,8 +128,8 @@ When responding to actual reviews (post-submission), rebuttals are a distinct sk
 ```
 > R1-W1: "The paper lacks comparison with Method X."
 
-We thank the reviewer for this suggestion. We have added a comparison with 
-Method X in Table 3 (revised). Our method outperforms X by 3.2pp on [metric] 
+We thank the reviewer for this suggestion. We have added a comparison with
+Method X in Table 3 (revised). Our method outperforms X by 3.2pp on [metric]
 (p<0.05). We note that X requires 2x our compute budget.
 ```
 
@@ -488,4 +488,3 @@ An accessible summary significantly increases impact:
 **Timing**: Post within 1-2 days of paper appearing on proceedings or arXiv camera-ready.
 
 ---
-

@@ -400,4 +400,3 @@ Full enumeration lives in `toolsets.py` as the `TOOLSETS` dict; `_HERMES_CORE_TO
 Tool changes take effect on `/reset` (new session). They do NOT apply mid-conversation to preserve prompt caching.
 
 ---
-

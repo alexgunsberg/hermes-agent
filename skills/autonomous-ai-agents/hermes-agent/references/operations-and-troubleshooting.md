@@ -490,4 +490,3 @@ hermes config set auxiliary.vision.model <model_name>
 | Source code | `~/.hermes/hermes-agent/` |
 
 ---
-

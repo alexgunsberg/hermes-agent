@@ -447,4 +447,3 @@ Work through systematically: title/authors → abstract → introduction → met
 | Deleting template content early | Lose formatting reference | Keep as comments until done |
 | Not compiling frequently | Errors accumulate | Compile after each section |
 | Raster PNGs for figures | Blurry in paper | Always use vector PDF via `savefig('fig.pdf')` |
-
