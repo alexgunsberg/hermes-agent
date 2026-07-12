@@ -257,6 +257,69 @@ def test_unchanged_skill_view_result_is_suppressed_only_after_fresh_comparison()
     assert "large instructions" not in json.dumps(compact)
 
 
+def test_skill_view_is_never_suppressed_without_retained_history_even_at_threshold_one():
+    # warn_after=1 must not let the very first call be suppressed: the stub
+    # claims the content is in retained history, so suppression is licensed
+    # by the retention proof, never by the repeat threshold alone.
+    controller = ToolCallGuardrailController(
+        ToolCallGuardrailConfig(no_progress_warn_after=1, no_progress_block_after=1)
+    )
+    args = {"name": "software-development-workflows"}
+    result = json.dumps({"success": True, "content": "only copy"})
+
+    first = controller.after_call("skill_view", args, result, failed=False)
+    assert first.action == "allow"
+
+    retained = controller.after_call(
+        "skill_view",
+        args,
+        result,
+        failed=False,
+        retained_messages=_retained_skill_messages(args, result),
+    )
+    assert retained.code == "unchanged_result_suppressed"
+
+
+def test_skill_view_suppression_is_a_token_bound_and_ignores_warnings_enabled():
+    controller = ToolCallGuardrailController(
+        ToolCallGuardrailConfig(warnings_enabled=False, hard_stop_enabled=False)
+    )
+    args = {"name": "software-development-workflows"}
+    result = json.dumps({"success": True, "content": "large instructions"})
+
+    controller.after_call("skill_view", args, result, failed=False)
+    repeated = controller.after_call(
+        "skill_view",
+        args,
+        result,
+        failed=False,
+        retained_messages=_retained_skill_messages(args, result),
+    )
+
+    assert repeated.action == "warn"
+    assert repeated.code == "unchanged_result_suppressed"
+
+
+def test_varying_skill_view_content_with_same_args_warns_after_repeated_reads():
+    # A skill whose inline rendering changes per call can never prove
+    # retention, so suppression stays off — but the loop must still be
+    # called out once the same signature keeps re-emitting full documents.
+    controller = ToolCallGuardrailController()
+    args = {"name": "nondeterministic-skill"}
+
+    first = controller.after_call("skill_view", args, "render 1", failed=False)
+    second = controller.after_call("skill_view", args, "render 2", failed=False)
+    third = controller.after_call("skill_view", args, "render 3", failed=False)
+
+    assert first.action == "allow"
+    assert second.action == "allow"
+    assert third.action == "warn"
+    assert third.code == "repeated_instructional_read"
+    # Warning only: execution and full content are never withheld.
+    assert controller.before_call("skill_view", args).action == "allow"
+    assert controller.halt_decision is None
+
+
 def test_changed_skill_view_content_is_returned_and_starts_a_new_streak():
     controller = ToolCallGuardrailController()
     args = {"name": "software-development-workflows"}

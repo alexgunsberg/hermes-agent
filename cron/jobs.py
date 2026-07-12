@@ -104,6 +104,11 @@ _ONESHOT_RUN_CLAIM_TTL_HEADROOM = 3
 
 _DEFAULT_CRON_INACTIVITY_TIMEOUT = 600.0
 
+# Ceiling for per-job max_iterations overrides.  The override exists for
+# deliberately complex automations, not to defeat the unattended cap — a
+# typo'd huge value must not restore unbounded runs.
+MAX_JOB_MAX_ITERATIONS = 500
+
 
 def _oneshot_run_claim_ttl_seconds() -> float:
     """Resolve the one-shot running-claim stale-recovery TTL.
@@ -757,6 +762,24 @@ def save_jobs(jobs: List[Dict[str, Any]]):
         _save_jobs_unlocked(jobs)
 
 
+def _validate_max_iterations(value: Any) -> int:
+    """Strictly validate a per-job ``max_iterations`` override.
+
+    Matches the HTTP API's strictness so every surface agrees: only genuine
+    integers (no bools, digit strings, or floats), bounded above so a typo'd
+    huge value cannot restore effectively-unbounded unattended runs.
+    """
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise ValueError(
+            f"max_iterations must be an integer between 1 and {MAX_JOB_MAX_ITERATIONS}"
+        )
+    if not 1 <= value <= MAX_JOB_MAX_ITERATIONS:
+        raise ValueError(
+            f"max_iterations must be an integer between 1 and {MAX_JOB_MAX_ITERATIONS}"
+        )
+    return value
+
+
 def _normalize_workdir(workdir: Optional[str]) -> Optional[str]:
     """Normalize and validate a cron job workdir.
 
@@ -992,14 +1015,7 @@ def create_job(
     normalized_attach = attach_to_session if isinstance(attach_to_session, bool) else None
     normalized_max_iterations = None
     if max_iterations is not None:
-        if isinstance(max_iterations, bool):
-            raise ValueError("max_iterations must be a positive integer")
-        try:
-            normalized_max_iterations = int(max_iterations)
-        except (TypeError, ValueError) as exc:
-            raise ValueError("max_iterations must be a positive integer") from exc
-        if normalized_max_iterations < 1:
-            raise ValueError("max_iterations must be a positive integer")
+        normalized_max_iterations = _validate_max_iterations(max_iterations)
 
     # no_agent jobs are meaningless without a script — the script IS the job.
     # Surface this as a clear ValueError at create time so bad configs never
@@ -1195,15 +1211,7 @@ def update_job(job_id: str, updates: Dict[str, Any]) -> Optional[Dict[str, Any]]
                 if _max_iter in {None, ""}:
                     updates["max_iterations"] = None
                 else:
-                    if isinstance(_max_iter, bool):
-                        raise ValueError("max_iterations must be a positive integer")
-                    try:
-                        _max_iter = int(_max_iter)
-                    except (TypeError, ValueError) as exc:
-                        raise ValueError("max_iterations must be a positive integer") from exc
-                    if _max_iter < 1:
-                        raise ValueError("max_iterations must be a positive integer")
-                    updates["max_iterations"] = _max_iter
+                    updates["max_iterations"] = _validate_max_iterations(_max_iter)
 
             previous_inference_axes = _normalized_inference_axes(job)
             updated = _apply_skill_fields({**job, **updates})

@@ -241,6 +241,7 @@ class ToolCallGuardrailController:
         self._exact_failure_counts: dict[ToolCallSignature, int] = {}
         self._same_tool_failure_counts: dict[str, int] = {}
         self._no_progress: dict[ToolCallSignature, tuple[str, int]] = {}
+        self._unverified_repeat_counts: dict[ToolCallSignature, int] = {}
         self._halt_decision: ToolGuardrailDecision | None = None
 
     @property
@@ -367,18 +368,20 @@ class ToolCallGuardrailController:
         result_hash = _result_hash(result)
         previous = self._no_progress.get(signature)
         repeat_count = 1
+        retained = False
         if tool_name in UNCHANGED_RESULT_SUPPRESSION_TOOL_NAMES:
             # Unlike ordinary read-only calls, suppressing an instructional
             # document is safe only while the earlier full result is provably
             # retained in model-visible history. This also makes a resumed
             # agent correct without process-local cache state and fails open
             # after compression removes the original tool result.
-            if retained_tool_result_matches(
+            retained = retained_tool_result_matches(
                 retained_messages,
                 tool_name,
                 args,
                 result,
-            ):
+            )
+            if retained:
                 repeat_count = (
                     previous[1] + 1
                     if previous is not None and previous[0] == result_hash
@@ -388,30 +391,31 @@ class ToolCallGuardrailController:
             repeat_count = previous[1] + 1
         self._no_progress[signature] = (result_hash, repeat_count)
 
-        if (
-            tool_name in UNCHANGED_RESULT_SUPPRESSION_TOOL_NAMES
-            and repeat_count >= self.config.no_progress_warn_after
-        ):
-            message = (
-                f"{tool_name} returned unchanged content {repeat_count} times. "
-                "The full content is already available in retained conversation "
-                "history; use it or load a different skill or linked file."
-            )
-            if (
-                self.config.hard_stop_enabled
-                and repeat_count >= self.config.no_progress_block_after
-            ):
-                decision = ToolGuardrailDecision(
-                    action="halt",
-                    code="unchanged_result_halt",
-                    message=message,
-                    tool_name=tool_name,
-                    count=repeat_count,
-                    signature=signature,
+        if tool_name in UNCHANGED_RESULT_SUPPRESSION_TOOL_NAMES:
+            # Suppression must never claim retention it cannot prove: the
+            # `retained` gate — not the repeat threshold — is what licenses
+            # replacing the document with a pointer to history. It is also a
+            # token-safety bound, so it deliberately ignores warnings_enabled.
+            if retained and repeat_count >= self.config.no_progress_warn_after:
+                message = (
+                    f"{tool_name} returned unchanged content {repeat_count} times. "
+                    "The full content is already available in retained conversation "
+                    "history; use it or load a different skill or linked file."
                 )
-                self._halt_decision = decision
-                return decision
-            if self.config.warnings_enabled:
+                if (
+                    self.config.hard_stop_enabled
+                    and repeat_count >= self.config.no_progress_block_after
+                ):
+                    decision = ToolGuardrailDecision(
+                        action="halt",
+                        code="unchanged_result_halt",
+                        message=message,
+                        tool_name=tool_name,
+                        count=repeat_count,
+                        signature=signature,
+                    )
+                    self._halt_decision = decision
+                    return decision
                 return ToolGuardrailDecision(
                     action="warn",
                     code="unchanged_result_suppressed",
@@ -420,6 +424,31 @@ class ToolCallGuardrailController:
                     count=repeat_count,
                     signature=signature,
                 )
+            # Same signature repeated but the content varies per call (e.g. a
+            # skill with non-deterministic inline rendering) or the prior copy
+            # is no longer retained: each call re-emits the full document, so
+            # at least warn even though suppression would be unsafe.
+            calls = self._unverified_repeat_counts.get(signature, 0) + 1
+            self._unverified_repeat_counts[signature] = calls
+            # One threshold higher than the suppression threshold: a single
+            # re-read after editing the underlying file is progress, not a loop.
+            if self.config.warnings_enabled and calls >= max(
+                3, self.config.no_progress_warn_after + 1
+            ):
+                return ToolGuardrailDecision(
+                    action="warn",
+                    code="repeated_instructional_read",
+                    message=(
+                        f"{tool_name} was called {calls} times this turn with "
+                        "identical arguments, and each call re-emits the full "
+                        "document into context. Reuse the content already "
+                        "provided or load a different skill or linked file."
+                    ),
+                    tool_name=tool_name,
+                    count=calls,
+                    signature=signature,
+                )
+            return ToolGuardrailDecision(tool_name=tool_name, count=repeat_count, signature=signature)
 
         if self.config.warnings_enabled and repeat_count >= self.config.no_progress_warn_after:
             return ToolGuardrailDecision(

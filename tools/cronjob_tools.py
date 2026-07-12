@@ -743,7 +743,9 @@ def cronjob(
                 workdir=_normalize_optional_job_value(workdir),
                 no_agent=_no_agent,
                 attach_to_session=attach_to_session,
-                max_iterations=max_iterations,
+                # 0 means "no override" — at create time that is simply the
+                # config default, mirroring the update-path clear sentinel.
+                max_iterations=max_iterations or None,
             )
             _notify_provider_jobs_changed_safe()
             _create_message = f"Cron job '{job['name']}' created."
@@ -936,7 +938,10 @@ def cronjob(
                         )
                 updates["no_agent"] = target_no_agent
             if max_iterations is not None:
-                updates["max_iterations"] = max_iterations
+                # 0 is the explicit "clear the override" sentinel: without it
+                # neither the CLI nor the agent tool could return a job to the
+                # cron.max_iterations config default once an override was set.
+                updates["max_iterations"] = None if max_iterations == 0 else max_iterations
             if repeat is not None:
                 # Normalize: treat 0 or negative as None (infinite)
                 normalized_repeat = None if repeat <= 0 else repeat
@@ -1075,8 +1080,9 @@ Important safety rule: cron-run sessions should not recursively schedule more cr
             },
             "max_iterations": {
                 "type": "integer",
-                "minimum": 1,
-                "description": "Optional per-run tool-loop cap for this unattended job. Omit to use cron.max_iterations (default 30). Raise only for jobs that are intentionally complex."
+                "minimum": 0,
+                "maximum": 500,
+                "description": "Optional per-run tool-loop cap for this unattended job, 1-500. Omit to use cron.max_iterations (default 30). Raise only for jobs that are intentionally complex. On update, pass 0 to clear the override back to the config default."
             },
             "workdir": {
                 "type": "string",

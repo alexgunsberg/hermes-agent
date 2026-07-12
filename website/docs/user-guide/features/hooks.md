@@ -1331,12 +1331,17 @@ hook in flight; an event emitted while its previous invocation is still running
 is dropped. This is appropriate for fail-fast notifications such as an optional
 cmux bridge. `blocking: false` is rejected for behavior-affecting hooks.
 
-To keep observer audit and notification scripts from accidentally copying
-model-sized data, Hermes bounds each serialized observer field to 16 KiB and
-the complete observer stdin payload to 64 KiB. Oversized strings carry a
-truncation marker; oversized structured values carry `_hermes_truncated`,
-`original_chars`, and a `preview`. Behavior-affecting hooks receive complete
-payloads so security and policy decisions never fail open on truncated input.
+To keep nonblocking observer audit and notification scripts from accidentally
+copying model-sized data, Hermes bounds each serialized field of a
+`blocking: false` hook's payload to 16,384 JSON-encoded characters and the
+complete stdin payload to 65,536 characters (limits are measured against the
+encoded JSON, not raw string length). Oversized strings carry a truncation
+marker; oversized structured values carry `_hermes_truncated`,
+`original_chars`, and a `preview`. Every synchronous hook — all
+behavior-affecting hooks, and observer-event hooks that keep the default
+`blocking: true` — receives the complete payload, so security/policy decisions
+never fail open on truncated input and scripts like a post-write formatter
+always see full file content.
 
 ### JSON wire protocol
 

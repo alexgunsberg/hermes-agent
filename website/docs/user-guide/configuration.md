@@ -1361,6 +1361,12 @@ tool_loop_guardrails:
 
 `hard_stop_enabled` defaults to `false` because interactive sessions have a human in the loop. In unattended deployments (gateway, cron, kanban workers) set it to `true` so repeated failures are blocked rather than only warned. See also [Docker / unattended deployments](docker.md).
 
+### Instructional-read suppression
+
+`skill_view` always executes (so an edited SKILL.md is never hidden behind stale state), but when a repeated call returns byte-identical content **and the full prior result provably remains in retained conversation history**, the duplicate payload is replaced by a compact `{"unchanged": true, ...}` stub (guardrail code `unchanged_result_suppressed`, or `unchanged_result_halt` past the hard-stop threshold). This is a token-safety bound, not advisory chatter — it stays active even with `warnings_enabled: false`. If retention can't be proven (after context compression, or when the skill renders differently per call), the full content is returned again; repeated same-argument reads of varying content emit a `repeated_instructional_read` warning instead of being suppressed.
+
+`search_files` results are additionally capped at 200 matches per call (`limit` is clamped, never errored); page through with `offset` for more.
+
 ## TTS Configuration
 
 ```yaml

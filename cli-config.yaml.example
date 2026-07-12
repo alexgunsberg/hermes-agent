@@ -385,6 +385,18 @@ tool_loop_guardrails:
     idempotent_no_progress: 5
 
 # =============================================================================
+# Cron (Unattended scheduled jobs)
+# =============================================================================
+# Cron agents get their own bounded iteration budget, independent of the larger
+# interactive agent.max_turns (which is no longer consulted for cron). Jobs
+# previously inherited the 90-iteration interactive default, so an unattended
+# job that stopped making progress could burn that full allowance on every
+# tick. Override per job with `hermes cron create/edit --max-iterations N`
+# (1-500; edit with 0 clears the override back to this default).
+cron:
+  max_iterations: 30
+
+# =============================================================================
 # Context Compression (Auto-shrinks long conversations)
 # =============================================================================
 # When conversation approaches model's context limit, middle turns are

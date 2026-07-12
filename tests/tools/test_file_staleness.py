@@ -175,6 +175,11 @@ class TestStalenessCheck(unittest.TestCase):
             previous = file_tools._file_ops_cache.get("live_task")
             file_tools._file_ops_cache["live_task"] = fake_ops
 
+        # Pin the process cwd for the duration: if any path in the tool falls
+        # back to os.getcwd() (e.g. under test-ordering state bleed), the
+        # relative "shared.txt" must land in this sandbox — not the repo root.
+        _orig_cwd = os.getcwd()
+        os.chdir(self._tmpdir)
         try:
             with patch.dict(os.environ, {"TERMINAL_CWD": start_dir}, clear=False):
                 read_file_tool("shared.txt", task_id="live_task")
@@ -187,6 +192,7 @@ class TestStalenessCheck(unittest.TestCase):
                     write_file_tool("shared.txt", "replacement", task_id="live_task")
                 )
         finally:
+            os.chdir(_orig_cwd)
             with file_tools._file_ops_lock:
                 if previous is None:
                     file_tools._file_ops_cache.pop("live_task", None)

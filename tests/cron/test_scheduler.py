@@ -99,6 +99,12 @@ class TestCronIterationBudget:
 
         assert _resolve_cron_max_iterations({}, cfg) == 30
 
+    def test_persisted_value_above_ceiling_is_clamped_not_defaulted(self):
+        # Stores hand-edited (or written before the ceiling existed) keep the
+        # intent to run long without restoring effectively-unbounded runs.
+        assert _resolve_cron_max_iterations({"max_iterations": 10_000_000}, {}) == 500
+        assert _resolve_cron_max_iterations({}, {"cron": {"max_iterations": 9999}}) == 500
+
 
 class TestResolveOrigin:
     def test_full_origin(self):

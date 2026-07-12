@@ -5614,6 +5614,11 @@ class AIAgent:
         failed: bool,
         messages: list | None = None,
     ) -> str:
+        if not isinstance(function_result, str):
+            # Multimodal dict results have no stable textual identity to hash
+            # and cannot carry appended guidance; observe nothing rather than
+            # feed the guardrail a value it cannot canonicalize.
+            return function_result
         decision = self._tool_guardrails.after_call(
             tool_name,
             function_args,

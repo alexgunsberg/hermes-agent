@@ -42,7 +42,7 @@ def build_cron_parser(subparsers, *, cmd_cron: Callable) -> None:
     cron_create.add_argument(
         "--max-iterations",
         type=int,
-        help="Per-run agent iteration cap (default: cron.max_iterations, normally 30)",
+        help="Per-run agent iteration cap, 1-500 (default: cron.max_iterations, normally 30)",
     )
     cron_create.add_argument(
         "--skill",
@@ -89,7 +89,7 @@ def build_cron_parser(subparsers, *, cmd_cron: Callable) -> None:
     cron_edit.add_argument(
         "--max-iterations",
         type=int,
-        help="New per-run agent iteration cap",
+        help="New per-run agent iteration cap, 1-500; pass 0 to clear the override back to the config default",
     )
     cron_edit.add_argument(
         "--skill",

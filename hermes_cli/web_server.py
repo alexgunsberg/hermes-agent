@@ -8542,6 +8542,7 @@ class CronJobCreate(BaseModel):
     enabled_toolsets: Optional[List[str]] = None
     workdir: Optional[str] = None
     no_agent: bool = False
+    max_iterations: Optional[int] = None
 
 
 class CronJobUpdate(BaseModel):
@@ -8644,6 +8645,10 @@ def _normalize_dashboard_cron_updates(
         normalized["context_from"] = _cron_string_list(normalized["context_from"])
     if "enabled_toolsets" in normalized:
         normalized["enabled_toolsets"] = _cron_string_list(normalized["enabled_toolsets"])
+    if "max_iterations" in normalized and normalized["max_iterations"] in {0, ""}:
+        # Same clear sentinel as the CLI/tool surfaces; JSON null also clears
+        # via update_job itself.
+        normalized["max_iterations"] = None
     return normalized
 
 
@@ -8856,6 +8861,9 @@ async def create_cron_job(body: CronJobCreate, profile: str = "default"):
             enabled_toolsets=_cron_string_list(body.enabled_toolsets),
             workdir=_cron_optional_text(body.workdir),
             no_agent=no_agent,
+            # 0/None both mean "no override"; core validation rejects other
+            # out-of-range values with a ValueError mapped to HTTP 400 below.
+            max_iterations=body.max_iterations or None,
         )
     except HTTPException:
         raise

@@ -293,12 +293,43 @@ class TestUnifiedCronjobTool:
                 action="create",
                 prompt="Invalid owner",
                 schedule="every 1h",
-                max_iterations=0,
+                max_iterations=-5,
             )
         )
 
         assert created["success"] is False
-        assert "positive integer" in created["error"]
+        assert "integer between 1 and 500" in created["error"]
+
+    def test_iteration_cap_zero_means_default_on_create(self):
+        created = json.loads(
+            cronjob(
+                action="create",
+                prompt="Default owner",
+                schedule="every 1h",
+                max_iterations=0,
+            )
+        )
+
+        assert created["success"] is True
+        assert created["job"].get("max_iterations") is None
+
+    def test_iteration_cap_zero_clears_override_on_update(self):
+        created = json.loads(
+            cronjob(
+                action="create",
+                prompt="Bounded owner",
+                schedule="every 1h",
+                max_iterations=12,
+            )
+        )
+        job_id = created["job"]["job_id"]
+
+        updated = json.loads(
+            cronjob(action="update", job_id=job_id, max_iterations=0)
+        )
+
+        assert updated["success"] is True
+        assert updated["job"].get("max_iterations") is None
 
     def test_list_handles_partial_legacy_job_records(self):
         from cron.jobs import save_jobs
