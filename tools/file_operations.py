@@ -685,6 +685,7 @@ DEFAULT_READ_OFFSET = 1
 DEFAULT_READ_LIMIT = 500
 DEFAULT_SEARCH_OFFSET = 0
 DEFAULT_SEARCH_LIMIT = 50
+MAX_SEARCH_LIMIT = 200
 
 
 def _coerce_int(value: Any, default: int) -> int:
@@ -716,9 +717,16 @@ def normalize_read_pagination(offset: Any = DEFAULT_READ_OFFSET,
 
 def normalize_search_pagination(offset: Any = DEFAULT_SEARCH_OFFSET,
                                 limit: Any = DEFAULT_SEARCH_LIMIT) -> tuple[int, int]:
-    """Return safe search pagination bounds for shell head/tail pipelines."""
+    """Return safe search pagination bounds for shell head/tail pipelines.
+
+    Search matches can each carry hundreds of characters, so an unbounded
+    positive ``limit`` can build a multi-megabyte result before the generic
+    tool-result persistence layer gets a chance to spill it.  Keep one page
+    bounded and let callers use ``offset`` for the next page.
+    """
     normalized_offset = max(0, _coerce_int(offset, DEFAULT_SEARCH_OFFSET))
-    normalized_limit = max(1, _coerce_int(limit, DEFAULT_SEARCH_LIMIT))
+    normalized_limit = _coerce_int(limit, DEFAULT_SEARCH_LIMIT)
+    normalized_limit = max(1, min(normalized_limit, MAX_SEARCH_LIMIT))
     return normalized_offset, normalized_limit
 
 

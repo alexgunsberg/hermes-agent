@@ -187,6 +187,7 @@ from agent.codex_responses_adapter import (
 from agent.tool_guardrails import (
     ToolGuardrailDecision,
     append_toolguard_guidance,
+    toolguard_suppressed_result,
     toolguard_synthetic_result,
 )
 from agent.tool_result_classification import (
@@ -5611,14 +5612,18 @@ class AIAgent:
         function_result: str,
         *,
         failed: bool,
+        messages: list | None = None,
     ) -> str:
         decision = self._tool_guardrails.after_call(
             tool_name,
             function_args,
             function_result,
             failed=failed,
+            retained_messages=messages,
         )
-        if decision.action in {"warn", "halt"}:
+        if decision.code in {"unchanged_result_suppressed", "unchanged_result_halt"}:
+            function_result = toolguard_suppressed_result(decision)
+        elif decision.action in {"warn", "halt"}:
             function_result = append_toolguard_guidance(function_result, decision)
         if decision.should_halt:
             self._set_tool_guardrail_halt(decision)

@@ -36,6 +36,20 @@ def _mock_response(content="Hello", finish_reason="stop", tool_calls=None):
     return SimpleNamespace(choices=[choice], model="test/model", usage=None)
 
 
+def _assistant_tool_history(name: str, args: dict, call_id: str) -> dict:
+    return {
+        "role": "assistant",
+        "content": "",
+        "tool_calls": [
+            {
+                "id": call_id,
+                "type": "function",
+                "function": {"name": name, "arguments": json.dumps(args)},
+            }
+        ],
+    }
+
+
 def _make_agent(*tool_names: str, max_iterations: int = 10, config: dict | None = None) -> AIAgent:
     with (
         patch("run_agent.get_tool_definitions", return_value=_make_tool_defs(*tool_names)),
@@ -151,6 +165,141 @@ def test_sequential_after_call_appends_guidance_to_tool_result_without_extra_mes
     assert messages[0]["tool_call_id"] == "c-warn"
     assert "Tool loop warning" in messages[0]["content"]
     assert "repeated_exact_failure_warning" in messages[0]["content"]
+
+
+def test_cross_turn_skill_view_suppresses_when_full_result_remains_in_history():
+    agent = _make_agent("skill_view")
+    args = {"name": "software-development-workflows"}
+    full_result = json.dumps({"success": True, "content": "x" * 20_000})
+
+    first = SimpleNamespace(
+        content="",
+        tool_calls=[_mock_tool_call("skill_view", json.dumps(args), "c-skill-1")],
+    )
+    second = SimpleNamespace(
+        content="",
+        tool_calls=[_mock_tool_call("skill_view", json.dumps(args), "c-skill-2")],
+    )
+    messages = [_assistant_tool_history("skill_view", args, "c-skill-1")]
+
+    with patch("run_agent.handle_function_call", return_value=full_result) as mock_hfc:
+        agent._execute_tool_calls_sequential(first, messages, "task-1")
+        agent._tool_guardrails.reset_for_turn()
+        messages.append(_assistant_tool_history("skill_view", args, "c-skill-2"))
+        agent._execute_tool_calls_sequential(second, messages, "task-1")
+
+    assert mock_hfc.call_count == 2
+    tool_messages = [m for m in messages if m.get("role") == "tool"]
+    assert len(tool_messages[0]["content"]) == len(full_result)
+    compact = json.loads(tool_messages[1]["content"])
+    assert compact["success"] is True
+    assert compact["unchanged"] is True
+    assert compact["guardrail"]["code"] == "unchanged_result_suppressed"
+    assert len(tool_messages[1]["content"]) < 1_000
+
+
+def test_post_compression_skill_view_returns_full_content_again():
+    agent = _make_agent("skill_view")
+    args = {"name": "software-development-workflows"}
+    full_result = json.dumps({"success": True, "content": "x" * 20_000})
+    first = SimpleNamespace(
+        content="",
+        tool_calls=[_mock_tool_call("skill_view", json.dumps(args), "c-skill-before")],
+    )
+    messages = [_assistant_tool_history("skill_view", args, "c-skill-before")]
+
+    with patch("run_agent.handle_function_call", return_value=full_result) as mock_hfc:
+        agent._execute_tool_calls_sequential(first, messages, "task-1")
+
+        # Context compression replaces the old tool exchange with a summary;
+        # process-local no-progress state must not suppress what the model can
+        # no longer see.
+        messages[:] = [
+            {"role": "system", "content": "You are helpful."},
+            {"role": "assistant", "content": "Context compaction summary"},
+            _assistant_tool_history("skill_view", args, "c-skill-after"),
+        ]
+        second = SimpleNamespace(
+            content="",
+            tool_calls=[_mock_tool_call("skill_view", json.dumps(args), "c-skill-after")],
+        )
+        agent._execute_tool_calls_sequential(second, messages, "task-1")
+
+    assert mock_hfc.call_count == 2
+    tool_messages = [m for m in messages if m.get("role") == "tool"]
+    assert len(tool_messages) == 1
+    assert tool_messages[0]["content"] == full_result
+
+
+def test_resumed_agent_derives_retained_skill_read_from_history_without_local_state():
+    args = {"name": "software-development-workflows"}
+    full_result = json.dumps({"success": True, "content": "x" * 20_000})
+    retained = [
+        _assistant_tool_history("skill_view", args, "c-skill-old"),
+        {
+            "role": "tool",
+            "name": "skill_view",
+            "tool_call_id": "c-skill-old",
+            "content": full_result,
+        },
+        _assistant_tool_history("skill_view", args, "c-skill-resumed"),
+    ]
+    resumed_agent = _make_agent("skill_view")
+    current = SimpleNamespace(
+        content="",
+        tool_calls=[_mock_tool_call("skill_view", json.dumps(args), "c-skill-resumed")],
+    )
+
+    with patch("run_agent.handle_function_call", return_value=full_result):
+        resumed_agent._execute_tool_calls_sequential(current, retained, "task-1")
+
+    compact = json.loads(retained[-1]["content"])
+    assert compact["unchanged"] is True
+    assert compact["guardrail"]["code"] == "unchanged_result_suppressed"
+
+
+def test_config_enabled_hard_stop_halts_after_comparing_repeated_skill_view_result():
+    config = _hard_stop_config(
+        hard_stop_after={
+            "exact_failure": 2,
+            "same_tool_failure": 8,
+            "idempotent_no_progress": 2,
+        }
+    )
+    agent = _make_agent("skill_view", config=config)
+    args = {"name": "software-development-workflows"}
+    full_result = json.dumps({"success": True, "content": "x" * 20_000})
+    agent.client.chat.completions.create.side_effect = [
+        _mock_response(
+            content="",
+            finish_reason="tool_calls",
+            tool_calls=[_mock_tool_call("skill_view", json.dumps(args), "c-skill-1")],
+        ),
+        _mock_response(
+            content="",
+            finish_reason="tool_calls",
+            tool_calls=[_mock_tool_call("skill_view", json.dumps(args), "c-skill-2")],
+        ),
+    ]
+
+    with (
+        patch("run_agent.handle_function_call", return_value=full_result) as mock_hfc,
+        patch.object(agent, "_persist_session"),
+        patch.object(agent, "_save_trajectory"),
+        patch.object(agent, "_cleanup_task_resources"),
+    ):
+        result = agent.run_conversation("load the same skill repeatedly")
+
+    # The threshold read still executes, proving its content is unchanged
+    # before the turn is halted.
+    assert mock_hfc.call_count == 2
+    assert result["turn_exit_reason"] == "guardrail_halt"
+    assert result["guardrail"]["code"] == "unchanged_result_halt"
+    tool_messages = [m for m in result["messages"] if m.get("role") == "tool"]
+    assert len(tool_messages[0]["content"]) == len(full_result)
+    compact = json.loads(tool_messages[1]["content"])
+    assert compact["unchanged"] is True
+    assert len(tool_messages[1]["content"]) < 1_000
 
 
 def test_same_tool_failure_warning_tells_model_to_recover_with_tools():
