@@ -447,3 +447,52 @@ class TestDelegationMaxRunTokens:
         assert dt._get_subagent_max_run_tokens() == 0
         monkeypatch.setattr(dt, "_load_config", lambda: {"max_run_tokens": "junk"})
         assert dt._get_subagent_max_run_tokens() == 0
+
+
+class TestToolStatusMapping:
+    """Regression: Hermes emits status='ok' for success (model_tools.
+    _tool_result_observer_fields), not 'success'. Only 'error' and 'timeout'
+    are tool failures; 'blocked' (policy) and 'cancelled' (interruption)
+    must not pollute error rates either."""
+
+    def _record(self, status, n=1, tool="terminal"):
+        for _ in range(n):
+            perf_monitor.on_post_tool_call(
+                tool_name=tool, session_id="s", duration_ms=10,
+                status=status, result="",
+            )
+
+    def test_ok_status_is_not_an_error(self):
+        self._record("ok", n=25)
+        report = perf_monitor.generate_report(days=1)
+        assert report["tools"][0]["errors"] == 0
+        assert report["proposals"] == []
+        conn = sqlite3.connect(perf_monitor._db_path())
+        alerts = conn.execute("SELECT COUNT(*) FROM alerts").fetchone()[0]
+        conn.close()
+        assert alerts == 0
+
+    def test_blocked_and_cancelled_are_not_errors(self):
+        self._record("blocked", n=15)
+        self._record("cancelled", n=15)
+        report = perf_monitor.generate_report(days=1)
+        assert report["tools"][0]["errors"] == 0
+
+    def test_error_and_timeout_are_errors(self):
+        self._record("ok", n=5)
+        self._record("error", n=3)
+        self._record("timeout", n=2)
+        report = perf_monitor.generate_report(days=1)
+        assert report["tools"][0]["calls"] == 10
+        assert report["tools"][0]["errors"] == 5
+
+    def test_real_success_derivation_matches(self):
+        # End-to-end: the status Hermes actually derives for a successful
+        # tool result must be classified as success by the monitor.
+        from model_tools import _tool_result_observer_fields
+
+        status, _, _ = _tool_result_observer_fields('{"payload": 42}')
+        self._record(status, n=25)
+        report = perf_monitor.generate_report(days=1)
+        assert report["tools"][0]["errors"] == 0
+        assert status not in perf_monitor._TOOL_FAILURE_STATUSES
