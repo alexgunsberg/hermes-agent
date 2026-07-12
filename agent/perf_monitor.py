@@ -131,6 +131,47 @@ def _ensure_schema(conn: sqlite3.Connection) -> None:
         "CREATE INDEX IF NOT EXISTS idx_gauges_name_created ON gauges(name, created_at)"
     )
     conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS alerts (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            created_at TEXT NOT NULL,
+            kind TEXT NOT NULL,
+            session_id TEXT NOT NULL DEFAULT '',
+            detail TEXT NOT NULL DEFAULT '',
+            value REAL NOT NULL DEFAULT 0,
+            threshold REAL NOT NULL DEFAULT 0
+        )
+        """
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_alerts_kind_created ON alerts(kind, created_at)"
+    )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS compression_events (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            created_at TEXT NOT NULL,
+            session_id TEXT NOT NULL DEFAULT '',
+            ok INTEGER NOT NULL DEFAULT 0,
+            tokens_before INTEGER,
+            tokens_after INTEGER
+        )
+        """
+    )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS hook_events (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            created_at TEXT NOT NULL,
+            event TEXT NOT NULL DEFAULT '',
+            command TEXT NOT NULL DEFAULT '',
+            duration_ms INTEGER NOT NULL DEFAULT 0,
+            timed_out INTEGER NOT NULL DEFAULT 0,
+            error TEXT
+        )
+        """
+    )
+    conn.execute(
         "INSERT OR REPLACE INTO meta (key, value) VALUES ('schema_version', ?)",
         (str(_SCHEMA_VERSION),),
     )
@@ -150,6 +191,58 @@ def _as_int(value: Any) -> int:
         return int(value or 0)
     except (TypeError, ValueError):
         return 0
+
+
+# ---------------------------------------------------------------------------
+# Thresholds (config-backed, cached; all alert-only)
+# ---------------------------------------------------------------------------
+
+_DEFAULT_THRESHOLDS = {
+    "alert_context_tokens": 150_000,   # per-request prompt size alert
+    "alert_session_tokens": 2_000_000, # cumulative per-session total-token alert
+    "alert_tool_seconds": 120,         # single tool call runtime alert
+    "alert_tool_error_rate": 0.3,      # 24h per-tool error-rate alert (min 10 calls)
+    "maintenance": True,               # startup FTS optimize / WAL checkpoint
+}
+_ALERT_DEDUP_WINDOW_S = 3600  # one alert per (kind, session) per hour
+
+
+def _threshold(key: str):
+    try:
+        from hermes_cli.config import cfg_get, load_config_readonly
+
+        return cfg_get(
+            load_config_readonly(), "monitor", key, default=_DEFAULT_THRESHOLDS[key]
+        )
+    except Exception:
+        return _DEFAULT_THRESHOLDS[key]
+
+
+def _record_alert(
+    conn: sqlite3.Connection,
+    kind: str,
+    session_id: str,
+    detail: str,
+    value: float,
+    threshold: float,
+) -> None:
+    """Insert an alert unless the same (kind, session) fired within the hour."""
+    cutoff = (
+        datetime.now(timezone.utc) - timedelta(seconds=_ALERT_DEDUP_WINDOW_S)
+    ).isoformat()
+    dup = conn.execute(
+        "SELECT 1 FROM alerts WHERE kind = ? AND session_id = ? AND created_at >= ? LIMIT 1",
+        (kind, session_id, cutoff),
+    ).fetchone()
+    if dup:
+        return
+    conn.execute(
+        "INSERT INTO alerts (created_at, kind, session_id, detail, value, threshold)"
+        " VALUES (?, ?, ?, ?, ?, ?)",
+        (_utc_now(), kind, session_id, detail, value, threshold),
+    )
+    logger.warning("perf_monitor alert [%s] %s (value=%.0f threshold=%.0f)",
+                   kind, detail, value, threshold)
 
 
 # ---------------------------------------------------------------------------
@@ -195,6 +288,29 @@ def on_post_api_request(**kwargs: Any) -> None:
                         _as_int(usage.get("total_tokens")),
                     ),
                 )
+                session_id = str(kwargs.get("session_id") or "")
+                prompt_tokens = _as_int(usage.get("prompt_tokens"))
+                ctx_ceiling = _as_int(_threshold("alert_context_tokens"))
+                if ctx_ceiling > 0 and prompt_tokens >= ctx_ceiling:
+                    _record_alert(
+                        conn, "context_size", session_id,
+                        f"request context {prompt_tokens:,} tokens "
+                        f"(model={kwargs.get('model')})",
+                        prompt_tokens, ctx_ceiling,
+                    )
+                sess_ceiling = _as_int(_threshold("alert_session_tokens"))
+                if sess_ceiling > 0 and session_id:
+                    total = conn.execute(
+                        "SELECT COALESCE(SUM(total_tokens), 0) FROM api_events"
+                        " WHERE session_id = ?",
+                        (session_id,),
+                    ).fetchone()[0]
+                    if total >= sess_ceiling:
+                        _record_alert(
+                            conn, "session_tokens", session_id,
+                            f"session cumulative {total:,} tokens",
+                            total, sess_ceiling,
+                        )
                 conn.commit()
             finally:
                 conn.close()
@@ -229,11 +345,105 @@ def on_post_tool_call(**kwargs: Any) -> None:
                         output_chars,
                     ),
                 )
+                tool_name = str(kwargs.get("tool_name") or "")
+                session_id = str(kwargs.get("session_id") or "")
+                duration_ms = _as_int(kwargs.get("duration_ms"))
+                slow_s = _as_int(_threshold("alert_tool_seconds"))
+                if slow_s > 0 and duration_ms >= slow_s * 1000:
+                    _record_alert(
+                        conn, "slow_tool", session_id,
+                        f"tool {tool_name} ran {duration_ms / 1000:.0f}s",
+                        duration_ms / 1000, slow_s,
+                    )
+                status = str(kwargs.get("status") or "")
+                if status not in ("success", ""):
+                    rate_ceiling = float(_threshold("alert_tool_error_rate") or 0)
+                    if rate_ceiling > 0 and tool_name:
+                        day_ago = (
+                            datetime.now(timezone.utc) - timedelta(hours=24)
+                        ).isoformat()
+                        calls, errors = conn.execute(
+                            "SELECT COUNT(*),"
+                            " SUM(CASE WHEN status NOT IN ('success', '')"
+                            " THEN 1 ELSE 0 END)"
+                            " FROM tool_events WHERE tool_name = ? AND created_at >= ?",
+                            (tool_name, day_ago),
+                        ).fetchone()
+                        errors = errors or 0
+                        if calls >= 10 and errors / calls >= rate_ceiling:
+                            _record_alert(
+                                conn, "tool_error_rate", tool_name,
+                                f"tool {tool_name}: {errors}/{calls} failed in 24h",
+                                errors / calls, rate_ceiling,
+                            )
                 conn.commit()
             finally:
                 conn.close()
     except Exception as exc:  # fail-open by contract
         logger.debug("perf_monitor: tool event not recorded: %s", exc)
+
+
+def record_compression(
+    session_id: str,
+    ok: bool,
+    tokens_before: Optional[int] = None,
+    tokens_after: Optional[int] = None,
+) -> None:
+    """Record one compression attempt; alert on a failure streak. Never raises."""
+    try:
+        with _DB_LOCK:
+            conn = _connect()
+            try:
+                conn.execute(
+                    "INSERT INTO compression_events"
+                    " (created_at, session_id, ok, tokens_before, tokens_after)"
+                    " VALUES (?, ?, ?, ?, ?)",
+                    (_utc_now(), session_id or "", 1 if ok else 0,
+                     tokens_before, tokens_after),
+                )
+                if not ok:
+                    recent = conn.execute(
+                        "SELECT ok FROM compression_events ORDER BY id DESC LIMIT 3"
+                    ).fetchall()
+                    if len(recent) == 3 and all(r["ok"] == 0 for r in recent):
+                        _record_alert(
+                            conn, "compression_failures", session_id or "",
+                            "3 consecutive compression failures — oversized "
+                            "sessions are not shrinking; consider rerouting the "
+                            "compression model",
+                            3, 3,
+                        )
+                conn.commit()
+            finally:
+                conn.close()
+    except Exception as exc:  # fail-open by contract
+        logger.debug("perf_monitor: compression event not recorded: %s", exc)
+
+
+def record_hook_event(
+    event: str,
+    command: str,
+    duration_ms: int,
+    timed_out: bool = False,
+    error: Optional[str] = None,
+) -> None:
+    """Record one shell-hook execution. Never raises."""
+    try:
+        with _DB_LOCK:
+            conn = _connect()
+            try:
+                conn.execute(
+                    "INSERT INTO hook_events"
+                    " (created_at, event, command, duration_ms, timed_out, error)"
+                    " VALUES (?, ?, ?, ?, ?, ?)",
+                    (_utc_now(), event or "", command or "",
+                     _as_int(duration_ms), 1 if timed_out else 0, error),
+                )
+                conn.commit()
+            finally:
+                conn.close()
+    except Exception as exc:  # fail-open by contract
+        logger.debug("perf_monitor: hook event not recorded: %s", exc)
 
 
 # ---------------------------------------------------------------------------
@@ -327,6 +537,103 @@ def _prune_old_events() -> None:
 
 
 # ---------------------------------------------------------------------------
+# Startup maintenance (auto, cheap, at most once per day)
+# ---------------------------------------------------------------------------
+
+_MAINTENANCE_INTERVAL_S = 24 * 3600
+
+
+def _run_maintenance() -> None:
+    """Passive WAL checkpoint + FTS optimize on state.db, at most once/day.
+
+    This is the automatic half of the design's maintenance table: FTS5
+    segment fragmentation is state.db's self-documented decay mode, and the
+    built-in optimize cadence (every 1000 writes) leaves long gaps on
+    lightly-used deployments. Everything here is fail-open and uses a short
+    busy timeout so a live writer is never stalled.
+    """
+    try:
+        with _DB_LOCK:
+            conn = _connect()
+            try:
+                row = conn.execute(
+                    "SELECT value FROM meta WHERE key = 'last_maintenance_at'"
+                ).fetchone()
+                if row:
+                    try:
+                        last = datetime.fromisoformat(row["value"])
+                        age = (datetime.now(timezone.utc) - last).total_seconds()
+                        if age < _MAINTENANCE_INTERVAL_S:
+                            return
+                    except ValueError:
+                        pass
+                conn.execute(
+                    "INSERT OR REPLACE INTO meta (key, value)"
+                    " VALUES ('last_maintenance_at', ?)",
+                    (_utc_now(),),
+                )
+                conn.commit()
+            finally:
+                conn.close()
+
+        state_db = get_hermes_home() / "state.db"
+        if not state_db.exists():
+            return
+        state = sqlite3.connect(state_db, timeout=1.0)
+        try:
+            state.execute("PRAGMA busy_timeout=1000")
+            for stmt in (
+                "PRAGMA wal_checkpoint(PASSIVE)",
+                "INSERT INTO messages_fts(messages_fts) VALUES('optimize')",
+                "INSERT INTO messages_fts_trigram(messages_fts_trigram)"
+                " VALUES('optimize')",
+            ):
+                try:
+                    state.execute(stmt)
+                    state.commit()
+                except sqlite3.Error:
+                    continue  # missing table / locked — skip, never stall
+        finally:
+            state.close()
+        logger.info("perf_monitor: ran daily state.db maintenance "
+                    "(passive checkpoint + FTS optimize)")
+    except Exception as exc:  # fail-open by contract
+        logger.debug("perf_monitor: maintenance skipped: %s", exc)
+
+
+def _check_catchup() -> None:
+    """Flag an idle gap so the next report leads with a catch-up header."""
+    try:
+        with _DB_LOCK:
+            conn = _connect()
+            try:
+                row = conn.execute(
+                    "SELECT MAX(created_at) FROM api_events"
+                ).fetchone()
+                last = row[0] if row else None
+                if not last:
+                    return
+                try:
+                    gap_s = (
+                        datetime.now(timezone.utc) - datetime.fromisoformat(last)
+                    ).total_seconds()
+                except ValueError:
+                    return
+                if gap_s >= 24 * 3600:
+                    _record_alert(
+                        conn, "catchup", "",
+                        f"resumed after {gap_s / 86400:.1f} idle day(s); "
+                        "run `hermes monitor` for the catch-up report",
+                        gap_s / 86400, 1,
+                    )
+                    conn.commit()
+            finally:
+                conn.close()
+    except Exception as exc:  # fail-open by contract
+        logger.debug("perf_monitor: catchup check skipped: %s", exc)
+
+
+# ---------------------------------------------------------------------------
 # Installation
 # ---------------------------------------------------------------------------
 
@@ -367,8 +674,11 @@ def install() -> bool:
             return False
     if first_install:
         # Outside the lock: one-time startup work, individually fail-open.
+        _check_catchup()
         sample_gauges()
         _prune_old_events()
+        if bool(_threshold("maintenance")):
+            _run_maintenance()
     return True
 
 
@@ -454,9 +764,99 @@ def generate_report(days: int = 7) -> Dict[str, Any]:
                     """
                 ).fetchall()
             ]
+            report["alerts"] = [
+                dict(r)
+                for r in conn.execute(
+                    "SELECT created_at, kind, session_id, detail FROM alerts"
+                    " WHERE created_at >= ? ORDER BY created_at DESC LIMIT 20",
+                    (cutoff,),
+                ).fetchall()
+            ]
+            comp = conn.execute(
+                "SELECT COUNT(*) AS attempts,"
+                " SUM(ok) AS successes,"
+                " AVG(CASE WHEN ok = 1 THEN tokens_before - tokens_after END)"
+                "   AS avg_saved"
+                " FROM compression_events WHERE created_at >= ?",
+                (cutoff,),
+            ).fetchone()
+            report["compression"] = dict(comp) if comp else {}
+            hooks = conn.execute(
+                "SELECT command,"
+                " COUNT(*) AS runs,"
+                " SUM(timed_out) AS timeouts,"
+                " SUM(duration_ms) AS total_ms"
+                " FROM hook_events WHERE created_at >= ?"
+                " GROUP BY command ORDER BY total_ms DESC LIMIT 10",
+                (cutoff,),
+            ).fetchall()
+            report["hooks"] = [dict(r) for r in hooks]
         finally:
             conn.close()
+    report["proposals"] = _build_proposals(report)
     return report
+
+
+def _build_proposals(report: Dict[str, Any]) -> List[str]:
+    """Maintenance proposals — operator-confirmed actions, surfaced per design.
+
+    Automatic actions (FTS optimize, WAL checkpoint, event pruning) run on
+    their own; everything that needs judgment (pruning, rerouting, curation)
+    is proposed here instead of executed.
+    """
+    proposals: List[str] = []
+    latest = {g["name"]: (g.get("last_value") or 0) for g in report.get("gauges") or []}
+
+    if latest.get("logs_dir_bytes", 0) > 500 * 1e6:
+        proposals.append(
+            f"logs directory is {latest['logs_dir_bytes'] / 1e9:.1f} GB — rotate or "
+            "compact old log files (a known fixed-overhead growth vector)."
+        )
+    if latest.get("state_db_bytes", 0) > 1e9:
+        proposals.append(
+            f"state.db is {latest['state_db_bytes'] / 1e9:.1f} GB — consider archiving "
+            "old sessions; large state.db lengthens WAL write-lock holds."
+        )
+    if latest.get("skills_count", 0) > 200:
+        proposals.append(
+            f"{latest['skills_count']:.0f} skills installed — the skills index in the "
+            "system prompt is uncapped; run a curation pass and archive unused skills."
+        )
+
+    api = report.get("api") or {}
+    ctx_ceiling = _as_int(_threshold("alert_context_tokens"))
+    if ctx_ceiling > 0 and (api.get("mean_prompt_tokens") or 0) >= ctx_ceiling:
+        proposals.append(
+            f"mean request context is {api['mean_prompt_tokens']:,.0f} tokens — prune "
+            "oversized route pins / start fresh sessions (`/new`) on the affected chats."
+        )
+
+    comp = report.get("compression") or {}
+    if (comp.get("attempts") or 0) >= 3 and not (comp.get("successes") or 0):
+        proposals.append(
+            "all compression attempts in this period failed — reroute auxiliary "
+            "compression to a cheaper, reliable model so oversized sessions shrink."
+        )
+
+    rate_ceiling = float(_threshold("alert_tool_error_rate") or 0)
+    for t in report.get("tools") or []:
+        calls = t.get("calls") or 0
+        errors = t.get("errors") or 0
+        if rate_ceiling > 0 and calls >= 20 and errors / calls >= rate_ceiling:
+            proposals.append(
+                f"tool {t['tool_name']} failed {errors}/{calls} times — failed calls "
+                "trigger extra model turns; investigate or disable it."
+            )
+
+    for h in report.get("hooks") or []:
+        runs = h.get("runs") or 0
+        timeouts = h.get("timeouts") or 0
+        if runs >= 5 and timeouts / runs >= 0.5:
+            proposals.append(
+                f"shell hook `{h['command']}` timed out {timeouts}/{runs} times — its "
+                "circuit breaker is throttling it; fix or remove the hook target."
+            )
+    return proposals
 
 
 def format_report(report: Dict[str, Any]) -> str:
@@ -515,6 +915,37 @@ def format_report(report: Dict[str, Any]) -> str:
                 )
             else:
                 lines.append(f"  {g['name']:<20} {first:>10.0f} → {last:>10.0f}")
+    comp = report.get("compression") or {}
+    if comp.get("attempts"):
+        lines.append("")
+        saved = comp.get("avg_saved")
+        saved_txt = f", avg {saved:,.0f} tokens saved" if saved else ""
+        lines.append(
+            f"Compression: {comp.get('successes') or 0}/{comp['attempts']} "
+            f"succeeded{saved_txt}"
+        )
+    hooks = report.get("hooks") or []
+    if hooks:
+        lines.append("")
+        lines.append("Shell hooks by total runtime:")
+        for h in hooks:
+            lines.append(
+                f"  {h['command'][:40]:<40} {h['runs']:>5} runs"
+                f"  {(h.get('total_ms') or 0) / 1000:>8.1f}s total"
+                f"  {h.get('timeouts') or 0} timeouts"
+            )
+    alerts = report.get("alerts") or []
+    if alerts:
+        lines.append("")
+        lines.append("Alerts:")
+        for a in alerts:
+            lines.append(f"  [{a['created_at'][:16]}] {a['kind']}: {a['detail']}")
+    proposals = report.get("proposals") or []
+    if proposals:
+        lines.append("")
+        lines.append("Proposed maintenance (operator-confirmed):")
+        for p in proposals:
+            lines.append(f"  • {p}")
     return "\n".join(lines)
 
 
@@ -529,6 +960,8 @@ __all__ = [
     "install",
     "on_post_api_request",
     "on_post_tool_call",
+    "record_compression",
+    "record_hook_event",
     "sample_gauges",
     "generate_report",
     "format_report",
