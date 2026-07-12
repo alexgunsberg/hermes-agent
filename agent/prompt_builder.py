@@ -1172,31 +1172,19 @@ def build_environment_hints() -> str:
 CONTEXT_FILE_MAX_CHARS = 20_000
 CONTEXT_TRUNCATE_HEAD_RATIO = 0.7
 CONTEXT_TRUNCATE_TAIL_RATIO = 0.2
+SKILLS_INDEX_MAX_CHARS = 6_000
 
-# Dynamic-cap parameters (used when no explicit context_file_max_chars is set).
-# The cap scales with the model's context window so large-context models rarely
-# truncate a project doc, while small-context models stay at the historical
-# 20K floor. ~4 chars/token is the usual English heuristic; we spend a small
-# slice of the window on context files since they share the cached prefix with
-# the system prompt, tools, memory, and the whole conversation.
-_CONTEXT_FILE_CHARS_PER_TOKEN = 4
-_CONTEXT_FILE_WINDOW_FRACTION = 0.06
-_CONTEXT_FILE_DYNAMIC_CEILING = 500_000
+# Project instructions are fixed-prefix input paid on every API call. Scaling
+# their allowance with a large model window made a one-sentence request inherit
+# tens or hundreds of thousands of characters from AGENTS.md. Keep the default
+# independent of model size; an explicit ``context_file_max_chars`` setting is
+# still available for operators who own a larger instruction file.
+_CONTEXT_FILE_DYNAMIC_CEILING = CONTEXT_FILE_MAX_CHARS
 
 
 def _dynamic_context_file_max_chars(context_length: Optional[int]) -> int:
-    """Derive a char cap from the model's context window.
-
-    Returns at least ``CONTEXT_FILE_MAX_CHARS`` (the historical 20K floor) and
-    at most ``_CONTEXT_FILE_DYNAMIC_CEILING``. When ``context_length`` is
-    unknown/invalid, returns the flat default so behavior is unchanged.
-    """
-    if not isinstance(context_length, int) or context_length <= 0:
-        return CONTEXT_FILE_MAX_CHARS
-    budget = int(
-        context_length * _CONTEXT_FILE_CHARS_PER_TOKEN * _CONTEXT_FILE_WINDOW_FRACTION
-    )
-    return max(CONTEXT_FILE_MAX_CHARS, min(budget, _CONTEXT_FILE_DYNAMIC_CEILING))
+    """Return the fixed compatibility cap, independent of model window size."""
+    return CONTEXT_FILE_MAX_CHARS
 
 
 def _get_context_file_max_chars(context_length: Optional[int] = None) -> int:
@@ -1204,10 +1192,8 @@ def _get_context_file_max_chars(context_length: Optional[int] = None) -> int:
 
     Resolution order:
       1. Explicit ``context_file_max_chars`` in config.yaml — user knows best,
-         always wins (including over the dynamic cap).
-      2. Dynamic cap derived from the model's ``context_length`` when provided
-         (scales the budget to the window; floor 20K, ceiling 500K).
-      3. ``CONTEXT_FILE_MAX_CHARS`` (20K) as the upstream-compatible fallback.
+         always wins (including over the fixed safety cap).
+      2. ``CONTEXT_FILE_MAX_CHARS`` (20K), independent of model window size.
     """
     try:
         from hermes_cli.config import load_config
@@ -1643,6 +1629,22 @@ def build_skills_system_prompt(
                 else:
                     index_lines.append(f"    - {name}")
 
+        # Descriptions are discovery metadata, not the instructions
+        # themselves. If a large installation would make that metadata a
+        # multi-thousand-token fixed prefix, retain every name but demote the
+        # whole index to names-only. ``skills_list`` still exposes descriptions
+        # on demand and ``skill_view`` still returns complete instructions.
+        if len("\n".join(index_lines)) > SKILLS_INDEX_MAX_CHARS:
+            index_lines = []
+            for category in sorted(skills_by_category.keys()):
+                names = sorted({name for name, _ in skills_by_category[category]})
+                index_lines.append(f"  {category} [names only]: {', '.join(names)}")
+            hidden_note = (
+                "\n(The installed skill catalog exceeded the fixed-prefix budget, "
+                "so descriptions are available through skills_list; every skill "
+                "name remains visible and loadable.)"
+            )
+
         result = (
             "## Skills (mandatory)\n"
             "Before replying, scan the skills below. If a skill matches or is even partially relevant "
@@ -1764,8 +1766,8 @@ def _truncate_content(
 
     ``filename`` is the human label used in warnings. ``read_path`` is the
     concrete path the agent should ``read_file`` to recover the full content
-    (defaults to ``filename`` when not supplied). ``context_length`` lets the
-    cap scale to the model's window when no explicit config override is set.
+    (defaults to ``filename`` when not supplied). ``context_length`` is kept
+    for API compatibility; the default cap is fixed across model sizes.
     """
     if max_chars is None:
         max_chars = _get_context_file_max_chars(context_length)
@@ -1775,8 +1777,8 @@ def _truncate_content(
     msg = (
         f"⚠️  Context file {filename} TRUNCATED: "
         f"{len(content)} chars exceeds limit of {max_chars} — "
-        f"trim the file, pin a larger context_file_max_chars, or use a "
-        f"larger-context model!"
+        f"trim the file or explicitly raise context_file_max_chars if the "
+        f"recurring token cost is intentional."
     )
     logger.warning(msg)
     _record_truncation_warning(msg)
@@ -1936,10 +1938,9 @@ def build_context_files_prompt(
 
     SOUL.md from HERMES_HOME is independent and always included when present.
 
-    Each context source is capped before injection. The cap defaults to the
-    model's context window (scaled — see ``_dynamic_context_file_max_chars``)
-    when *context_length* is provided, falling back to 20,000 chars otherwise.
-    An explicit ``context_file_max_chars`` in config.yaml always wins.
+    Each context source is capped before injection. The default is 20,000
+    characters regardless of model window size. An explicit
+    ``context_file_max_chars`` in config.yaml always wins.
 
     When *skip_soul* is True, SOUL.md is not included here (it was already
     loaded via ``load_soul_md()`` for the identity slot).

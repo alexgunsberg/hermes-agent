@@ -3316,11 +3316,28 @@ def _build_dynamic_schema_overrides() -> dict:
     overrides_params["properties"] = {
         k: dict(v) for k, v in DELEGATE_TASK_SCHEMA["parameters"]["properties"].items()
     }
-    overrides_params["properties"]["tasks"]["description"] = _build_tasks_param_description()
-    overrides_params["properties"]["role"]["description"] = _build_role_param_description()
+    max_children = _get_max_concurrent_children()
+    max_depth = _get_max_spawn_depth()
+    nesting_enabled = max_depth >= 2 and _get_orchestrator_enabled()
+    overrides_params["properties"]["tasks"]["description"] = (
+        f"Parallel isolated tasks (up to {max_children}); overrides top-level goal/context."
+    )
+    overrides_params["properties"]["role"]["description"] = (
+        "Child role: leaf cannot delegate; orchestrator can delegate when enabled. "
+        f"Current max_spawn_depth={max_depth}; nesting is {'enabled' if nesting_enabled else 'disabled'}."
+    )
 
     return {
-        "description": _build_top_level_description(),
+        "description": (
+            "Run isolated subagents for reasoning-heavy or parallel work while keeping "
+            "intermediate data out of this context. Provide goal for one task or tasks "
+            f"for up to {max_children} parallel tasks (max_spawn_depth={max_depth}). "
+            "Top-level calls return immediately "
+            "and later inject final summaries; do not poll. Pass all paths, constraints, "
+            "errors, and requested language in context because children have no chat "
+            "memory or clarify access. Treat summaries as self-reports and verify side "
+            "effects. Delegations are not durable across process/session exit."
+        ),
         "parameters": overrides_params,
     }
 
@@ -3389,15 +3406,7 @@ DELEGATE_TASK_SCHEMA = {
             },
             "background": {
                 "type": "boolean",
-                "description": (
-                    "DEPRECATED / IGNORED. Single-task delegations always run "
-                    "in the background automatically — you do not need to (and "
-                    "cannot) opt in or out. The result re-enters the "
-                    "conversation as a new message when the subagent finishes; "
-                    "just continue working in the meantime. Setting this has no "
-                    "effect; the parameter remains only for backward "
-                    "compatibility."
-                ),
+                "description": "Deprecated and ignored; top-level delegation is always asynchronous.",
             },
         },
         "required": [],

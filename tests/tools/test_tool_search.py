@@ -84,22 +84,25 @@ class TestConfigParsing:
 
 
 # ---------------------------------------------------------------------------
-# Classification — the hard invariant: core tools NEVER defer.
+# Classification — fundamental primitives stay direct; bulky capabilities defer.
 # ---------------------------------------------------------------------------
 
 
 class TestClassification:
-    def test_core_tools_never_defer(self):
-        """The critical invariant from the OpenClaw report."""
+    def test_fundamental_core_tools_never_defer(self):
         from tools.tool_search import is_deferrable_tool_name
-        # Sample of core tools from _HERMES_CORE_TOOLS.
         for core_name in ["terminal", "read_file", "write_file", "patch",
                           "search_files", "todo", "memory", "browser_navigate",
-                          "web_search", "session_search", "clarify",
-                          "execute_code", "delegate_task", "send_message"]:
+                          "web_search", "clarify", "send_message"]:
             assert not is_deferrable_tool_name(core_name), (
                 f"Core tool '{core_name}' must NEVER be deferrable"
             )
+
+    def test_task_specific_core_tools_defer_when_registered(self):
+        from tools.tool_search import DEFERABLE_CORE_TOOLS, is_deferrable_tool_name
+        import model_tools  # noqa: F401 — triggers built-in registration
+        for name in DEFERABLE_CORE_TOOLS:
+            assert is_deferrable_tool_name(name), name
 
     def test_bridge_tools_never_defer(self):
         from tools.tool_search import is_deferrable_tool_name, BRIDGE_TOOL_NAMES
@@ -152,21 +155,19 @@ class TestThresholdGate:
     def test_auto_below_threshold_does_not_activate(self):
         from tools.tool_search import ToolSearchConfig, should_activate
         cfg = ToolSearchConfig.from_raw({"enabled": "auto", "threshold_pct": 10})
-        # 5% of 200K = below 10% threshold
-        assert not should_activate(cfg, deferrable_tokens=10_000, context_length=200_000)
+        assert not should_activate(cfg, deferrable_tokens=1_499, context_length=200_000)
 
     def test_auto_at_or_above_threshold_activates(self):
         from tools.tool_search import ToolSearchConfig, should_activate
         cfg = ToolSearchConfig.from_raw({"enabled": "auto", "threshold_pct": 10})
-        assert should_activate(cfg, deferrable_tokens=20_000, context_length=200_000)
+        assert should_activate(cfg, deferrable_tokens=1_500, context_length=200_000)
         assert should_activate(cfg, deferrable_tokens=50_000, context_length=200_000)
 
-    def test_auto_without_context_length_uses_20k_cutoff(self):
-        """Fallback cutoff used when the active model is unknown."""
+    def test_auto_without_context_length_uses_absolute_cutoff(self):
         from tools.tool_search import ToolSearchConfig, should_activate
         cfg = ToolSearchConfig.from_raw({"enabled": "auto"})
-        assert not should_activate(cfg, deferrable_tokens=10_000, context_length=0)
-        assert should_activate(cfg, deferrable_tokens=25_000, context_length=0)
+        assert not should_activate(cfg, deferrable_tokens=1_499, context_length=0)
+        assert should_activate(cfg, deferrable_tokens=1_500, context_length=0)
 
     def test_token_estimate_proportional_to_schema_size(self):
         from tools.tool_search import estimate_tokens_from_schemas
@@ -372,9 +373,8 @@ class TestRegression_OpenClawCron84141:
     resulted in the agent receiving only ``sessions_send`` — the catalog
     builder silently dropped the requested core tool.
 
-    Our defense: core tools are NEVER deferred. This test exercises the
-    full assembly pipeline with a mixed core+MCP toolset and asserts that
-    every core tool survives.
+    Our defense: fundamental primitives are never deferred. This test exercises
+    the full assembly pipeline and asserts that those primitives survive.
     """
 
     def test_core_tool_survives_alongside_many_mcp_tools(self):
@@ -533,6 +533,5 @@ class TestRegression_ToolsetScoping:
         )
         names = scoped_deferrable_names(defs)
         assert "mcp_helper_op" in names
-        # core tools are never deferrable
+        # Fundamental primitives are never deferrable.
         assert "terminal" not in names
-

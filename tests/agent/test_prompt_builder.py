@@ -225,39 +225,34 @@ class TestTruncateContent:
 
 
 class TestDynamicContextFileCap:
-    """B — cap scales with the model's context window when not pinned.
-    C — truncation marker points the agent at the full file to read_file."""
+    """The default fixed-prefix cap stays flat unless explicitly pinned."""
 
     @pytest.fixture(autouse=True)
     def _no_explicit_config(self, monkeypatch):
-        # No explicit context_file_max_chars → dynamic path is eligible.
+        # No explicit context_file_max_chars → fixed compatibility path.
         monkeypatch.setattr("hermes_cli.config.load_config", lambda: {})
 
     def test_dynamic_floor_for_small_window(self):
-        # A small context window never drops below the historical 20K floor.
+        # A small context window uses the same fixed 20K cap.
         assert _dynamic_context_file_max_chars(8_000) == CONTEXT_FILE_MAX_CHARS
 
-    def test_dynamic_scales_above_floor_for_large_window(self):
-        # 200K-token window → ~48K (200000 * 4 * 0.06), well above the floor
-        # and above Codex's 32 KiB project_doc default.
+    def test_large_window_does_not_expand_fixed_prefix(self):
         cap = _dynamic_context_file_max_chars(200_000)
-        assert cap == 48_000
-        assert cap > CONTEXT_FILE_MAX_CHARS
+        assert cap == CONTEXT_FILE_MAX_CHARS
 
     def test_dynamic_respects_ceiling(self):
-        # An enormous window is clamped to the ceiling.
+        # An enormous window still uses the fixed default.
         assert _dynamic_context_file_max_chars(100_000_000) == _CONTEXT_FILE_DYNAMIC_CEILING
 
     def test_none_context_length_falls_back_to_flat_default(self):
         assert _dynamic_context_file_max_chars(None) == CONTEXT_FILE_MAX_CHARS
         assert _dynamic_context_file_max_chars(0) == CONTEXT_FILE_MAX_CHARS
 
-    def test_get_context_file_max_chars_uses_context_length(self):
-        # With no explicit config, the resolver derives the cap from context.
-        assert _get_context_file_max_chars(200_000) == 48_000
+    def test_get_context_file_max_chars_ignores_context_length_by_default(self):
+        assert _get_context_file_max_chars(200_000) == CONTEXT_FILE_MAX_CHARS
         assert _get_context_file_max_chars(None) == CONTEXT_FILE_MAX_CHARS
 
-    def test_explicit_config_beats_dynamic(self, monkeypatch):
+    def test_explicit_config_beats_fixed_default(self, monkeypatch):
         # An explicit value always wins, even when a big window is available.
         monkeypatch.setattr(
             "hermes_cli.config.load_config",
@@ -265,14 +260,12 @@ class TestDynamicContextFileCap:
         )
         assert _get_context_file_max_chars(200_000) == 1_000
 
-    def test_large_window_avoids_truncation_of_midsize_doc(self):
-        # A 30K-char AGENTS.md is truncated at the flat default but survives
-        # whole on a large-context model (dynamic cap ~48K).
+    def test_large_window_still_truncates_midsize_doc(self):
         content = "z" * 30_000
         small = _truncate_content(content, "AGENTS.md", context_length=8_000)
         big = _truncate_content(content, "AGENTS.md", context_length=200_000)
         assert "truncated" in small.lower()
-        assert big == content
+        assert "truncated" in big.lower()
 
     def test_marker_points_to_read_path(self):
         content = "h" * 50_000
@@ -473,6 +466,23 @@ class TestBuildSkillsSystemPrompt:
         # Unfiltered call must not be served from the compacted cache entry.
         full = build_skills_system_prompt()
         assert "Write threads" in full
+
+    def test_oversized_catalog_falls_back_to_names_only(self, monkeypatch, tmp_path):
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        for i in range(100):
+            name = f"large-catalog-skill-{i:02d}"
+            d = tmp_path / "skills" / "catalog" / name
+            d.mkdir(parents=True)
+            (d / "SKILL.md").write_text(
+                f"---\nname: {name}\ndescription: {'detail ' * 60}\n---\n"
+            )
+
+        result = build_skills_system_prompt()
+        assert "catalog [names only]" in result
+        assert "large-catalog-skill-00" in result
+        assert "large-catalog-skill-99" in result
+        assert "detail detail" not in result
+        assert "descriptions are available through skills_list" in result
 
     def test_excludes_incompatible_platform_skills(self, monkeypatch, tmp_path):
         """Skills with platforms: [macos] should not appear on Linux."""
@@ -1644,5 +1654,3 @@ class TestParallelToolCallGuidance:
 # =========================================================================
 # Budget warning history stripping
 # =========================================================================
-
-

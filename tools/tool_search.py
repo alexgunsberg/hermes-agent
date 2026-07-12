@@ -2,13 +2,14 @@
 
 When enabled, MCP and non-core plugin tools are replaced in the model-visible
 tools array by three bridge tools — ``tool_search``, ``tool_describe``,
-``tool_call`` — and surfaced on demand. Core Hermes tools never defer.
+``tool_call`` — and surfaced on demand. Fundamental primitives stay direct;
+bulky task-specific built-ins may defer with MCP/plugin tools.
 
 Design constraints this module is built around (see ``openclaw-tool-search-report``
 for the full rationale):
 
-* Core tools defined in ``toolsets._HERMES_CORE_TOOLS`` are *never* deferred.
-  Always-load means always-load. No exceptions.
+* Fundamental primitives (terminal, file editing, web search, skill loading)
+  are never deferred. Task-specific built-ins are explicitly allowlisted.
 * The threshold gate runs every assembly: when deferrable tools would consume
   less than ``threshold_pct`` of the model's context window (default 10%),
   tool search is a no-op and the tools array passes through unchanged.
@@ -53,6 +54,27 @@ BRIDGE_TOOL_NAMES = frozenset({TOOL_SEARCH_NAME, TOOL_DESCRIBE_NAME, TOOL_CALL_N
 # positives (activated when not needed). 4.0 errs slightly toward
 # underestimating, which is the safer default.
 CHARS_PER_TOKEN = 4.0
+
+# Keep fundamental primitives directly callable. Task-specific built-ins can
+# use the existing bridge just like MCP/plugin tools; otherwise a fresh chat
+# pays their full schemas even when the user only says "hello".
+DEFERABLE_CORE_TOOLS = frozenset({
+    "session_search",
+    "skill_manage",
+    "delegate_task",
+    "execute_code",
+    "image_generate",
+    "vision_analyze",
+    "browser_vision",
+    "browser_console",
+    "browser_get_images",
+    "text_to_speech",
+})
+
+# A percentage-only gate becomes ineffective as model windows grow: 10% of a
+# 400K window permits 40K tokens of schemas. Bound the auto threshold by an
+# absolute fixed-prefix allowance.
+AUTO_MAX_INLINE_TOKENS = 1_500
 
 
 # ---------------------------------------------------------------------------
@@ -164,12 +186,19 @@ def is_deferrable_tool_name(name: str) -> bool:
     """Return True if a tool with this name is *eligible* for deferral.
 
     A tool is deferrable iff it is registered with an MCP toolset prefix
-    OR it is not in ``_HERMES_CORE_TOOLS``. Core tools are never deferred
-    even when their toolset is technically plugin-provided (this protects
-    against accidental shadowing).
+    OR it is not in ``_HERMES_CORE_TOOLS``. Fundamental core primitives stay
+    direct; registered task-specific built-ins in ``DEFERABLE_CORE_TOOLS``
+    are deliberately eligible. Other core names remain direct, including if
+    a plugin tries to shadow one.
     """
     if name in BRIDGE_TOOL_NAMES:
         return False
+    if name in DEFERABLE_CORE_TOOLS:
+        try:
+            from tools.registry import registry
+            return registry.get_entry(name) is not None
+        except Exception:
+            return False
     if name in _core_tool_names():
         return False
     # Check registry toolset for MCP prefix.
@@ -251,10 +280,11 @@ def should_activate(
         return True
     # auto
     if not context_length or context_length <= 0:
-        # Without a known context size, fall back to a fixed 20K-token cutoff
-        # — the cliff above which Anthropic and OpenAI both saw quality drops.
-        return deferrable_tokens >= 20_000
-    threshold_tokens = int(context_length * (config.threshold_pct / 100.0))
+        return deferrable_tokens >= AUTO_MAX_INLINE_TOKENS
+    threshold_tokens = min(
+        AUTO_MAX_INLINE_TOKENS,
+        int(context_length * (config.threshold_pct / 100.0)),
+    )
     return deferrable_tokens >= threshold_tokens
 
 
@@ -270,7 +300,7 @@ class CatalogEntry:
     name: str
     description: str
     schema: Dict[str, Any]  # The full {"type":"function", "function": {...}} entry.
-    source: str  # "mcp" | "plugin" | "other"
+    source: str  # "core" | "mcp" | "plugin" | "other"
     source_name: str  # Toolset name, e.g. "mcp-github" or "kanban"
 
     # Pre-tokenized fields for BM25.
@@ -311,6 +341,8 @@ def _classify_source(name: str) -> Tuple[str, str]:
         entry = registry.get_entry(name)
         if entry is None:
             return ("other", "")
+        if name in DEFERABLE_CORE_TOOLS:
+            return ("core", entry.toolset)
         if entry.toolset.startswith("mcp-"):
             return ("mcp", entry.toolset)
         return ("plugin", entry.toolset)
@@ -535,9 +567,9 @@ def assemble_tool_defs(
     """Return the tool-defs list the model should actually see.
 
     When tool search is inactive (off, no deferrable tools, or below
-    threshold), this is a passthrough. When active, MCP and plugin tools
-    are stripped from the visible list and replaced with the three bridge
-    tools. Core tools are *never* deferred regardless of config.
+    threshold), this is a passthrough. When active, MCP, plugin, and the
+    task-specific built-ins in ``DEFERABLE_CORE_TOOLS`` are replaced with the
+    three bridge tools. Fundamental primitives always remain direct.
 
     Idempotent: calling with bridge tools already in the input is a no-op
     (they classify as non-core/non-deferrable but their names are reserved,
@@ -562,12 +594,18 @@ def assemble_tool_defs(
             activated=False,
             deferred_count=len(deferrable),
             deferred_tokens=deferrable_tokens,
-            threshold_tokens=int((context_length or 0) * (config.threshold_pct / 100.0)),
+            threshold_tokens=min(
+                AUTO_MAX_INLINE_TOKENS,
+                int((context_length or 0) * (config.threshold_pct / 100.0)),
+            ),
         )
 
     bridge = bridge_tool_schemas(len(deferrable))
     result = visible + bridge
-    threshold_tokens = int((context_length or 0) * (config.threshold_pct / 100.0))
+    threshold_tokens = min(
+        AUTO_MAX_INLINE_TOKENS,
+        int((context_length or 0) * (config.threshold_pct / 100.0)),
+    )
 
     logger.info(
         "tool_search activated: %d core/visible tools kept, %d deferred (~%d tokens, threshold ~%d)",
@@ -715,6 +753,8 @@ __all__ = [
     "TOOL_DESCRIBE_NAME",
     "TOOL_CALL_NAME",
     "BRIDGE_TOOL_NAMES",
+    "DEFERABLE_CORE_TOOLS",
+    "AUTO_MAX_INLINE_TOKENS",
     "ToolSearchConfig",
     "CatalogEntry",
     "AssemblyResult",

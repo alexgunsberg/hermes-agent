@@ -133,10 +133,9 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
     # we resolve through ``_ra()`` to honor those patches.
     _r = _ra()
 
-    # Resolve the model's context window once so context-file caps can scale
-    # to it (dynamic cap — see prompt_builder._dynamic_context_file_max_chars).
-    # None falls back to the historical flat default. This value is stable for
-    # the life of the conversation, so it does not threaten prompt caching.
+    # Resolve once for compatibility with context builders. The default
+    # project-file cap is now flat; an explicit config override may still use
+    # this call path. The value remains stable for the conversation.
     _ctx_len: Optional[int] = None
     _cc = getattr(agent, "context_compressor", None)
     if _cc is not None:

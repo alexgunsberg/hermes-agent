@@ -5,23 +5,21 @@ sidebar_position: 95
 
 # Tool Search
 
-When you have many MCP servers or non-core plugin tools attached to a
-session, their JSON schemas can consume a substantial fraction of the
+When you have many tools attached to a session, their JSON schemas can consume a substantial fraction of the
 context window on every turn — even when only a few of them are relevant
 to what the user actually asked for.
 
 **Tool Search** is Hermes' opt-in progressive-disclosure layer for that
-problem. When activated, MCP and plugin tools are replaced in the
-model-visible tools array by three bridge tools, and the model loads each
-specific tool's schema on demand.
+problem. When activated, MCP tools, plugin tools, and a small allowlist of
+bulky task-specific built-ins are replaced in the model-visible tools array
+by three bridge tools. The model loads each specific schema on demand.
 
-:::info Built-in Hermes tools never defer
-The tools that make up Hermes' core capability set (`terminal`,
-`read_file`, `write_file`, `patch`, `search_files`, `todo`, `memory`,
-`browser_*`, `web_search`, `web_extract`, `clarify`, `execute_code`,
-`delegate_task`, `session_search`, and the rest of
-`_HERMES_CORE_TOOLS`) are *always* loaded directly. Only MCP tools and
-non-core plugin tools are eligible for deferral.
+:::info Fundamental tools stay direct
+Hermes always exposes primitives such as `terminal`, file editing,
+`web_search`, `skill_view`, memory, todo, and clarification. Bulky
+task-specific built-ins such as `session_search`, `skill_manage`,
+`delegate_task`, and `execute_code` can defer alongside MCP and plugin tools.
+They remain available through `tool_search`, `tool_describe`, and `tool_call`.
 :::
 
 ## How it works
@@ -55,15 +53,14 @@ see the underlying tool, not the bridge.
 
 ## When does it activate?
 
-By default Tool Search runs in `auto` mode: it activates only when the
-deferrable tool schemas would consume at least 10% of the active model's
-context window. Below that, the tools-array assembly is a pure
-pass-through and you pay no overhead.
+By default Tool Search runs in `auto` mode. It activates when deferrable tool
+schemas reach the smaller of 10% of the active model's context window or
+about 1,500 estimated tokens. The absolute ceiling prevents a very large
+model window from making a large fixed schema payload look artificially cheap.
 
 This decision is re-evaluated every time the tools array is built, so:
 
-- A session with just a few MCP tools and a long context model never
-  activates Tool Search.
+- A session with only a few compact deferrable tools usually remains direct.
 - A session with many MCP servers attached (15+ tools typically) starts
   activating it.
 - Removing MCP servers mid-session correctly returns to direct exposure
@@ -83,7 +80,7 @@ tools:
 | Key | Default | Meaning |
 | --- | --- | --- |
 | `enabled` | `auto` | `auto` activates above threshold; `on` always activates if there's at least one deferrable tool; `off` disables entirely. |
-| `threshold_pct` | `10` | Percentage of context length at which `auto` mode kicks in. Range 0–100. |
+| `threshold_pct` | `10` | Percentage threshold used by `auto`, capped at about 1,500 estimated schema tokens. Range 0–100. |
 | `search_default_limit` | `5` | Hits returned when the model calls `tool_search` without a `limit`. |
 | `max_search_limit` | `20` | Hard upper bound the model can request via `limit`. Range 1–50. |
 

@@ -1,11 +1,12 @@
 """Tests for skill content size limits.
 
 Agent writes (create/edit/patch/write_file) are constrained to
-MAX_SKILL_CONTENT_CHARS (100k) and MAX_SKILL_FILE_BYTES (1 MiB).
+MAX_SKILL_CONTENT_CHARS and MAX_SKILL_FILE_BYTES (1 MiB).
 Hand-placed and hub-installed skills have no hard limit.
 """
 
 import json
+from pathlib import Path
 
 import pytest
 
@@ -51,8 +52,8 @@ class TestValidateContentSize:
     def test_over_limit(self):
         err = _validate_content_size("a" * (MAX_SKILL_CONTENT_CHARS + 1))
         assert err is not None
-        assert "100,001" in err
-        assert "100,000" in err
+        assert f"{MAX_SKILL_CONTENT_CHARS + 1:,}" in err
+        assert f"{MAX_SKILL_CONTENT_CHARS:,}" in err
 
     def test_custom_label(self):
         err = _validate_content_size("a" * (MAX_SKILL_CONTENT_CHARS + 1), label="references/api.md")
@@ -71,7 +72,7 @@ class TestCreateSkillSizeLimit:
         content = _make_skill_content(MAX_SKILL_CONTENT_CHARS + 100)
         result = json.loads(skill_manage(action="create", name="huge-skill", content=content))
         assert result["success"] is False
-        assert "100,000" in result["error"]
+        assert f"{MAX_SKILL_CONTENT_CHARS:,}" in result["error"]
 
     def test_create_at_limit(self, isolate_skills):
         # Content at exactly the limit should succeed
@@ -97,7 +98,7 @@ class TestEditSkillSizeLimit:
         big = big.replace("name: test-skill", "name: grow-me")
         result = json.loads(skill_manage(action="edit", name="grow-me", content=big))
         assert result["success"] is False
-        assert "100,000" in result["error"]
+        assert f"{MAX_SKILL_CONTENT_CHARS:,}" in result["error"]
 
 
 class TestPatchSkillSizeLimit:
@@ -116,7 +117,7 @@ class TestPatchSkillSizeLimit:
             new_string="# Test Skill\n" + ("y" * 200),
         ))
         assert result["success"] is False
-        assert "100,000" in result["error"]
+        assert f"{MAX_SKILL_CONTENT_CHARS:,}" in result["error"]
 
     def test_patch_that_reduces_size_on_oversized_skill(self, isolate_skills, tmp_path):
         """Patches that shrink an already-oversized skill should succeed."""
@@ -177,7 +178,7 @@ class TestWriteFileSizeLimit:
             file_content="x" * (MAX_SKILL_CONTENT_CHARS + 1),
         ))
         assert result["success"] is False
-        assert "100,000" in result["error"]
+        assert f"{MAX_SKILL_CONTENT_CHARS:,}" in result["error"]
 
     def test_write_file_within_limit(self, isolate_skills):
         small = _make_skill_content(1000)
@@ -209,3 +210,14 @@ class TestHandPlacedSkillsNoLimit:
         assert "content" in result
         # The full content is returned — no truncation at the storage layer
         assert len(result["content"]) > MAX_SKILL_CONTENT_CHARS
+
+
+def test_bundled_main_skill_documents_fit_full_read_budget():
+    """Bundled skills must route detail to references instead of growing huge."""
+    repo_skills = Path(__file__).resolve().parents[2] / "skills"
+    oversized = {
+        str(path.relative_to(repo_skills)): path.stat().st_size
+        for path in repo_skills.rglob("SKILL.md")
+        if path.stat().st_size > MAX_SKILL_CONTENT_CHARS
+    }
+    assert oversized == {}

@@ -468,7 +468,7 @@ def _curator_consolidation_delete_guard(
     }
 
 
-MAX_SKILL_CONTENT_CHARS = 100_000   # ~36k tokens at 2.75 chars/token
+MAX_SKILL_CONTENT_CHARS = 40_000    # keep mandatory full reads bounded
 MAX_SKILL_FILE_BYTES = 1_048_576    # 1 MiB per supporting file
 
 # Characters allowed in skill names (filesystem-safe, URL-friendly)
@@ -1535,6 +1535,31 @@ SKILL_MANAGE_SCHEMA = {
         "required": ["action", "name"],
     },
 }
+
+# The procedural guidance belongs in the skills system prompt and skill docs;
+# the model-facing schema only needs the mutation contract. Keep this static so
+# prompt caching remains stable.
+SKILL_MANAGE_SCHEMA["description"] = (
+    "Create, patch, edit, delete, or manage supporting files for reusable skills. "
+    f"New skills live under {display_hermes_home()}/skills/. Prefer patch for focused "
+    "fixes and full edit only for rewrites. Confirm before create/delete. On delete, "
+    "set absorbed_into to an existing umbrella after consolidation, or empty for pruning. "
+    "Pinned skills may be updated but not deleted."
+)
+_manage_props = SKILL_MANAGE_SCHEMA["parameters"]["properties"]
+_manage_props["name"]["description"] = "Skill name (lowercase, hyphens/underscores, max 64 chars)."
+_manage_props["content"]["description"] = (
+    "Complete SKILL.md for create/edit; read the existing skill before editing."
+)
+_manage_props["old_string"]["description"] = "Unique patch match unless replace_all=true."
+_manage_props["new_string"]["description"] = "Patch replacement; may be empty to delete the match."
+_manage_props["category"]["description"] = "Optional category subdirectory for create."
+_manage_props["file_path"]["description"] = (
+    "Supporting path under references/, templates/, scripts/, or assets/; patch defaults to SKILL.md."
+)
+_manage_props["absorbed_into"]["description"] = (
+    "Delete intent: existing umbrella after consolidation, or empty string for pruning."
+)
 
 
 # --- Registry ---

@@ -3483,18 +3483,20 @@ def install_from_quarantine(
     if install_dir.exists():
         shutil.rmtree(install_dir)
 
-    # Warn (but don't block) if SKILL.md is very large
+    # Instructional tools must be read in full, so reject monolithic skills
+    # before install rather than truncating/paginating them at runtime.
     skill_md = quarantine_path / "SKILL.md"
     if skill_md.exists():
         try:
             skill_size = skill_md.stat().st_size
-            if skill_size > 100_000:
-                logger.warning(
-                    "Skill '%s' has a large SKILL.md (%s chars). "
-                    "Large skills consume significant context when loaded. "
-                    "Consider asking the author to split it into smaller files.",
-                    safe_skill_name,
-                    f"{skill_size:,}",
+            from tools.skill_manager_tool import MAX_SKILL_CONTENT_CHARS
+
+            if skill_size > MAX_SKILL_CONTENT_CHARS:
+                raise ValueError(
+                    f"Skill '{safe_skill_name}' has a {skill_size:,}-byte SKILL.md; "
+                    f"the maximum is {MAX_SKILL_CONTENT_CHARS:,}. Move topic-specific "
+                    "material into references/ and keep SKILL.md as a complete routing "
+                    "and core-instructions document."
                 )
         except OSError:
             pass

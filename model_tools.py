@@ -538,8 +538,8 @@ def _compute_tool_definitions(
     # Conditionally replace MCP + plugin (non-core) tools with three bridge
     # tools (tool_search / tool_describe / tool_call) when the deferrable
     # surface exceeds the configured threshold (default 10% of context
-    # window). Core Hermes tools (toolsets._HERMES_CORE_TOOLS) are NEVER
-    # deferred. See tools/tool_search.py for full design notes.
+    # window). Fundamental Hermes primitives stay direct; explicitly
+    # allowlisted task-specific built-ins may defer. See tools/tool_search.py.
     #
     # This is deliberately the last step before returning — sanitization
     # has already normalized schemas, and the assembly is idempotent in
@@ -556,7 +556,7 @@ def _compute_tool_definitions(
             )
             if assembly.activated and not quiet_mode:
                 print(
-                    f"🔎 Tool Search: {assembly.deferred_count} MCP/plugin tools deferred "
+                    f"🔎 Tool Search: {assembly.deferred_count} on-demand tools deferred "
                     f"(~{assembly.deferred_tokens} tokens) behind tool_search/describe/call. "
                     f"Threshold ~{assembly.threshold_tokens} tokens."
                 )
