@@ -2558,12 +2558,27 @@ DEFAULT_CONFIG = {
         "allow_lazy_installs": True,
     },
 
+    "monitor": {
+        # Built-in event-driven performance monitor (agent/perf_monitor.py):
+        # records model-request latency/tokens/context size and tool runtimes
+        # to <HERMES_HOME>/monitor.db via the observer hooks, samples health
+        # gauges at startup, and powers `hermes monitor`. Zero cost while
+        # idle; recording is fail-open and never affects the agent loop.
+        "enabled": True,
+    },
+
     "cron": {
         # Unattended agents should not inherit the interactive 90-turn budget.
         # Individual complex jobs can override this with their stored
         # ``max_iterations`` field, but the default keeps a confused recurring
         # owner from burning through the full interactive allowance every tick.
         "max_iterations": 30,
+        # Per-run token ceiling for unattended cron runs. ``max_iterations``
+        # bounds call count but not cost; this bounds cumulative NON-cache-read
+        # tokens per run. When crossed the run wraps up gracefully through the
+        # normal max-iterations path. 0 = unlimited (default). Individual jobs
+        # may override with a stored ``max_run_tokens`` field.
+        "max_run_tokens": 0,
         # Active cron SCHEDULER provider (Axis B — the trigger that decides
         # WHEN a due job fires). Empty string = the built-in in-process 60s
         # ticker (default). Name an installed provider (plugins/cron_providers/<name>/ or

@@ -2052,6 +2052,18 @@ def invoke_hook(hook_name: str, **kwargs: Any) -> List[Any]:
     return get_plugin_manager().invoke_hook(hook_name, **kwargs)
 
 
+def register_builtin_hook(hook_name: str, callback: Callable) -> None:
+    """Register a first-party (non-plugin) observer hook callback.
+
+    Built-in consumers such as the performance monitor share the plugin
+    hook dispatch so ``has_hook``-gated fire sites build their payloads.
+    Idempotent per (hook, callback) pair.
+    """
+    hooks = get_plugin_manager()._hooks.setdefault(hook_name, [])
+    if callback not in hooks:
+        hooks.append(callback)
+
+
 def invoke_middleware(kind: str, **kwargs: Any) -> List[Any]:
     """Invoke registered middleware callbacks.
 

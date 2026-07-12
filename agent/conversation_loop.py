@@ -4295,6 +4295,35 @@ def run_conversation(
             except Exception:
                 pass
 
+            # Unattended run token ceiling (``cron.max_run_tokens``): the
+            # iteration budget bounds call COUNT but not cost — a run under
+            # the cap can still consume unbounded tokens. Counts non-cache-
+            # read tokens; on crossing, exhausts the iteration budget so the
+            # run ends through the normal graceful max-iterations path.
+            _token_ceiling = getattr(agent, "max_run_tokens", 0) or 0
+            if _token_ceiling > 0:
+                try:
+                    _usage_summary = agent._usage_summary_for_api_request_hook(response)
+                    if _usage_summary:
+                        _spent = (_usage_summary.get("total_tokens") or 0) - (
+                            _usage_summary.get("cache_read_tokens") or 0
+                        )
+                        agent._run_tokens_spent = (
+                            getattr(agent, "_run_tokens_spent", 0) + max(0, _spent)
+                        )
+                        if (
+                            agent._run_tokens_spent >= _token_ceiling
+                            and agent.iteration_budget.remaining > 0
+                        ):
+                            agent.iteration_budget.exhaust()
+                            agent._vprint(
+                                f"{agent.log_prefix}⛔ Run token ceiling reached "
+                                f"({agent._run_tokens_spent:,} >= {_token_ceiling:,} "
+                                "non-cached tokens); wrapping up."
+                            )
+                except Exception:
+                    pass
+
             # Handle assistant response
             if assistant_message.content and not agent.quiet_mode:
                 if agent.verbose_logging:

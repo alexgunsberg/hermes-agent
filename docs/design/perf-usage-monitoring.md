@@ -1,6 +1,8 @@
 # Event-Driven Performance & Usage Monitoring
 
-> **Status:** design proposal
+> **Status:** phase 1 implemented (`agent/perf_monitor.py`, `hermes monitor`),
+> plus the cron per-run token ceiling (`cron.max_run_tokens`) from phase 2;
+> remaining phase 2/3 items are proposals
 > **Audience:** Hermes operators and contributors working on the agent loop, gateway, and cron
 > **Related:** `docs/observability/README.md` (observer hook contract),
 > `docs/chronos-managed-cron-contract.md` (scale-to-zero precedent),

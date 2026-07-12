@@ -381,6 +381,16 @@ def init_agent(
     """
     _install_safe_stdio()
 
+    # Built-in performance monitor: register its observer-hook callbacks
+    # before the first API/tool call (fire sites are has_hook-gated).
+    # Idempotent per process; fail-open by contract.
+    try:
+        from agent.perf_monitor import install as _install_perf_monitor
+
+        _install_perf_monitor()
+    except Exception:
+        pass
+
     agent.model = model
     agent.max_iterations = max_iterations
     # Shared iteration budget — parent creates, children inherit.

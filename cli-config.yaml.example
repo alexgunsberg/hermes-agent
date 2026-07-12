@@ -1442,3 +1442,26 @@ updates:
 #     binary_path: ""                               # "" = resolve op via PATH; else absolute path
 #     cache_ttl_seconds: 300                        # 0 disables BOTH cache layers
 #     override_existing: true                       # resolved values win over existing env
+
+# ============================================================================
+# Performance monitor & unattended run bounds
+# ============================================================================
+# Built-in event-driven performance monitor. Records model-request latency,
+# token usage, context size, and tool runtimes to <HERMES_HOME>/monitor.db
+# via the observer hooks; samples health gauges (state.db size, skills count,
+# memory/log dir sizes) once per process start; powers `hermes monitor`.
+# Zero cost while idle; recording is fail-open and never affects the agent
+# loop. Only sizes, durations, and counts are stored — never content.
+#
+# monitor:
+#   enabled: true
+#
+# Per-run token ceiling for unattended cron runs. cron.max_iterations bounds
+# call COUNT but not cost; max_run_tokens bounds cumulative non-cache-read
+# tokens per run. When crossed, the run wraps up gracefully through the
+# normal max-iterations path (including its final summary call).
+# 0 = unlimited. Individual jobs may override with a stored max_run_tokens.
+#
+# cron:
+#   max_iterations: 30
+#   max_run_tokens: 0
