@@ -190,29 +190,40 @@ bounds and queues its alerts/report for this same catch-up channel.
 
 ## Memory layers and ownership
 
-The monitor treats memory as three layers with different owners and different
-performance characteristics, and instruments each without ever holding the
-content:
+The monitor treats memory as three layers with different owners, different
+performance characteristics, and different growth modes, and instruments each
+without ever holding the content:
 
-1. **Built-in memory** — `MEMORY.md` / `USER.md`, hard-capped
-   (2200/1375 chars, `tools/memory_tool.py:130`) and injected into the system
-   prompt. Already bounded; the gauge just confirms it stays that way.
-2. **Holographic memory (PMB)** — the operator's primary memory bank, living
-   in a separate ops repository outside this codebase. From this repo's
-   perspective it is an external memory provider: what the monitor owns is the
-   `prefetch()` path (`agent/memory_provider.py:94`), which runs **before
-   every API call** and is therefore on the latency-critical path. The monitor
-   records per-layer prefetch latency and injected-context size, so a slow or
-   bloated provider shows up as a named line in the report rather than as
-   diffuse turn slowness.
-3. **Accumulating cross-service memory** — memory aggregated across all AI
-   services the operator uses. Same treatment as layer 2 at the seam: latency
-   and injected size per call, growth gauge at startup.
+1. **Built-in memory (per-tool, per-session)** — each AI service's native
+   layer: the session context window, instruction files re-read at startup,
+   and vendor memory features. In Hermes that is `MEMORY.md` / `USER.md`,
+   hard-capped (2200/1375 chars, `tools/memory_tool.py:130`) and injected into
+   the system prompt. Ephemeral or vendor-siloed, never the durable record;
+   already bounded, so the gauge just confirms it stays that way.
+2. **Holographic memory (Hermes runtime store)** — the store at
+   `${HERMES_HOME}/memory`, living alongside sessions, Kanban DBs, and logs.
+   Live runtime state owned by the running agent; never mirrored or committed
+   to any git repository. This is the layer on the latency-critical path: the
+   provider `prefetch()` (`agent/memory_provider.py:94`) runs **before every
+   API call**. The monitor records per-provider prefetch latency and
+   injected-context size per call, plus a store-size gauge at startup, so a
+   slow or bloated store shows up as a named line in the report rather than
+   as diffuse turn slowness.
+3. **Accumulating cross-service memory (git-versioned knowledge base)** — the
+   private ops repository every agent (Hermes, Claude Code, Cursor, etc.)
+   reads contracts, docs, prompts, and templates from. It stores sanitized
+   *knowledge*, not raw memories — raw stays in layer 2, and insights are
+   promoted only via sanitize-and-commit. It touches Hermes' hot path only
+   through startup-loaded context files, which are already capped
+   (`CONTEXT_FILE_MAX_CHARS`, `agent/prompt_builder.py:1172`), so the monitor
+   needs only the existing context-file truncation warnings plus a
+   prompt-size gauge here — no per-call instrumentation.
 
-The ownership invariant: all monitor data, like all memory content, stays in
-operator-owned local storage. Instrumentation records sizes, durations, and
-counts — never memory content — so the monitor can be exported or wiped with
-the rest of the store.
+The ownership invariant: all monitor data, like all layer-2 memory content,
+stays in operator-owned local storage — and, like layer 2 itself, is never
+committed to git. Instrumentation records sizes, durations, and counts —
+never memory content — so the monitor can be exported or wiped with the rest
+of the store.
 
 ## What this design does *not* do
 
