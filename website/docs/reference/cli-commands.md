@@ -986,6 +986,9 @@ hermes prompt-size --platform telegram
 
 # Machine-readable output for scripts
 hermes prompt-size --json
+
+# Fail CI when any fixed-prefix budget is exceeded
+hermes prompt-size --platform telegram --check
 ```
 
 :::tip

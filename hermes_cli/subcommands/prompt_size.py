@@ -33,4 +33,9 @@ def build_prompt_size_parser(subparsers, *, cmd_prompt_size: Callable) -> None:
         action="store_true",
         help="Emit the breakdown as JSON",
     )
+    prompt_size_parser.add_argument(
+        "--check",
+        action="store_true",
+        help="Exit non-zero when a fixed-prefix token budget is exceeded",
+    )
     prompt_size_parser.set_defaults(func=cmd_prompt_size)

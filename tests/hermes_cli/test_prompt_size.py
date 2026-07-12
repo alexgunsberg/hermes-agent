@@ -7,6 +7,7 @@ from types import SimpleNamespace
 import pytest
 
 from hermes_cli.prompt_size import (
+    DEFAULT_TOKEN_BUDGETS,
     _SKILLS_BLOCK_RE,
     _build_inspection_agent,
     compute_prompt_breakdown,
@@ -53,15 +54,23 @@ def test_breakdown_keys_and_shape(isolated_home):
         "user_profile",
         "tools",
         "sections",
+        "budgets",
+        "base_prefix_tokens",
+        "fresh_prefix_tokens",
+        "token_method",
     }
     assert data["platform"] == "cli"
     for key in ("system_prompt", "skills_index", "memory", "user_profile"):
         assert data[key]["bytes"] >= 0
         assert data[key]["chars"] >= 0
+        assert data[key]["tokens"] >= 0
     assert data["tools"]["count"] >= 0
     assert data["tools"]["json_bytes"] >= 0
+    assert data["tools"]["tokens"] >= 0
+    assert len(data["tools"]["items"]) == data["tools"]["count"]
     # System prompt is non-trivial even with empty home (identity + guidance).
     assert data["system_prompt"]["bytes"] > 0
+    assert data["over_budget"] == []
 
 
 def test_runs_offline_without_credentials(isolated_home, monkeypatch):
@@ -161,6 +170,8 @@ def test_render_breakdown_is_plain_text(isolated_home):
     assert "System prompt total" in out
     assert "skills index" in out
     assert "Tool schemas" in out
+    assert "Token budgets" in out
+    assert "Fresh fixed prefix" in out
     # Plain text — no JSON braces leaking in.
     assert not out.strip().startswith("{")
 
@@ -169,3 +180,18 @@ def test_json_serializable(isolated_home):
     data = compute_prompt_breakdown("cli")
     # Round-trips cleanly for ``--json`` output.
     assert json.loads(json.dumps(data)) == json.loads(json.dumps(data))
+
+
+def test_budget_results_match_declared_limits(isolated_home):
+    data = compute_prompt_breakdown("cli")
+    assert set(data["budgets"]) == set(DEFAULT_TOKEN_BUDGETS)
+    for name, result in data["budgets"].items():
+        assert result["limit"] == DEFAULT_TOKEN_BUDGETS[name]
+        assert result["ok"] is (result["tokens"] <= result["limit"])
+        assert result["over"] == max(0, result["tokens"] - result["limit"])
+
+
+def test_tool_items_are_sorted_largest_first(isolated_home):
+    data = compute_prompt_breakdown("cli")
+    tokens = [item["tokens"] for item in data["tools"]["items"]]
+    assert tokens == sorted(tokens, reverse=True)
