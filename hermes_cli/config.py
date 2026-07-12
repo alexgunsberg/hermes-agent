@@ -2559,6 +2559,11 @@ DEFAULT_CONFIG = {
     },
 
     "cron": {
+        # Unattended agents should not inherit the interactive 90-turn budget.
+        # Individual complex jobs can override this with their stored
+        # ``max_iterations`` field, but the default keeps a confused recurring
+        # owner from burning through the full interactive allowance every tick.
+        "max_iterations": 30,
         # Active cron SCHEDULER provider (Axis B — the trigger that decides
         # WHEN a due job fires). Empty string = the built-in in-process 60s
         # ticker (default). Name an installed provider (plugins/cron_providers/<name>/ or

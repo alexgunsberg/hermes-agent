@@ -40,6 +40,11 @@ def build_cron_parser(subparsers, *, cmd_cron: Callable) -> None:
     )
     cron_create.add_argument("--repeat", type=int, help="Optional repeat count")
     cron_create.add_argument(
+        "--max-iterations",
+        type=int,
+        help="Per-run agent iteration cap (default: cron.max_iterations, normally 30)",
+    )
+    cron_create.add_argument(
         "--skill",
         dest="skills",
         action="append",
@@ -81,6 +86,11 @@ def build_cron_parser(subparsers, *, cmd_cron: Callable) -> None:
     cron_edit.add_argument("--name", help="New job name")
     cron_edit.add_argument("--deliver", help="New delivery target")
     cron_edit.add_argument("--repeat", type=int, help="New repeat count")
+    cron_edit.add_argument(
+        "--max-iterations",
+        type=int,
+        help="New per-run agent iteration cap",
+    )
     cron_edit.add_argument(
         "--skill",
         dest="skills",

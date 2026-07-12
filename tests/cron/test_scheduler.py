@@ -8,7 +8,7 @@ from unittest.mock import AsyncMock, patch, MagicMock
 
 import pytest
 
-from cron.scheduler import _resolve_origin, _resolve_delivery_target, _deliver_result, _send_media_via_adapter, run_job, SILENT_MARKER, _build_job_prompt, _resolve_cron_enabled_toolsets, _merge_mcp_into_per_job_toolsets
+from cron.scheduler import _resolve_origin, _resolve_delivery_target, _deliver_result, _send_media_via_adapter, run_job, SILENT_MARKER, _build_job_prompt, _resolve_cron_enabled_toolsets, _merge_mcp_into_per_job_toolsets, _resolve_cron_max_iterations
 from tools.env_passthrough import clear_env_passthrough
 from tools.credential_files import clear_credential_files
 
@@ -75,6 +75,29 @@ class TestPerJobToolsetMcpMerge:
         # _get_platform_tools args: (cfg, "cron")
         assert m_platform.call_args[0][1] == "cron"
         assert set(result) == set(sentinel)
+
+
+class TestCronIterationBudget:
+    def test_unconfigured_cron_does_not_inherit_interactive_budget(self):
+        cfg = {"agent": {"max_turns": 90}}
+
+        assert _resolve_cron_max_iterations({}, cfg) == 30
+
+    def test_cron_config_sets_unattended_default(self):
+        cfg = {"cron": {"max_iterations": 18}, "agent": {"max_turns": 90}}
+
+        assert _resolve_cron_max_iterations({}, cfg) == 18
+
+    def test_per_job_cap_wins_for_intentionally_complex_job(self):
+        cfg = {"cron": {"max_iterations": 18}}
+
+        assert _resolve_cron_max_iterations({"max_iterations": 55}, cfg) == 55
+
+    @pytest.mark.parametrize("value", [0, -3, "invalid", None])
+    def test_invalid_explicit_config_falls_back_safely(self, value):
+        cfg = {"cron": {"max_iterations": value}}
+
+        assert _resolve_cron_max_iterations({}, cfg) == 30
 
 
 class TestResolveOrigin:
@@ -1484,6 +1507,44 @@ class TestRunJobSessionPersistence:
         assert success is True
         assert error is None
         assert final_response == "all good"
+        assert mock_agent_cls.call_args.kwargs["max_iterations"] == 30
+
+    def test_run_job_passes_per_job_iteration_cap_to_agent(self, tmp_path):
+        job = {
+            "id": "bounded-job",
+            "name": "bounded",
+            "prompt": "hello",
+            "max_iterations": 9,
+        }
+        fake_db = MagicMock()
+
+        with patch("cron.scheduler._hermes_home", tmp_path), \
+             patch("cron.scheduler._resolve_origin", return_value=None), \
+             patch("hermes_cli.env_loader.load_hermes_dotenv"), \
+             patch("hermes_cli.env_loader.reset_secret_source_cache"), \
+             patch("hermes_state.SessionDB", return_value=fake_db), \
+             patch(
+                 "hermes_cli.runtime_provider.resolve_runtime_provider",
+                 return_value={
+                     "api_key": "***",
+                     "base_url": "https://example.invalid/v1",
+                     "provider": "openrouter",
+                     "api_mode": "chat_completions",
+                 },
+             ), \
+             patch("run_agent.AIAgent") as mock_agent_cls:
+            mock_agent = MagicMock()
+            mock_agent.run_conversation.return_value = {
+                "final_response": "all good",
+                "completed": True,
+            }
+            mock_agent_cls.return_value = mock_agent
+
+            success, _, _, error = run_job(job)
+
+        assert success is True
+        assert error is None
+        assert mock_agent_cls.call_args.kwargs["max_iterations"] == 9
 
     def test_run_job_delivers_max_iteration_fallback_summary(self, tmp_path):
         """Cron should deliver a usable max-iteration fallback summary.
