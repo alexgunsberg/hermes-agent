@@ -25,6 +25,27 @@ retrieval tools when available.
 - If `hermes-ops` is inaccessible, say so and ask the owner to relay or grant
   access; do not guess its contents.
 
+## Hosted automation and release cadence
+
+For Alex-owned repositories, the durable cross-tool policy is
+`alexgunsberg/hermes-ops/docs/github-actions-governance.md`. Hermes, Codex,
+Cursor, Claude Code, and delegated workers must use that same policy instead of
+inventing tool-specific CI habits.
+
+- Keep normal iterations local or draft; only the release worker admits hosted
+  CI and deployment candidates.
+- Batch normal work into at most one candidate per active Europe/Helsinki date;
+  idle days run nothing.
+- A referenced urgent regression, security issue, data-integrity risk, or
+  outage may bypass the daily wait, never review, required CI, protected
+  integration, or smoke verification.
+- Never duplicate an identical workflow/SHA/input run or create an empty commit
+  to force one.
+
+This repository is public, so standard GitHub-hosted runners do not consume the
+private-repository minute allowance. The batching discipline still applies to
+engineering churn and deployments; do not weaken upstream-required checks.
+
 ## Product model
 
 Hermes runs the same agent core across CLI, messaging gateways, TUI, Electron
