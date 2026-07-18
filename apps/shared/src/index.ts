@@ -19,3 +19,12 @@ export {
   type ResolveGatewayWsUrlDeps,
   type WebSocketAuthParam
 } from './websocket-url'
+export {
+  classifyConnectionHealth,
+  type ConnectionHealthCode,
+  type ConnectionHealthInput,
+  type ConnectionHealthLayer,
+  type ConnectionHealthReport,
+  isRecoverableHealthFailure,
+  sanitizeConnectionDetail
+} from './connection-health'
