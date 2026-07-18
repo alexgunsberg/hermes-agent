@@ -21,6 +21,10 @@ declare global {
       // self-heal via the child 'exit' handler). `rebuilt` is true when a stale
       // remote cache was dropped.
       revalidateConnection: () => Promise<{ ok: boolean; rebuilt: boolean }>
+      // Layered connection health (HTTP /api/status + live /api/ws). Used by the
+      // recovery overlay / reconnect escalate so tunnel-down vs auth-rejected
+      // failures get actionable copy. Never returns tokens or tickets.
+      diagnoseConnection: () => Promise<DesktopConnectionHealthResult>
       // Keepalive: mark a pool profile backend as recently used so the idle
       // reaper spares it while its chat is active.
       touchBackend: (profile?: string | null) => Promise<{ ok: boolean }>
@@ -453,6 +457,30 @@ export interface DesktopConnectionTestResult {
   baseUrl: string
   ok: boolean
   version: string | null
+  health?: DesktopConnectionHealthResult
+}
+
+/** Structured connection-health report from main-process diagnose / Test Remote. */
+export type DesktopConnectionHealthLayer =
+  | 'connected'
+  | 'reconnecting'
+  | 'endpoint_unreachable'
+  | 'http_ok_ws_rejected'
+  | 'auth_rejected'
+  | 'unknown'
+
+/** Minimal health payload the recovery overlay needs (layer + sanitized detail). */
+export interface DesktopConnectionHealthSummary {
+  layer: DesktopConnectionHealthLayer
+  code: `health.${DesktopConnectionHealthLayer}`
+  detail: string | null
+}
+
+export interface DesktopConnectionHealthResult extends DesktopConnectionHealthSummary {
+  httpOk: boolean
+  wsOk: boolean | null
+  baseUrl: string
+  version: string | null
 }
 
 export interface DesktopAuthProvider {
@@ -542,6 +570,8 @@ export interface DesktopBootProgress {
   progress: number
   running: boolean
   timestamp: number
+  /** Optional layered health from diagnose / reconnect escalate. */
+  health?: DesktopConnectionHealthSummary | null
 }
 
 // First-launch install ("bootstrap") event types -- emitted by

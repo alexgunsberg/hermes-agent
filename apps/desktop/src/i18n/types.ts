@@ -125,6 +125,14 @@ export interface Translations {
       gatewaySignInRequired: string
       ipcBridgeUnavailable: string
     }
+    health: {
+      connected: { title: string; hint: string }
+      reconnecting: { title: string; hint: string }
+      endpoint_unreachable: { title: string; hint: string }
+      http_ok_ws_rejected: { title: string; hint: string }
+      auth_rejected: { title: string; hint: string }
+      unknown: { title: string; hint: string }
+    }
     failure: {
       title: string
       description: string

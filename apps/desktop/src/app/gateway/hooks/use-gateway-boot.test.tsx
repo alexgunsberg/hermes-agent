@@ -86,6 +86,16 @@ function fakeDesktop() {
   return {
     getConnection: vi.fn(async () => conn),
     getGatewayWsUrl: vi.fn(async () => conn.wsUrl),
+    diagnoseConnection: vi.fn(async () => ({
+      layer: 'endpoint_unreachable',
+      code: 'health.endpoint_unreachable',
+      detail: 'fetch failed: ECONNREFUSED',
+      httpOk: false,
+      wsOk: null,
+      baseUrl: conn.baseUrl,
+      version: null
+    })),
+    revalidateConnection: vi.fn(async () => ({ ok: true, rebuilt: false })),
     getBootProgress: vi.fn(async () => ({
       error: null,
       fakeMode: false,
@@ -228,6 +238,7 @@ describe('useGatewayBoot remote reconnect loop (real hook, fake socket)', () => 
   })
 
   it('FIX: after the prolonged drop the hook raises a recoverable boot error (the escape hatch)', async () => {
+    const desktop = window.hermesDesktop
     render(<Harness />)
     await flushAsync()
     expect($desktopBoot.get().error).toBeNull()
@@ -244,6 +255,8 @@ describe('useGatewayBoot remote reconnect loop (real hook, fake socket)', () => 
     // The hook surfaced the recoverable error → BootFailureOverlay (Use local
     // gateway / Sign in / Retry) becomes reachable instead of CONNECTING.
     expect($desktopBoot.get().error).toBeTruthy()
+    expect($desktopBoot.get().health?.layer).toBe('endpoint_unreachable')
+    expect(desktop.diagnoseConnection).toHaveBeenCalled()
   })
 
   it('FIX: a successful reconnect clears the recoverable error', async () => {

@@ -3,6 +3,9 @@ import { contextBridge, ipcRenderer, webUtils } from 'electron'
 contextBridge.exposeInMainWorld('hermesDesktop', {
   getConnection: profile => ipcRenderer.invoke('hermes:connection', profile),
   revalidateConnection: () => ipcRenderer.invoke('hermes:connection:revalidate'),
+  // Layered HTTP + live WebSocket health report for recovery UI. Never returns
+  // tokens/tickets — only a ConnectionHealthLayer + sanitized detail.
+  diagnoseConnection: () => ipcRenderer.invoke('hermes:connection:diagnose'),
   touchBackend: profile => ipcRenderer.invoke('hermes:backend:touch', profile),
   getGatewayWsUrl: profile => ipcRenderer.invoke('hermes:gateway:ws-url', profile),
   openSessionWindow: (sessionId, opts) => ipcRenderer.invoke('hermes:window:openSession', sessionId, opts),

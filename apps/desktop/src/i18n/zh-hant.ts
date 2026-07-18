@@ -80,6 +80,32 @@ export const zhHant = defineLocale({
       gatewaySignInRequired: '需要閘道登入',
       ipcBridgeUnavailable: '桌面 IPC 橋接器不可用。'
     },
+    health: {
+      connected: {
+        title: '已連線至閘道',
+        hint: '桌面閘道可連線。'
+      },
+      reconnecting: {
+        title: '正在重新連線閘道',
+        hint: 'Hermes 正在重試即時連線。可以保持此視窗開啟。'
+      },
+      endpoint_unreachable: {
+        title: '無法連線閘道',
+        hint: '無法連線此位址上的閘道。請確認遠端機器上的 Hermes 正在執行且本機可以連線，然後重試或開啟閘道設定。'
+      },
+      http_ok_ws_rejected: {
+        title: '即時連線被拒絕',
+        hint: '閘道已回應，但即時聊天連線被拒絕。請在閘道設定中重新測試，依提示重新登入，或重試。'
+      },
+      auth_rejected: {
+        title: '需要閘道登入',
+        hint: '閘道工作階段已失效。請在閘道設定中重新登入，然後重試。'
+      },
+      unknown: {
+        title: '閘道連線出現問題',
+        hint: '連線閘道時發生錯誤。請重試、開啟閘道設定，或切換至本機閘道。'
+      }
+    },
     failure: {
       title: 'Hermes 無法啟動',
       description: '背景閘道未啟動。請嘗試下面的復原步驟。這裡的操作不會刪除您的聊天或設定。',

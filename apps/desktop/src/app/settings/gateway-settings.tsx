@@ -1,4 +1,5 @@
 import { useStore } from '@nanostores/react'
+import { classifyConnectionHealth } from '@hermes/shared'
 import { useEffect, useMemo, useRef, useState } from 'react'
 
 import { Button } from '@/components/ui/button'
@@ -705,7 +706,16 @@ export function GatewaySettings({ embedded = false }: { embedded?: boolean } = {
       setLastTest(message)
       notify({ kind: 'success', title: g.reachableTitle, message })
     } catch (err) {
-      notifyError(err, g.testFailed)
+      const classified = classifyConnectionHealth({
+        errorText: err instanceof Error ? err.message : String(err)
+      })
+      const layeredTitle =
+        classified.layer === 'endpoint_unreachable' ||
+        classified.layer === 'http_ok_ws_rejected' ||
+        classified.layer === 'auth_rejected'
+          ? t.boot.health[classified.layer].title
+          : g.testFailed
+      notifyError(err, layeredTitle)
     } finally {
       setTesting(false)
     }

@@ -1,15 +1,21 @@
 import { atom } from 'nanostores'
 
-import type { DesktopBootProgress } from '@/global'
+import { classifyConnectionHealth, type ConnectionHealthReport } from '@hermes/shared'
+
+import type { DesktopBootProgress, DesktopConnectionHealthSummary } from '@/global'
 import { translateNow } from '@/i18n'
+
+export type BootHealth = DesktopConnectionHealthSummary | ConnectionHealthReport
 
 export interface DesktopBootState extends DesktopBootProgress {
   visible: boolean
+  health?: BootHealth | null
 }
 
 const INITIAL_BOOT_STATE: DesktopBootState = {
   error: null,
   fakeMode: false,
+  health: null,
   message: translateNow('boot.steps.startingHermesDesktop'),
   phase: 'renderer.init',
   progress: 2,
@@ -37,6 +43,7 @@ export function applyDesktopBootProgress(progress: DesktopBootProgress) {
     ...current,
     ...progress,
     error: progress.error ?? null,
+    health: progress.health !== undefined ? progress.health : current.health,
     progress: mergedProgress,
     visible: progress.running || mergedProgress < 100 || Boolean(progress.error)
   })
@@ -49,11 +56,13 @@ export function setDesktopBootStep(step: {
   running?: boolean
   fakeMode?: boolean
   error?: string | null
+  health?: BootHealth | null
 }) {
   const current = $desktopBoot.get()
   applyDesktopBootProgress({
     error: step.error ?? null,
     fakeMode: step.fakeMode ?? current.fakeMode,
+    health: step.health !== undefined ? step.health : current.health,
     message: step.message,
     phase: step.phase,
     progress: step.progress,
@@ -67,6 +76,7 @@ export function completeDesktopBoot(message = translateNow('boot.ready')) {
   $desktopBoot.set({
     ...current,
     error: null,
+    health: null,
     message,
     phase: 'renderer.ready',
     progress: 100,
@@ -76,11 +86,14 @@ export function completeDesktopBoot(message = translateNow('boot.ready')) {
   })
 }
 
-export function failDesktopBoot(message: string) {
+export function failDesktopBoot(message: string, health?: BootHealth | null) {
   const current = $desktopBoot.get()
+  const resolvedHealth = health !== undefined ? health : classifyConnectionHealth({ errorText: message })
+
   $desktopBoot.set({
     ...current,
     error: message,
+    health: resolvedHealth,
     message: translateNow('boot.desktopBootFailedWithMessage', message),
     phase: 'renderer.error',
     progress: clampProgress(current.progress),

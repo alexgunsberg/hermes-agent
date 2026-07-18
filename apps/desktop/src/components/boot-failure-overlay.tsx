@@ -7,6 +7,7 @@ import { Loader } from '@/components/ui/loader'
 import { LogView } from '@/components/ui/log-view'
 import type { DesktopConnectionConfig } from '@/global'
 import { useI18n } from '@/i18n'
+import { connectionHealthCopy } from '@/lib/connection-health-copy'
 import { ChevronLeft, FileText, Loader2, LogIn, RefreshCw, SlidersHorizontal, Wrench } from '@/lib/icons'
 import { $desktopBoot } from '@/store/boot'
 import { notify, notifyError } from '@/store/notifications'
@@ -58,6 +59,8 @@ export function BootFailureOverlay() {
   // higher z-index regardless of onboarding state.
   const suppressed = onboarding.flow.status !== 'idle' && onboarding.flow.status !== 'error'
 
+  const healthCopy = connectionHealthCopy(boot.health, t, boot.error)
+
   useEffect(() => {
     if (!visible) {
       return
@@ -104,7 +107,14 @@ export function BootFailureOverlay() {
 
       setRemoteFailure(isRemoteConfig(config))
 
-      if (!isRemoteReauthFailure(config, boot.error)) {
+      const authFromHealth = boot.health?.layer === 'auth_rejected'
+      const authFromError = isRemoteReauthFailure(config, boot.error)
+
+      if (!authFromHealth && !authFromError) {
+        return
+      }
+
+      if (!isRemoteConfig(config) || config.remoteAuthMode !== 'oauth') {
         return
       }
 
@@ -128,7 +138,7 @@ export function BootFailureOverlay() {
     return () => {
       cancelled = true
     }
-  }, [boot.error, visible])
+  }, [boot.error, boot.health, visible])
 
   if (!visible || suppressed) {
     return null
@@ -136,6 +146,9 @@ export function BootFailureOverlay() {
 
   const retry = async () => {
     setBusy('retry')
+    // Soft nudge: revalidate before reload so a stale remote cache is dropped
+    // and the next boot starts from a fresh descriptor.
+    await window.hermesDesktop?.revalidateConnection?.().catch(() => undefined)
     await window.hermesDesktop?.resetBootstrap().catch(() => undefined)
     window.location.reload()
   }
@@ -254,7 +267,11 @@ export function BootFailureOverlay() {
     hint = copy.remoteSignInHint(label)
   } else if (remoteFailure) {
     actions = [settingsAction, { ...retryAction, variant: 'secondary' }, localAction]
-    hint = copy.remoteFailureHint
+    // Prefer layered health hint (endpoint vs WS) over the generic remote blurb.
+    hint =
+      healthCopy.layer === 'endpoint_unreachable' || healthCopy.layer === 'http_ok_ws_rejected'
+        ? healthCopy.hint
+        : copy.remoteFailureHint
   } else {
     // Local failure: Use-local is redundant with Retry (both re-target local), so
     // it's dropped here; keep it for remote failures where it's the fall-back.
@@ -270,8 +287,25 @@ export function BootFailureOverlay() {
       },
       { ...settingsAction, variant: 'ghost' }
     ]
-    hint = copy.repairHint
+    hint =
+      healthCopy.layer === 'endpoint_unreachable' || healthCopy.layer === 'http_ok_ws_rejected'
+        ? healthCopy.hint
+        : copy.repairHint
   }
+
+  const layeredHeading =
+    healthCopy.layer !== 'unknown' && healthCopy.layer !== 'connected' && healthCopy.layer !== 'reconnecting'
+
+  const headingTitle = remoteReauth ? copy.remoteTitle : layeredHeading ? healthCopy.title : copy.title
+  const headingDescription = remoteReauth
+    ? copy.remoteDescription
+    : layeredHeading
+      ? healthCopy.hint
+      : copy.description
+
+  // Prefer sanitized health detail over a raw boot.error that may contain
+  // credentialized URLs from older error paths.
+  const errorDetail = healthCopy.detail || boot.error
 
   if (view === 'connect') {
     return (
@@ -303,18 +337,14 @@ export function BootFailureOverlay() {
         <div className="flex items-start gap-3 px-5 py-4">
           <ErrorIcon className="mt-0.5" size="1.25rem" />
           <div>
-            <h2 className="text-[0.9375rem] font-semibold tracking-tight">
-              {remoteReauth ? copy.remoteTitle : copy.title}
-            </h2>
-            <p className="mt-1 text-[0.8125rem] leading-5 text-(--ui-text-tertiary)">
-              {remoteReauth ? copy.remoteDescription : copy.description}
-            </p>
+            <h2 className="text-[0.9375rem] font-semibold tracking-tight">{headingTitle}</h2>
+            <p className="mt-1 text-[0.8125rem] leading-5 text-(--ui-text-tertiary)">{headingDescription}</p>
           </div>
         </div>
 
         <div className="grid gap-4 p-5 pt-0">
           <div className="rounded-2xl border border-destructive/30 bg-destructive/10 px-4 py-3 text-xs text-destructive">
-            {boot.error}
+            {errorDetail}
           </div>
 
           <div className="grid gap-2">

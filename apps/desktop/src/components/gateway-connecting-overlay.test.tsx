@@ -58,7 +58,11 @@ const isConnectingShown = () =>
   screen.queryAllByText((_, el) => /^CONN[/\\|\-_=+<>~:*A-Z]*$/.test(el?.textContent?.trim() ?? '')).length > 0
 
 const isRecoveryShown = () =>
-  Boolean(screen.queryByText(/use local gateway/i) || screen.queryByText(/retry/i) || screen.queryByText(/sign in/i))
+  Boolean(
+    screen.queryAllByText(/use local gateway/i).length > 0 ||
+      screen.queryAllByRole('button', { name: /retry/i }).length > 0 ||
+      screen.queryAllByText(/sign in/i).length > 0
+  )
 
 describe('connecting overlay vs recovery surface', () => {
   it('hard initial-boot failure surfaces the recovery overlay (the working path)', async () => {

@@ -67,6 +67,7 @@ import {
 } from './desktop-uninstall'
 import { installEmbedReferer } from './embed-referer'
 import { readDirForIpc } from './fs-read-dir'
+import { diagnoseRemoteConnection } from './connection-health-diagnose'
 import { probeGatewayWebSocket } from './gateway-ws-probe'
 import { scanGitRepos } from './git-repo-scan'
 import {
@@ -6326,8 +6327,103 @@ async function testDesktopConnectionConfig(input: any = {}) {
   return {
     ok: true,
     baseUrl,
-    version: status?.version || null
+    version: status?.version || null,
+    health: {
+      layer: 'connected',
+      code: 'health.connected',
+      detail: null,
+      httpOk: true,
+      wsOk: wsUrl && typeof globalThis.WebSocket === 'function' ? true : null,
+      baseUrl,
+      version: status?.version || null
+    }
   }
+}
+
+function isAuthRejectedError(error: unknown): boolean {
+  if (error && typeof error === 'object' && (error as { needsOauthLogin?: unknown }).needsOauthLogin === true) {
+    return true
+  }
+
+  if (error && typeof error === 'object' && (error as { statusCode?: unknown }).statusCode === 401) {
+    return true
+  }
+
+  const text = error instanceof Error ? error.message : String(error || '')
+
+  return /remote gateway session has expired|not signed in|needs oauth|sign-in required|401\b/i.test(text)
+}
+
+/**
+ * Layered connection diagnosis for the recovery overlay / reconnect escalate.
+ * Reuses the same HTTP + live WS legs as Test Remote, but returns a structured
+ * health report (never tokens/tickets) instead of throwing.
+ */
+async function diagnoseDesktopConnection() {
+  let baseUrl: null | string = null
+  let authMode = 'token'
+  let token: null | string = null
+
+  // Prefer the live cached connection (what the renderer is actually dialing).
+  const connectionPromise = backendConnectionState.getPromise()
+
+  if (connectionPromise) {
+    try {
+      const conn = await connectionPromise
+
+      if (conn?.baseUrl) {
+        baseUrl = String(conn.baseUrl).replace(/\/+$/, '')
+        authMode = normAuthMode(conn.authMode)
+        token = conn.authMode === 'oauth' ? null : conn.token || null
+      }
+    } catch {
+      // Cached boot rejected — fall through to saved config.
+    }
+  }
+
+  if (!baseUrl) {
+    const config = readDesktopConnectionConfig()
+    const remote = config.remote
+
+    if (modeIsRemoteLike(config.mode) && remote?.url) {
+      baseUrl = normalizeRemoteBaseUrl(remote.url)
+      authMode = normAuthMode(remote.authMode)
+      token = authMode === 'oauth' ? null : decryptDesktopSecret(remote.token)
+    }
+  }
+
+  if (!baseUrl) {
+    return {
+      layer: 'unknown' as const,
+      code: 'health.unknown' as const,
+      detail: 'No gateway URL is configured to diagnose.',
+      httpOk: false,
+      wsOk: null,
+      baseUrl: '',
+      version: null
+    }
+  }
+
+  const skipWs = typeof globalThis.WebSocket !== 'function'
+
+  return diagnoseRemoteConnection(
+    { baseUrl, skipWs },
+    {
+      probeHttp: async url => {
+        // Public status is enough for reachability; matches revalidate's liveness
+        // notion and works for oauth + token + local alike.
+        const status = (await fetchPublicJson(`${url}/api/status`, { timeoutMs: 2_500 })) as any
+
+        return { version: status?.version || null }
+      },
+      resolveWsUrl: async url =>
+        resolveTestWsUrl(url, authMode, token, {
+          mintTicket: mintGatewayWsTicket
+        }),
+      probeWs: async wsUrl => probeGatewayWebSocket(wsUrl, { WebSocketImpl: globalThis.WebSocket }),
+      isAuthRejected: isAuthRejectedError
+    }
+  )
 }
 
 function resetBootProgressForReconnect() {
@@ -7465,6 +7561,7 @@ ipcMain.handle('hermes:connection:revalidate', async () => {
     return { ok: true, rebuilt: true }
   }
 })
+ipcMain.handle('hermes:connection:diagnose', async () => diagnoseDesktopConnection())
 ipcMain.handle('hermes:backend:touch', async (_event, profile) => {
   touchPoolBackend(profile)
 

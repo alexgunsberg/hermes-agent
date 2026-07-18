@@ -80,6 +80,32 @@ export const en: Translations = {
       gatewaySignInRequired: 'Gateway sign-in required',
       ipcBridgeUnavailable: 'Desktop IPC bridge is unavailable.'
     },
+    health: {
+      connected: {
+        title: 'Connected to the gateway',
+        hint: 'The desktop gateway is reachable.'
+      },
+      reconnecting: {
+        title: 'Reconnecting to the gateway',
+        hint: 'Hermes is retrying the live connection. You can keep this window open.'
+      },
+      endpoint_unreachable: {
+        title: 'Gateway unreachable',
+        hint: 'Could not reach the gateway at this address. Check that Hermes is running on the remote machine and this computer can reach it, then Retry or open Gateway settings.'
+      },
+      http_ok_ws_rejected: {
+        title: 'Live connection refused',
+        hint: 'The gateway responded, but the live chat connection was refused. Re-test under Gateway settings, sign in again if prompted, or Retry.'
+      },
+      auth_rejected: {
+        title: 'Gateway sign-in required',
+        hint: 'Your gateway session is no longer valid. Sign in again under Gateway settings, then Retry.'
+      },
+      unknown: {
+        title: 'Gateway connection problem',
+        hint: 'Something went wrong reaching the gateway. Retry, open Gateway settings, or switch to the local gateway.'
+      }
+    },
     failure: {
       title: "Hermes couldn't start",
       description:

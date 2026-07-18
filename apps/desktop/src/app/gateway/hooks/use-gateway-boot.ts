@@ -187,7 +187,24 @@ export function useGatewayBoot({
         if (!cancelled && !gatewayOpen() && !$gatewaySwitching.get()) {
           if (reconnectAttempt >= RECONNECT_ESCALATE_AFTER && !escalated) {
             escalated = true
-            failDesktopBoot(translateNow('boot.errors.gatewayConnectionLost'))
+            // Diagnose the failure layer (endpoint down vs HTTP-ok/WS-rejected vs
+            // auth) so the recovery overlay shows actionable, architecture-neutral
+            // copy instead of a generic "lost connection" string.
+            let health = null
+
+            try {
+              health = (await desktop.diagnoseConnection?.()) ?? null
+            } catch {
+              health = null
+            }
+
+            const layer = health?.layer
+            const title =
+              layer && layer !== 'connected' && layer !== 'reconnecting'
+                ? translateNow(`boot.health.${layer}.title`)
+                : translateNow('boot.errors.gatewayConnectionLost')
+
+            failDesktopBoot(title, health)
           }
 
           scheduleReconnect()

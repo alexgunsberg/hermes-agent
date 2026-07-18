@@ -80,6 +80,32 @@ export const zh: Translations = {
       gatewaySignInRequired: '需要登录网关',
       ipcBridgeUnavailable: '桌面 IPC 桥不可用。'
     },
+    health: {
+      connected: {
+        title: '已连接到网关',
+        hint: '桌面网关可访问。'
+      },
+      reconnecting: {
+        title: '正在重新连接网关',
+        hint: 'Hermes 正在重试实时连接。可以保持此窗口打开。'
+      },
+      endpoint_unreachable: {
+        title: '无法访问网关',
+        hint: '无法访问此地址上的网关。请确认远程机器上的 Hermes 正在运行且本机可以访问，然后重试或打开网关设置。'
+      },
+      http_ok_ws_rejected: {
+        title: '实时连接被拒绝',
+        hint: '网关已响应，但实时聊天连接被拒绝。请在网关设置中重新测试，按提示重新登录，或重试。'
+      },
+      auth_rejected: {
+        title: '需要登录网关',
+        hint: '网关会话已失效。请在网关设置中重新登录，然后重试。'
+      },
+      unknown: {
+        title: '网关连接出现问题',
+        hint: '连接网关时出错。请重试、打开网关设置，或切换到本地网关。'
+      }
+    },
     failure: {
       title: 'Hermes 无法启动',
       description: '后台网关没有启动。请尝试下面的恢复步骤；这里不会删除你的对话或设置。',
