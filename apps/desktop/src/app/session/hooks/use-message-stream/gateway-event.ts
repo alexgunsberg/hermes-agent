@@ -8,7 +8,7 @@ import { burstVibeHearts } from '@/components/chat/vibe-hearts'
 import { translateNow } from '@/i18n'
 import { type GatewayEventPayload, textPart } from '@/lib/chat-messages'
 import { coerceGatewayText, coerceThinkingText, normalizePersonalityValue } from '@/lib/chat-runtime'
-import { playCompletionSound } from '@/lib/completion-sound'
+import { completionSoundDedupeKey, playCompletionSound } from '@/lib/completion-sound'
 import { resolveGatewayEventSessionId } from '@/lib/gateway-events'
 import { triggerHaptic } from '@/lib/haptics'
 import { isProviderSetupErrorMessage } from '@/lib/provider-setup-errors'
@@ -483,8 +483,10 @@ export function useGatewayEventHandler(deps: GatewayEventDeps) {
 
         flushQueuedDeltas(sessionId)
 
-        // Keyed by session so only one window beeps when several are open.
-        playCompletionSound(sessionId)
+        // A completion id distinguishes consecutive fast turns while still
+        // giving every window the same key for this one backend event. Older
+        // gateways fall back to the historical session-scoped key.
+        playCompletionSound(completionSoundDedupeKey(sessionId, coerceGatewayText(payload?.completion_id)))
 
         const finalText = coerceGatewayText(payload?.text) || coerceGatewayText(payload?.rendered)
         completeAssistantMessage(sessionId, finalText, payload?.response_previewed)

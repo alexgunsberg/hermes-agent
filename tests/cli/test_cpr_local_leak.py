@@ -26,7 +26,15 @@ from cli import (
 
 @pytest.fixture(autouse=True)
 def _clear_cpr_env(monkeypatch):
-    for var in ("SSH_CONNECTION", "SSH_CLIENT", "SSH_TTY", "PROMPT_TOOLKIT_NO_CPR"):
+    for var in (
+        "SSH_CONNECTION",
+        "SSH_CLIENT",
+        "SSH_TTY",
+        "PROMPT_TOOLKIT_NO_CPR",
+        "TERM",
+        "PROMPT_TOOLKIT_BELL",
+        "PROMPT_TOOLKIT_COLOR_DEPTH",
+    ):
         monkeypatch.delenv(var, raising=False)
 
 
@@ -55,6 +63,22 @@ class TestClassicCliOutputSelection:
             full_screen=False,
         )
         assert app.renderer.cpr_support == CPR_Support.NOT_SUPPORTED
+
+    def test_cpr_disabled_output_preserves_prompt_toolkit_terminal_preferences(self, monkeypatch):
+        from prompt_toolkit.output.color_depth import ColorDepth
+
+        monkeypatch.setattr(sys, "platform", "linux")
+        monkeypatch.setenv("TERM", "dumb")
+        monkeypatch.setenv("PROMPT_TOOLKIT_BELL", "0")
+        monkeypatch.setenv("PROMPT_TOOLKIT_COLOR_DEPTH", "DEPTH_1_BIT")
+
+        out = _select_classic_cli_pt_output(sys.stdout)
+
+        assert out is not None
+        assert out.enable_cpr is False
+        assert out.term == "dumb"
+        assert out.enable_bell is False
+        assert out.default_color_depth == ColorDepth.DEPTH_1_BIT
 
     def test_windows_preserves_default_output_selection(self, monkeypatch):
         monkeypatch.setattr(sys, "platform", "win32")

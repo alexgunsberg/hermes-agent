@@ -160,3 +160,50 @@ def test_classify_unknown_status_skipped():
     completed, pending, job_urls = _mod.classify_jobs(jobs)
     assert completed == {}
     assert pending == []
+
+
+def test_review_jobs_are_not_terminal_until_required_gate_finishes():
+    assert _mod.review_jobs_are_terminal([]) is False
+    assert _mod.review_jobs_are_terminal([
+        _job("All required checks pass", "queued", None),
+    ]) is False
+    assert _mod.review_jobs_are_terminal([
+        _job("All required checks pass", "completed", "success"),
+    ]) is True
+
+
+def test_find_comment_id_ignores_foreign_marker_comment(monkeypatch):
+    monkeypatch.setattr(
+        _mod,
+        "_api_get_paginated",
+        lambda *_args, **_kwargs: [
+            {
+                "id": 41,
+                "body": "<!-- hermes-ci-review-bot --> attacker",
+                "user": {"login": "contributor"},
+            },
+            {
+                "id": 42,
+                "body": "<!-- hermes-ci-review-bot --> real status",
+                "user": {"login": "github-actions[bot]"},
+            },
+        ],
+    )
+
+    assert _mod.find_comment_id("token", "NousResearch/hermes-agent", "7") == 42
+
+
+def test_find_comment_id_creates_own_comment_when_only_foreign_marker_exists(monkeypatch):
+    monkeypatch.setattr(
+        _mod,
+        "_api_get_paginated",
+        lambda *_args, **_kwargs: [
+            {
+                "id": 41,
+                "body": "<!-- hermes-ci-review-bot --> attacker",
+                "user": {"login": "contributor"},
+            },
+        ],
+    )
+
+    assert _mod.find_comment_id("token", "NousResearch/hermes-agent", "7") is None

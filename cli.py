@@ -3314,8 +3314,13 @@ def _build_cpr_disabled_output(stdout):
     """
     try:
         import io as _io
+        from prompt_toolkit.output.color_depth import ColorDepth
         from prompt_toolkit.output.vt100 import Vt100_Output, _get_size
         from prompt_toolkit.data_structures import Size
+        from prompt_toolkit.utils import (
+            get_bell_environment_variable,
+            get_term_environment_variable,
+        )
 
         def _get_term_size():
             rows = columns = None
@@ -3325,7 +3330,14 @@ def _build_cpr_disabled_output(stdout):
                 pass
             return Size(rows=rows or 24, columns=columns or 80)
 
-        return Vt100_Output(stdout, _get_term_size, enable_cpr=False)
+        return Vt100_Output(
+            stdout,
+            _get_term_size,
+            term=get_term_environment_variable(),
+            default_color_depth=ColorDepth.from_env(),
+            enable_bell=get_bell_environment_variable(),
+            enable_cpr=False,
+        )
     except Exception:
         return None
 

@@ -127,6 +127,11 @@ jobs:
       pull-requests: write # needed for PR creation + auto-merge
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          # The push below must use the App token so its commit triggers the
+          # normal downstream workflows. Do not leave checkout's GITHUB_TOKEN
+          # credential installed in origin.
+          persist-credentials: false
 
       - name: Get GitHub App token
         id: app-token
@@ -147,6 +152,7 @@ jobs:
 
       - name: Apply patch and push to bot branch
         env:
+          APP_TOKEN: ${{ steps.app-token.outputs.token }}
           BOT_BRANCH: bot/js-autofix
         run: |
           set -euo pipefail
@@ -172,7 +178,9 @@ jobs:
           # Push to the dedicated bot branch. Force-push is safe here:
           # bot/js-autofix is a bot-only branch that gets rewritten each run.
           # If the branch was deleted after a previous PR merge, this
-          # recreates it.
+          # recreates it. Authenticate explicitly with the App token rather
+          # than checkout's workflow-scoped GITHUB_TOKEN.
+          git remote set-url origin "https://x-access-token:${APP_TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
           git push --force origin HEAD:"$BOT_BRANCH"
 
       - name: Create/update PR and enable auto-merge

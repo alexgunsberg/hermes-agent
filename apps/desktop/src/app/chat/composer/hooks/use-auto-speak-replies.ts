@@ -48,12 +48,14 @@ export function useAutoSpeakReplies({
       return undefined
     }
 
+    let active = true
+
     // Don't read whatever reply already sits at the bottom when the toggle flips
     // on (or a chat opens) — consume it so only later replies are spoken.
     latest.current.markSpoken()
 
     const speakLatest = () => {
-      const { conversationActive, failureLabel, markSpoken, pendingReply } = latest.current
+      const { conversationActive, failureLabel, pendingReply } = latest.current
 
       if (conversationActive || $voicePlayback.get().status !== 'idle') {
         return
@@ -65,11 +67,28 @@ export function useAutoSpeakReplies({
         return
       }
 
-      markSpoken()
       // Only one window voices a given reply when the same chat is open in
-      // several (reply.id is the shared backend message id). markSpoken already
-      // ran in every window, so peers just stay quiet.
+      // several (reply.id is the shared backend message id). Revalidate after
+      // the main-process claim so a newer same-session reply supersedes this
+      // one while the IPC round trip is pending.
       void ownsAmbientCue(`speak:${reply.id}`).then(owns => {
+        const currentReply = latest.current.pendingReply()
+
+        if (
+          !active ||
+          !currentReply ||
+          currentReply.pending ||
+          currentReply.id !== reply.id ||
+          latest.current.conversationActive ||
+          $voicePlayback.get().status !== 'idle'
+        ) {
+          return
+        }
+
+        // Consume in every window after the claim settles. Losing peers stay
+        // quiet without repeatedly trying to claim the same completed reply.
+        latest.current.markSpoken()
+
         if (owns) {
           void playSpeechText(reply.text, { messageId: reply.id, source: 'read-aloud' }).catch(error =>
             notifyError(error, failureLabel)
@@ -82,6 +101,9 @@ export function useAutoSpeakReplies({
     // ($voicePlayback → idle), which frees us to read the next held reply.
     const stops = [$messages.subscribe(speakLatest), $voicePlayback.listen(speakLatest)]
 
-    return () => stops.forEach(f => f())
+    return () => {
+      active = false
+      stops.forEach(f => f())
+    }
   }, [enabled, sessionId])
 }

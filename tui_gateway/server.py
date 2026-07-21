@@ -1207,6 +1207,13 @@ def write_json(obj: dict) -> bool:
 def _emit(event: str, sid: str, payload: dict | None = None):
     params = {"type": event, "session_id": sid}
     if payload is not None:
+        if event == "message.complete":
+            # A session can complete two short turns inside the desktop's
+            # cross-window de-dupe interval. Give each completion a stable
+            # event identity so peers suppress only the same cue, not the
+            # next turn's cue. Copy to avoid mutating caller-owned payloads.
+            payload = dict(payload)
+            payload.setdefault("completion_id", uuid.uuid4().hex)
         params["payload"] = payload
     write_json({"jsonrpc": "2.0", "method": "event", "params": params})
 

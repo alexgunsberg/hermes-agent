@@ -87,6 +87,8 @@ export type GatewayEventPayload = {
   label?: string
   index?: number
   aggregator?: string
+  // message.complete — stable per-completion identity for cross-window cues.
+  completion_id?: string
   // message.complete — signals the final text was already previewed via
   // interim_assistant_callback, so the UI can settle instead of duplicating.
   response_previewed?: boolean

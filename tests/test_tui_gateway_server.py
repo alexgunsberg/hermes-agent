@@ -746,6 +746,22 @@ def test_write_json_returns_false_on_broken_pipe(monkeypatch):
     assert server.write_json({"ok": True}) is False
 
 
+def test_emit_assigns_distinct_completion_ids_without_mutating_payload(monkeypatch):
+    frames = []
+    monkeypatch.setattr(server, "write_json", lambda frame: frames.append(frame))
+    payload = {"text": "done"}
+
+    server._emit("message.complete", "sid", payload)
+    server._emit("message.complete", "sid", payload)
+
+    first = frames[0]["params"]["payload"]
+    second = frames[1]["params"]["payload"]
+    assert first["completion_id"]
+    assert second["completion_id"]
+    assert first["completion_id"] != second["completion_id"]
+    assert payload == {"text": "done"}
+
+
 def test_write_json_drops_detached_ws_frames(monkeypatch):
     out = _ChunkyStdout()
     monkeypatch.setattr(server, "_real_stdout", out)

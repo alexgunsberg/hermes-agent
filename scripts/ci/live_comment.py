@@ -71,6 +71,8 @@ _CONCLUSION_MAP = {
     "action_required": "skipped",
 }
 
+_COMMENT_AUTHOR_LOGIN = "github-actions[bot]"
+
 
 def classify_jobs(api_jobs: list[dict]) -> tuple[dict[str, str], list[str], dict[str, str]]:
     """Classify raw API job dicts into completed + pending + job_urls.
@@ -115,6 +117,21 @@ def classify_jobs(api_jobs: list[dict]) -> tuple[dict[str, str], list[str], dict
         # else: unknown status → skip
 
     return completed, pending, job_urls
+
+
+def review_jobs_are_terminal(api_jobs: list[dict]) -> bool:
+    """Return whether the required-checks gate has reached a terminal state.
+
+    Child ``workflow_call`` runs can be temporarily absent from GitHub's run
+    listing. The required-checks gate depends on those jobs, so its completion
+    is the authoritative signal that an empty child listing is no longer a
+    propagation gap.
+    """
+    return any(
+        job.get("name") in {"all-checks-pass", "All required checks pass"}
+        and job.get("status") == "completed"
+        for job in api_jobs
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -219,7 +236,7 @@ def collect_run_jobs(token: str, repo: str, run_id: str) -> list[dict]:
 
 
 def find_comment_id(token: str, repo: str, pr_number: str) -> int | None:
-    """Find our existing review comment by marker prefix."""
+    """Find our existing review comment by marker and trusted author."""
     owner, repo_name = repo.split("/")
     comments = _api_get_paginated(
         f"{API_BASE}/repos/{owner}/{repo_name}/issues/{pr_number}/comments",
@@ -227,7 +244,8 @@ def find_comment_id(token: str, repo: str, pr_number: str) -> int | None:
     )
     for c in comments:
         body = c.get("body", "") if isinstance(c, dict) else ""
-        if body.startswith("<!-- hermes-ci-review-bot -->"):
+        author = (c.get("user") or {}).get("login", "") if isinstance(c, dict) else ""
+        if author == _COMMENT_AUTHOR_LOGIN and body.startswith("<!-- hermes-ci-review-bot -->"):
             return c.get("id") if isinstance(c, dict) else None
     return None
 
@@ -398,6 +416,12 @@ def run(
             continue
 
         completed, pending, job_urls = classify_jobs(jobs)
+        terminal = review_jobs_are_terminal(jobs)
+        if not terminal and not pending:
+            # A just-started reusable workflow may not be visible in the API
+            # yet. Keep the comment honest and the poller alive until the
+            # dependency gate confirms every required job has settled.
+            pending = ["Waiting for remaining CI jobs"]
         total = len(completed) + len(pending)
         print(f"  [{elapsed:.0f}s] {len(completed)} completed, {len(pending)} pending "
               f"({total} total jobs)")
