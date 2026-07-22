@@ -1516,6 +1516,7 @@ def _dispatch_tick_lock(db_path: Path):
 # interval. Keyed per resolved DB path so multi-board dispatchers checkpoint
 # each board on its own clock.
 _WAL_CHECKPOINT_INTERVAL_SECONDS = 300.0
+_WAL_CHECKPOINT_BUSY_TIMEOUT_MS = 50
 _LAST_WAL_CHECKPOINT: dict[str, float] = {}
 _WAL_CHECKPOINT_LOCK = threading.Lock()
 
@@ -1540,7 +1541,16 @@ def _maybe_checkpoint_wal(conn: sqlite3.Connection, db_path: Path) -> None:
         # Claim the slot before doing the work so concurrent ticks (other
         # threads in this process) don't double-checkpoint on the boundary.
         _LAST_WAL_CHECKPOINT[key] = now
+    previous_busy_timeout_ms = DEFAULT_BUSY_TIMEOUT_MS
     try:
+        previous_busy_timeout = conn.execute("PRAGMA busy_timeout").fetchone()
+        if previous_busy_timeout:
+            previous_busy_timeout_ms = int(previous_busy_timeout[0])
+        # TRUNCATE honors the connection busy handler and can otherwise pin the
+        # dispatch flock for the normal 120-second writer timeout when another
+        # process retains a read snapshot. Housekeeping is best-effort, so give
+        # it a tiny independent budget and always restore the writer timeout.
+        conn.execute(f"PRAGMA busy_timeout={_WAL_CHECKPOINT_BUSY_TIMEOUT_MS}")
         row = conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone()
         _log.debug(
             "kanban WAL checkpoint (TRUNCATE) on %s -> %s "
@@ -1549,6 +1559,11 @@ def _maybe_checkpoint_wal(conn: sqlite3.Connection, db_path: Path) -> None:
         )
     except sqlite3.Error as exc:
         _log.debug("kanban WAL checkpoint on %s skipped: %s", key, exc)
+    finally:
+        try:
+            conn.execute(f"PRAGMA busy_timeout={previous_busy_timeout_ms}")
+        except sqlite3.Error as exc:
+            _log.warning("failed to restore kanban busy timeout on %s: %s", key, exc)
 
 
 def _looks_like_tls_record_at(data: bytes, offset: int) -> bool:

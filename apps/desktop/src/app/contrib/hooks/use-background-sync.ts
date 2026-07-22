@@ -41,7 +41,13 @@ interface LiveSessionStatusResponse {
  * normally own these states, but events emitted while Desktop was disconnected
  * cannot be replayed. `session.active_list` is the authoritative in-memory
  * snapshot and does not resume, focus, or otherwise mutate a chat. */
-export function rehydrateLiveSessionStatuses(response: LiveSessionStatusResponse, nowMs = Date.now()): void {
+export function rehydrateLiveSessionStatuses(
+  response: LiveSessionStatusResponse,
+  nowMs = Date.now(),
+  previouslyObservedRuntimeIds: ReadonlySet<string> = new Set()
+): Set<string> {
+  const observedRuntimeIds = new Set<string>()
+
   for (const session of response.sessions ?? []) {
     const runtimeSessionId = session.id?.trim()
     const storedSessionId = session.session_key?.trim()
@@ -51,6 +57,8 @@ export function rehydrateLiveSessionStatuses(response: LiveSessionStatusResponse
     if (!runtimeSessionId || !storedSessionId) {
       continue
     }
+
+    observedRuntimeIds.add(runtimeSessionId)
 
     const existing = $sessionStates.get()[runtimeSessionId]
 
@@ -87,6 +95,32 @@ export function rehydrateLiveSessionStatuses(response: LiveSessionStatusResponse
 
     setSessionStalled(storedSessionId, isQuiet)
   }
+
+  // A successful active_list response is a complete snapshot. Settle only
+  // runtimes that this same profile poll observed previously; other profiles
+  // can keep running through their own sockets while the foreground changes.
+  for (const runtimeSessionId of previouslyObservedRuntimeIds) {
+    if (observedRuntimeIds.has(runtimeSessionId)) {
+      continue
+    }
+
+    const existing = $sessionStates.get()[runtimeSessionId]
+
+    if (existing?.busy || existing?.needsInput) {
+      publishSessionState(runtimeSessionId, {
+        ...existing,
+        awaitingResponse: false,
+        busy: false,
+        needsInput: false
+      })
+    }
+
+    if (existing?.storedSessionId) {
+      setSessionStalled(existing.storedSessionId, false)
+    }
+  }
+
+  return observedRuntimeIds
 }
 
 interface BackgroundSyncParams {
@@ -179,6 +213,7 @@ export function useBackgroundSync({
 
     let cancelled = false
     let inFlight = false
+    let observedRuntimeIds = new Set<string>()
 
     const refreshLiveStatuses = async () => {
       if (inFlight) {
@@ -191,7 +226,7 @@ export function useBackgroundSync({
         const response = await requestGateway<LiveSessionStatusResponse>('session.active_list', {})
 
         if (!cancelled) {
-          rehydrateLiveSessionStatuses(response)
+          observedRuntimeIds = rehydrateLiveSessionStatuses(response, Date.now(), observedRuntimeIds)
         }
       } catch {
         // Older gateways may not expose session.active_list. Live stream events

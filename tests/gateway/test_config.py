@@ -693,6 +693,35 @@ class TestLoadGatewayConfig:
 
         assert config.quick_commands == {"limits": {"type": "exec", "command": "echo ok"}}
 
+    def test_present_null_top_level_blocks_nested_gateway_fallbacks(self, tmp_path, monkeypatch):
+        """Presence, not truthiness, controls top-level precedence."""
+        hermes_home = tmp_path / ".hermes"
+        hermes_home.mkdir()
+        (hermes_home / "config.yaml").write_text(
+            "quick_commands: null\n"
+            "profile_routes: null\n"
+            "streaming: null\n"
+            "gateway:\n"
+            "  quick_commands:\n"
+            "    stale:\n"
+            "      type: exec\n"
+            "      command: echo stale\n"
+            "  profile_routes:\n"
+            "    - name: stale\n"
+            "      platform: telegram\n"
+            "      profile: stale\n"
+            "  streaming:\n"
+            "    mode: auto\n",
+            encoding="utf-8",
+        )
+        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+
+        config = load_gateway_config()
+
+        assert config.quick_commands == {}
+        assert config.profile_routes == []
+        assert config.streaming.enabled is False
+
     def test_stt_from_nested_gateway_section(self, tmp_path, monkeypatch):
         """Asserts False (not the True default) so the test fails if the
         nested gateway.stt value never reaches from_dict() and silently

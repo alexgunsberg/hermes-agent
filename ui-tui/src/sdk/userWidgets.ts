@@ -15,8 +15,8 @@ import { gauge, hbars, sparkline, sparkRows } from '../lib/charts.js'
 import { recordParentLifecycle } from '../lib/parentLog.js'
 
 import { openWidget, updateWidget } from './host.js'
-import { defineWidgetApp, listWidgetApps, removeWidgetApp } from './registry.js'
-import { isCtrl } from './types.js'
+import { defineOwnedWidgetApp, defineWidgetApp, getWidgetApp, listWidgetApps, removeOwnedWidgetApps } from './registry.js'
+import { isCtrl, type WidgetApp } from './types.js'
 
 /**
  * User widget apps — Hermes authors its own TUI widgets, mirroring the
@@ -72,6 +72,7 @@ export interface UserWidgetLoadResult {
 /** Which app ids each user file registered — the delete-sync source of
  *  truth (file gone on the next scan ⇒ its apps unregister). */
 const fileApps = new Map<string, string[]>()
+let importRevision = 0
 
 const listeners = new Set<(result: UserWidgetLoadResult) => void>()
 
@@ -98,12 +99,15 @@ export async function loadUserWidgets(dir = widgetsDir()): Promise<UserWidgetLoa
     // No directory: fall through so previously-loaded files still delete-sync.
   }
 
-  for (const [file, ids] of fileApps) {
-    if (!files.includes(file)) {
-      fileApps.delete(file)
+  const currentFileKeys = new Set(files.map(file => join(dir, file)))
+
+  for (const [fileKey, ids] of fileApps) {
+    if (!currentFileKeys.has(fileKey)) {
+      fileApps.delete(fileKey)
+      removeOwnedWidgetApps(fileKey)
 
       for (const id of ids) {
-        if (removeWidgetApp(id)) {
+        if (!getWidgetApp(id)) {
           result.removed.push(id)
         }
       }
@@ -111,10 +115,12 @@ export async function loadUserWidgets(dir = widgetsDir()): Promise<UserWidgetLoa
   }
 
   for (const file of files) {
+    const fileKey = join(dir, file)
     const before = new Set(listWidgetApps().map(app => app.id))
+    const stagedApps: WidgetApp<unknown>[] = []
 
     try {
-      const mod = (await import(`${pathToFileURL(join(dir, file)).href}?t=${Date.now()}`)) as {
+      const mod = (await import(`${pathToFileURL(join(dir, file)).href}?t=${Date.now()}-${++importRevision}`)) as {
         default?: (sdk: WidgetSdk) => void
       }
 
@@ -122,17 +128,35 @@ export async function loadUserWidgets(dir = widgetsDir()): Promise<UserWidgetLoa
         throw new Error('default export must be register(sdk)')
       }
 
-      mod.default(widgetSdk)
+      const ownedSdk = {
+        ...widgetSdk,
+        defineWidgetApp: <S>(app: WidgetApp<S>) => {
+          stagedApps.push(app as WidgetApp<unknown>)
+
+          return app
+        }
+      } as WidgetSdk
+
+      mod.default(ownedSdk)
       result.loaded.push(file)
 
-      const ids = listWidgetApps()
-        .map(app => app.id)
-        .filter(id => !before.has(id))
+      const previousIds = fileApps.get(fileKey) ?? []
 
-      // Re-registrations of existing ids keep their prior file attribution.
-      if (ids.length) {
-        fileApps.set(file, ids)
-        result.added.push(...ids)
+      removeOwnedWidgetApps(fileKey)
+
+      for (const app of stagedApps) {
+        defineOwnedWidgetApp(fileKey, app)
+      }
+
+      const ids = stagedApps.map(app => app.id)
+
+      fileApps.set(fileKey, ids)
+      result.added.push(...ids.filter(id => !before.has(id)))
+
+      for (const id of previousIds) {
+        if (!ids.includes(id) && !getWidgetApp(id)) {
+          result.removed.push(id)
+        }
       }
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error)
