@@ -1582,8 +1582,13 @@ class TestPluginToolVisibility:
         tool_names2 = [t["function"]["name"] for t in tools2]
         assert "vis_tool" not in tool_names2
 
-        # Plugin tools are included when no toolset filter is active (all enabled)
-        tools3 = get_tool_definitions(quiet_mode=True)
+        # Plugin tools are included when no toolset filter is active (all
+        # enabled). skip_tool_search_assembly: with every toolset enabled the
+        # tool-search progressive-disclosure step defers plugin tools behind
+        # the tool_search bridge; visibility in the raw catalog is what this
+        # test asserts.
+        tools3 = get_tool_definitions(quiet_mode=True,
+                                      skip_tool_search_assembly=True)
         tool_names3 = [t["function"]["name"] for t in tools3]
         assert "vis_tool" in tool_names3
 

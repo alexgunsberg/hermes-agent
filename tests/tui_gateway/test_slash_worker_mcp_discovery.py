@@ -48,7 +48,12 @@ def test_profile_local_mcp_tool_is_visible_in_slash_worker(tmp_path):
                         "command": sys.executable,
                         "args": [str(server)],
                     }
-                }
+                },
+                # This test asserts the probe tool appears BY NAME in /tools.
+                # Tool-search progressive disclosure would defer MCP tools
+                # behind the tool_search bridge and hide the name; disable it
+                # — MCP discovery, not disclosure policy, is under test here.
+                "tools": {"tool_search": False},
             }
         ),
         encoding="utf-8",
