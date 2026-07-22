@@ -116,27 +116,48 @@ Always: set `workdir`, pass `--no-auto-update` (Grok) and an explicit
 `background=true, notify_on_complete=true`, and verify the delegate's diff
 yourself (run the repo's tests) before reporting success.
 
-## Route Production Work: the Thin Router
+## Route Production Work: the `route_code_task` Tool
 
-`scripts/coding_agent_router.py` is the production path. It takes an immutable
-work packet (objective, seeded files, acceptance commands), selects a named
-profile by task class, runs the harness headless in an isolated scratch repo
-under process-group supervision, verifies OUTSIDE candidate control (protected
-files are restored from the packet before acceptance), performs at most one
-same-session repair with the exact failure evidence, reroutes the identical
-packet once to the fallback profile, then stops. Every attempt is appended to
-a durable JSONL record with the packet hash, task class, harness, exact
-model/profile/version, repair/reroute, acceptance, elapsed time, and failure
-class.
+The general routing path is the engine in `tools/code_routing.py`, exposed to
+Hermes as the **`route_code_task` tool** (toolset `delegation`) and to
+operators as `scripts/coding_agent_router.py`. A work packet targets a real
+repository (`repo`: local path or URL, `base_sha`: the exact commit to build
+on) or seeds a synthetic scratch repo from `files` (benchmarks). The engine:
+
+1. clones an isolated workspace at the exact base SHA (the original checkout
+   is never touched); packet file paths are strictly validated — no absolute
+   paths, no `..`, no symlink escapes;
+2. runs the selected profile headless under process-group supervision plus a
+   descendant tracker (no orphaned processes, even detached ones);
+3. verifies OUTSIDE candidate control: protected files are restored from the
+   packet before acceptance, and an `allowed_paths` scope contract rejects
+   changes outside the packet's declared surface;
+4. performs at most one same-session repair with the exact failure evidence,
+   reroutes the identical packet once to the fallback profile, then stops;
+5. appends every attempt to `HERMES_HOME/router/routes.jsonl` with the
+   packet hash (covering all semantic fields), per-phase run/repair outcomes
+   and usage, exact model/profile/resolved CLI version, and failure class.
 
 ```
-python scripts/coding_agent_router.py --packet packet.json --log routes.jsonl
+python scripts/coding_agent_router.py --packet packet.json
 ```
 
-Named profiles: `grok-lean-high`, `cursor-grok-high-fast-off`,
-`cursor-composer`, `cursor-frontier`. The routing table (task class →
-[primary, fallback]) is provisional — the JSONL production record is what
-promotes or demotes a harness per task class, not synthetic samples.
+Named profiles (all env-configurable, never plain defaults):
+
+- `grok-high` — `ROUTER_GROK_BIN` (default `grok`), `ROUTER_GROK_MODEL`
+  (default `grok-4.5`, catalog-valid on 0.2.109), `ROUTER_GROK_EFFORT`,
+  `ROUTER_GROK_SANDBOX` (when set, `--sandbox` is an argv invariant and the
+  profile fails closed if the binary can't enforce it).
+- `cursor-grok-high-fast-off` — `ROUTER_CURSOR_GROK_MODEL`.
+- `cursor-composer` — `ROUTER_CURSOR_COMPOSER_MODEL`.
+- `cursor-frontier` — **fails closed** unless `ROUTER_CURSOR_FRONTIER_MODEL`
+  names a model from the live authenticated catalog; a moving alias must
+  never silently pin a stale model.
+
+Risk policy: packets with `risk: high` route only to sandbox-enforcing
+profiles. The routing table (task class → [primary, fallback]) is
+provisional — the JSONL production record is what promotes or demotes a
+harness per task class, not synthetic samples.
 
 ## Measure, Don't Guess
 
