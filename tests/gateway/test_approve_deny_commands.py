@@ -456,7 +456,12 @@ class TestBlockingApprovalE2E:
         t = threading.Thread(target=agent_thread)
         t.start()
 
-        for _ in range(50):
+        # Generous ceiling: before the approval notify fires,
+        # check_all_command_guards may spend several seconds in auxiliary-
+        # client probes on slow CI runners (marking openrouter/nous
+        # unhealthy). The assertion is about ordering, not latency — a
+        # fixed 2.5s window made this flake CI-deterministically.
+        for _ in range(600):
             if notified:
                 break
             time.sleep(0.05)
@@ -465,7 +470,7 @@ class TestBlockingApprovalE2E:
         assert "rm -rf /important" in notified[0]["command"]
 
         resolve_gateway_approval(session_key, "once")
-        t.join(timeout=5)
+        t.join(timeout=15)
 
         assert result_holder[0] is not None
         assert result_holder[0]["approved"] is True
