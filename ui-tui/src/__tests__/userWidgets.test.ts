@@ -6,7 +6,7 @@ import { beforeEach, describe, expect, it } from 'vitest'
 
 import { getOverlayState, resetOverlayState } from '../app/overlayStore.js'
 import { launchWidget } from '../sdk/host.js'
-import { getWidgetApp } from '../sdk/registry.js'
+import { defineWidgetApp, getWidgetApp } from '../sdk/registry.js'
 import { loadUserWidgets } from '../sdk/userWidgets.js'
 
 const WIDGET = `
@@ -63,5 +63,45 @@ describe('user widget loading', () => {
 
     expect(result.removed).toEqual(['soon-gone'])
     expect(getWidgetApp('soon-gone')).toBeUndefined()
+  })
+
+  it('removes a renamed widget id on reload and deletion', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'tui-widgets-'))
+    const file = join(dir, 'renamed.mjs')
+
+    await writeFile(file, WIDGET.replace('test-user-widget', 'old-id'))
+    await loadUserWidgets(dir)
+    await writeFile(file, WIDGET.replace('test-user-widget', 'new-id'))
+    const renamed = await loadUserWidgets(dir)
+
+    expect(renamed.removed).toContain('old-id')
+    expect(getWidgetApp('old-id')).toBeUndefined()
+    expect(getWidgetApp('new-id')).toBeDefined()
+
+    await rm(file)
+    await loadUserWidgets(dir)
+    expect(getWidgetApp('new-id')).toBeUndefined()
+  })
+
+  it('restores a built-in after deleting a shadowing user widget', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'tui-widgets-'))
+    const file = join(dir, 'shadow.mjs')
+
+    const builtIn = defineWidgetApp({
+      id: 'shadowed-built-in',
+      help: 'built in',
+      mode: 'ambient',
+      init: () => ({}),
+      reduce: state => state,
+      render: () => null
+    })
+
+    await writeFile(file, WIDGET.replace('test-user-widget', 'shadowed-built-in'))
+    await loadUserWidgets(dir)
+    expect(getWidgetApp('shadowed-built-in')).not.toBe(builtIn)
+
+    await rm(file)
+    await loadUserWidgets(dir)
+    expect(getWidgetApp('shadowed-built-in')).toBe(builtIn)
   })
 })

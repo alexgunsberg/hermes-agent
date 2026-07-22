@@ -74,10 +74,11 @@ def accept_changes(
             env=get_soffice_env(),
         )
     except subprocess.TimeoutExpired:
-        return (
-            None,
-            f"Successfully accepted all tracked changes: {input_file} -> {output_file}",
-        )
+        try:
+            output_path.unlink(missing_ok=True)
+        except OSError as e:
+            logger.warning("Failed to remove unverified DOCX output after timeout: %s", e)
+        return None, "Error: LibreOffice timed out before tracked changes could be verified"
 
     if result.returncode != 0:
         return None, f"Error: LibreOffice failed: {result.stderr}"

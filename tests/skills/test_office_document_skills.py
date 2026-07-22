@@ -8,7 +8,9 @@ of skill content.
 
 from __future__ import annotations
 
+import importlib.util
 import re
+import subprocess
 from pathlib import Path
 
 import pytest
@@ -124,3 +126,31 @@ def test_docs_pages_generated():
         assert (docs_dir / f"productivity-{name}.md").exists(), (
             f"missing generated docs page for {name}; run website/scripts/generate-skill-docs.py"
         )
+
+
+def test_accept_changes_timeout_fails_closed(tmp_path, monkeypatch):
+    """A timed-out macro must not claim that the copied input is clean."""
+    scripts_dir = _skill_dir("docx") / "scripts"
+    monkeypatch.syspath_prepend(str(scripts_dir))
+    spec = importlib.util.spec_from_file_location(
+        "docx_accept_changes_test", scripts_dir / "accept_changes.py"
+    )
+    assert spec and spec.loader
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+
+    source = tmp_path / "source.docx"
+    output = tmp_path / "accepted.docx"
+    source.write_bytes(b"not-a-real-docx-needed-for-this-unit-test")
+    monkeypatch.setattr(module, "_setup_libreoffice_macro", lambda: True)
+
+    def _timeout(*args, **kwargs):
+        raise subprocess.TimeoutExpired(cmd="soffice", timeout=30)
+
+    monkeypatch.setattr(module.subprocess, "run", _timeout)
+
+    _, message = module.accept_changes(str(source), str(output))
+
+    assert message.startswith("Error:")
+    assert "timed out" in message.lower()
+    assert not output.exists()

@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
+import time
 from pathlib import Path
 
 import pytest
@@ -376,6 +377,34 @@ def test_wal_checkpoint_truncates_wal_file(tmp_path, monkeypatch):
             "wal_checkpoint(TRUNCATE) should reset the -wal file to 0 bytes"
         )
     finally:
+        conn.close()
+
+
+def test_wal_checkpoint_is_bounded_by_short_housekeeping_timeout(tmp_path, monkeypatch):
+    """A long-lived reader must not stall the dispatcher busy timeout."""
+    db_path = tmp_path / "kanban.db"
+    _build_board_db(db_path, tasks=1)
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
+    monkeypatch.setenv("HERMES_KANBAN_BUSY_TIMEOUT_MS", "2000")
+    monkeypatch.setattr(kb, "_LAST_WAL_CHECKPOINT", {})
+
+    conn = kb.connect(db_path=db_path)
+    reader = sqlite3.connect(db_path, isolation_level=None)
+    try:
+        reader.execute("PRAGMA journal_mode=WAL")
+        reader.execute("BEGIN")
+        reader.execute("SELECT COUNT(*) FROM tasks").fetchone()
+        kb.create_task(conn, title="frame-after-reader-snapshot")
+
+        started = time.monotonic()
+        kb.dispatch_once(conn, spawn_fn=lambda *a, **k: None, dry_run=True)
+        elapsed = time.monotonic() - started
+
+        assert elapsed < 1.0, f"housekeeping checkpoint blocked for {elapsed:.2f}s"
+        assert conn.execute("PRAGMA busy_timeout").fetchone()[0] == 2000
+    finally:
+        reader.rollback()
+        reader.close()
         conn.close()
 
 

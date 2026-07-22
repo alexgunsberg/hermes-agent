@@ -1248,7 +1248,7 @@ def load_gateway_config() -> GatewayConfig:
                 gw_data["default_reset_policy"] = sr
 
             qc = yaml_cfg.get("quick_commands")
-            if qc is None and isinstance(gateway_section, dict):
+            if "quick_commands" not in yaml_cfg and isinstance(gateway_section, dict):
                 qc = gateway_section.get("quick_commands")
             if qc is not None:
                 if isinstance(qc, dict):
@@ -1292,7 +1292,7 @@ def load_gateway_config() -> GatewayConfig:
             # ``profile_routes`` or the nested ``gateway.profile_routes`` form
             # (matching the multiplex_profiles parity above).
             _pr = yaml_cfg.get("profile_routes")
-            if _pr is None and isinstance(gateway_section, dict):
+            if "profile_routes" not in yaml_cfg and isinstance(gateway_section, dict):
                 _pr = gateway_section.get("profile_routes")
             if isinstance(_pr, list):
                 gw_data["profile_routes"] = _pr
@@ -1312,7 +1312,7 @@ def load_gateway_config() -> GatewayConfig:
                 gw_data["max_concurrent_sessions"] = yaml_cfg["max_concurrent_sessions"]
 
             streaming_cfg = yaml_cfg.get("streaming")
-            if not isinstance(streaming_cfg, dict) and isinstance(gateway_section, dict):
+            if "streaming" not in yaml_cfg and isinstance(gateway_section, dict):
                 # Fall back to nested gateway.streaming written by
                 # ``hermes config set gateway.streaming.*``
                 streaming_cfg = gateway_section.get("streaming")

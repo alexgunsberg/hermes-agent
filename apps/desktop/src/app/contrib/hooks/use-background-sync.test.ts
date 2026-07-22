@@ -72,4 +72,36 @@ describe('rehydrateLiveSessionStatuses', () => {
     expect($attentionSessionIds.get()).toEqual([])
     expect($stalledSessionIds.get()).toEqual([])
   })
+
+  it('settles sessions omitted from the next authoritative snapshot', () => {
+    const previous = rehydrateLiveSessionStatuses({
+      sessions: [
+        {
+          id: 'runtime-finished-while-disconnected',
+          last_active: 1,
+          session_key: 'finished-while-disconnected',
+          status: 'waiting'
+        },
+        {
+          id: 'runtime-stalled-while-disconnected',
+          last_active: 1,
+          session_key: 'stalled-while-disconnected',
+          status: 'working'
+        }
+      ]
+    })
+
+    expect($workingSessionIds.get()).toEqual([
+      'finished-while-disconnected',
+      'stalled-while-disconnected'
+    ])
+    expect($attentionSessionIds.get()).toEqual(['finished-while-disconnected'])
+    expect($stalledSessionIds.get()).toEqual(['stalled-while-disconnected'])
+
+    rehydrateLiveSessionStatuses({ sessions: [] }, Date.now(), previous)
+
+    expect($workingSessionIds.get()).toEqual([])
+    expect($attentionSessionIds.get()).toEqual([])
+    expect($stalledSessionIds.get()).toEqual([])
+  })
 })
