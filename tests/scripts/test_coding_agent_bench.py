@@ -148,3 +148,20 @@ def test_headless_invocations_use_safe_flags():
     cursor_cmd = registry["cursor"].build_cmd("do it")
     assert "--force" in cursor_cmd
     assert "--output-format" in cursor_cmd  # stream-json default must be overridden
+
+
+def test_agents_pin_explicit_models_never_plain_defaults():
+    registry = bench.builtin_agents(grok_model="grok-lean", grok_effort="high",
+                                    cursor_model="composer")
+    grok_cmd = registry["grok"].build_cmd("do it")
+    assert grok_cmd[grok_cmd.index("-m") + 1] == "grok-lean"
+    assert grok_cmd[grok_cmd.index("--reasoning-effort") + 1] == "high"
+    # Bounded autonomy: turn cap + no inherited context.
+    for flag in ("--max-turns", "--no-subagents", "--no-memory",
+                 "--disable-web-search"):
+        assert flag in grok_cmd, flag
+    # Removed in grok 0.2.109 — must never be emitted.
+    assert "--check" not in grok_cmd and "--best-of-n" not in grok_cmd
+    cursor_cmd = registry["cursor"].build_cmd("do it")
+    assert cursor_cmd[cursor_cmd.index("-m") + 1] == "composer"
+    assert registry["grok"].model == "grok-lean[effort=high]"

@@ -194,11 +194,23 @@ class Agent:
     build_cmd: "callable"  # (prompt) -> argv list
     auth_check: "callable"  # () -> None | reason string
     timeout: int = 600
+    model: str = "harness-default"
+    version_argv: list = None
 
     def availability(self) -> str | None:
         if shutil.which(self.binary) is None:
             return f"binary `{self.binary}` not found on PATH"
         return self.auth_check()
+
+    def resolved_version(self) -> str:
+        if not self.version_argv:
+            return "unversioned"
+        try:
+            out = subprocess.run(
+                self.version_argv, capture_output=True, text=True, timeout=30)
+            return (out.stdout or out.stderr).strip().splitlines()[0]
+        except Exception as exc:  # pragma: no cover - defensive
+            return f"version-check-failed: {exc}"
 
 
 def _grok_auth() -> str | None:
@@ -220,25 +232,38 @@ def _cursor_auth() -> str | None:
     return "CURSOR_API_KEY unset and `cursor-agent status` reports no login"
 
 
-def builtin_agents(stub_cmd: str | None = None) -> dict:
+def builtin_agents(stub_cmd: str | None = None,
+                   grok_model: str = "grok-lean",
+                   grok_effort: str = "high",
+                   cursor_model: str = "grok-4.5[effort=high,fast=false]") -> dict:
+    # Both adapters pin an explicit model/profile — never a plain-default
+    # invocation — and every result records the resolved CLI version, so a
+    # comparison is always attributable to an exact (version, model) pair.
     agents = {
         "grok": Agent(
             name="grok",
             binary="grok",
             build_cmd=lambda prompt: [
                 "grok", "--no-auto-update", "--always-approve",
+                "-m", grok_model, "--reasoning-effort", grok_effort,
+                "--max-turns", "40", "--no-subagents", "--no-memory",
+                "--disable-web-search",
                 "--output-format", "json", "-p", prompt,
             ],
             auth_check=_grok_auth,
+            model=f"{grok_model}[effort={grok_effort}]",
+            version_argv=["grok", "--version"],
         ),
         "cursor": Agent(
             name="cursor",
             binary="cursor-agent",
             build_cmd=lambda prompt: [
-                "cursor-agent", "-p", "--force",
+                "cursor-agent", "-p", "--force", "-m", cursor_model,
                 "--output-format", "json", prompt,
             ],
             auth_check=_cursor_auth,
+            model=cursor_model,
+            version_argv=["cursor-agent", "--version"],
         ),
     }
     if stub_cmd:
@@ -399,10 +424,16 @@ def main(argv: list | None = None) -> int:
                     help="command template for the `stub` agent; {prompt} is substituted")
     ap.add_argument("--timeout", type=int, default=600,
                     help="per-task agent timeout in seconds")
+    ap.add_argument("--grok-model", default="grok-lean")
+    ap.add_argument("--grok-effort", default="high")
+    ap.add_argument("--cursor-model", default="grok-4.5[effort=high,fast=false]")
     args = ap.parse_args(argv)
 
     tasks = load_tasks(args.tasks)
-    registry = builtin_agents(stub_cmd=args.stub_cmd)
+    registry = builtin_agents(stub_cmd=args.stub_cmd,
+                              grok_model=args.grok_model,
+                              grok_effort=args.grok_effort,
+                              cursor_model=args.cursor_model)
     requested = [a.strip() for a in args.agents.split(",") if a.strip()]
     unknown = [a for a in requested if a not in registry]
     if unknown:
@@ -410,6 +441,7 @@ def main(argv: list | None = None) -> int:
 
     results: list = []
     unavailable: dict = {}
+    agent_meta: dict = {}
     workdir = Path(tempfile.mkdtemp(prefix="agent-bench-"))
     for name in requested:
         agent = registry[name]
@@ -419,6 +451,8 @@ def main(argv: list | None = None) -> int:
             unavailable[name] = reason
             print(f"[bench] {name}: UNAVAILABLE — {reason}", file=sys.stderr)
             continue
+        agent_meta[name] = {"model": agent.model,
+                            "resolved_version": agent.resolved_version()}
         for task in tasks:
             print(f"[bench] {name} ⇐ {task.name} ...", file=sys.stderr)
             res = run_task(agent, task, workdir)
@@ -428,6 +462,7 @@ def main(argv: list | None = None) -> int:
     report = {
         "tasks": [t.name for t in tasks],
         "unavailable": unavailable,
+        "agents": agent_meta,
         "results": [vars(r) for r in results],
         "workdir": str(workdir),
     }

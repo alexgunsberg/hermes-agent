@@ -127,8 +127,8 @@ For pure automation, headless `-p` is still cleaner than the TUI.
 | `--tools` / `--disallowed-tools` | Comma-separated allow/remove lists for built-in tools |
 | `--disable-web-search` | Turn off web search/fetch tools for hermetic runs |
 | `-w, --worktree [<NAME>]` | Run the session in a fresh git worktree (`--worktree-ref` picks the base) |
-| `--best-of-n <N>` | Headless only: run the task N ways in parallel, pick the best |
-| `--check` | Headless only: append a self-verification loop to the prompt |
+| `--best-of-n <N>` | **0.2.106 only — removed in 0.2.109.** Ran the task N ways in parallel, picked the best |
+| `--check` | **0.2.106 only — removed in 0.2.109.** Appended a self-verification loop to the prompt |
 | `--json-schema <SCHEMA>` | Constrain output to a JSON Schema (implies `--output-format json`) |
 | `--agents <JSON>` / `--agent <NAME>` | Inline subagent definitions / named agent profile |
 | `--no-subagents` / `--no-plan` / `--no-memory` | Disable subagent spawning / plan mode / cross-session memory |
@@ -147,15 +147,19 @@ terminal(command="grok --no-auto-update -p 'List all TODO comments in src/' --ou
 terminal(command="grok --no-auto-update --always-approve -p 'Refactor the database layer and run the tests'", workdir="/project", timeout=300)
 ```
 
-### Pipeline Maximizers (verified on grok 0.2.106)
+### Pipeline Maximizers
 
-These headless-only flags are Grok's differentiators over sibling CLIs —
-compose them for high-assurance autonomous pipelines:
+> **Version-gate before using any of these** — Grok's flag surface moves
+> fast. Run `grok --help` and check the flag exists in the installed version
+> before emitting it. Notably, `--best-of-n` and `--check` existed in 0.2.106
+> but were **removed by 0.2.109**; on current versions, self-verification is
+> your own external check plus one same-session repair (`-s <uuid>` to name
+> the session, then `-r <uuid>` with the failure evidence), and best-of-N is
+> an opt-in fan-out you build with multiple `-w` worktrees.
+
+Verified on grok 0.2.109 (all flags below still present):
 
 ```
-# Quality: N parallel attempts, keep the best, then self-verify
-terminal(command="grok --no-auto-update --always-approve --best-of-n 3 --check -p 'Fix the flaky retry logic in gateway/delivery.py and make the tests pass'", workdir="/project", timeout=900)
-
 # Isolation: run in a throwaway git worktree so main checkout is never touched
 terminal(command="grok --no-auto-update --always-approve -w fix-retry -p 'Fix issue #78 and commit'", workdir="/project", timeout=600)
 

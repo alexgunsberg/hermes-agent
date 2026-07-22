@@ -18,9 +18,12 @@ the decision layer: which delegate to pick, how to invoke it for maximum
 capability, and how to measure the choice instead of guessing.
 
 Capability facts below: the Grok column was verified live against
-`grok 0.2.106` (`--help` inspection); the Cursor column reflects Cursor's
-published CLI docs. Re-verify with `grok --help` / `cursor-agent --help` when
-versions move — both CLIs evolve fast.
+`grok 0.2.109` (`--help` inspection); the Cursor column reflects Cursor's
+published CLI docs. **Version-gate every capability**: re-verify with
+`grok --help` / `cursor-agent --help` before emitting a flag — Grok removed
+`--check` and `--best-of-n` between 0.2.106 and 0.2.109, so any cached
+"maximum profile" can silently go stale. Record the resolved CLI version and
+model in every result.
 
 ## Capability Matrix
 
@@ -30,8 +33,8 @@ versions move — both CLIs evolve fast.
 | Auto-approve writes | `--always-approve`, or graded `--permission-mode` | `--force` (binary) |
 | Output formats | `plain`, `json`, `streaming-json` | `text`, `json`, `stream-json` (**default in print mode: stream-json**) |
 | Schema-constrained output | `--json-schema '<schema>'` | not available |
-| Best-of-N parallel attempts | `--best-of-n N` (headless) | not available |
-| Built-in self-verification | `--check` (headless) | not available (prompt for it manually) |
+| Best-of-N parallel attempts | removed in 0.2.109 (`--best-of-n` was 0.2.106-only); emulate via parallel `-w` worktrees as an opt-in fan-out | not available |
+| Built-in self-verification | removed in 0.2.109 (`--check` was 0.2.106-only); use external verification + one same-session repair (`-s`/`-r`) | not available (same external pattern) |
 | Git worktree isolation | built-in `-w/--worktree`, `grok worktree` | manual `git worktree` + `workdir` |
 | Turn cap | `--max-turns N` | not available |
 | Sandbox profiles | `--sandbox <profile>` | permissions allow/deny in CLI config |
@@ -49,10 +52,13 @@ versions move — both CLIs evolve fast.
 
 Route by task shape first, then by environment constraints:
 
-1. **High-assurance autonomous builds → Grok.** `--best-of-n 3 --check
-   --always-approve` gives parallel attempts + a self-verification loop no
-   sibling has. Use for "make the tests pass", tricky bug fixes, and anything
-   where a wrong-but-plausible diff is expensive.
+1. **High-assurance autonomous builds → Grok with bounded autonomy.** Pin the
+   model and effort, cap turns, strip inherited context, and verify
+   externally: `-m grok-lean --reasoning-effort high --max-turns 40
+   --no-subagents --no-memory --disable-web-search --output-format json`.
+   Self-verification is YOUR check plus one same-session repair (`-s <uuid>`
+   then `-r <uuid>` with the exact failure evidence) — do not rely on
+   `--check`/`--best-of-n`, which were removed in 0.2.109.
 2. **Pipelines that parse agent output → Grok.** `--json-schema` yields
    validated JSON; Cursor can emit `json` but cannot constrain its shape.
 3. **Model-sensitive tasks → Cursor.** When the task benefits from a specific
@@ -85,9 +91,13 @@ Route by task shape first, then by environment constraints:
 ## Optimized Pipeline Recipes
 
 ```
-# Grok: maximum-assurance build (parallel attempts + self-check + worktree isolation)
-grok --no-auto-update --always-approve --best-of-n 3 --check -w fix-123 \
-  -p 'Fix issue #123; run the test suite; commit when green'
+# Grok: bounded-autonomy build (the `grok-lean-high` router profile)
+grok --no-auto-update --always-approve -m grok-lean --reasoning-effort high \
+  --max-turns 40 --no-subagents --no-memory --disable-web-search \
+  --output-format json -s <uuid> -p 'Fix issue #123; run the test suite'
+# ...verify externally; on failure, repair once in the SAME session:
+grok --no-auto-update --always-approve -r <uuid> --output-format json \
+  -p 'Acceptance failed with: <evidence>. Fix it.'
 
 # Grok: structured audit feeding a Hermes pipeline
 grok --no-auto-update -p 'List dead code in src/' \
@@ -106,6 +116,28 @@ Always: set `workdir`, pass `--no-auto-update` (Grok) and an explicit
 `background=true, notify_on_complete=true`, and verify the delegate's diff
 yourself (run the repo's tests) before reporting success.
 
+## Route Production Work: the Thin Router
+
+`scripts/coding_agent_router.py` is the production path. It takes an immutable
+work packet (objective, seeded files, acceptance commands), selects a named
+profile by task class, runs the harness headless in an isolated scratch repo
+under process-group supervision, verifies OUTSIDE candidate control (protected
+files are restored from the packet before acceptance), performs at most one
+same-session repair with the exact failure evidence, reroutes the identical
+packet once to the fallback profile, then stops. Every attempt is appended to
+a durable JSONL record with the packet hash, task class, harness, exact
+model/profile/version, repair/reroute, acceptance, elapsed time, and failure
+class.
+
+```
+python scripts/coding_agent_router.py --packet packet.json --log routes.jsonl
+```
+
+Named profiles: `grok-lean-high`, `cursor-grok-high-fast-off`,
+`cursor-composer`, `cursor-frontier`. The routing table (task class →
+[primary, fallback]) is provisional — the JSONL production record is what
+promotes or demotes a harness per task class, not synthetic samples.
+
 ## Measure, Don't Guess
 
 Routing rules decay as CLIs evolve. `scripts/coding_agent_bench.py` runs an
@@ -118,5 +150,5 @@ python scripts/coding_agent_bench.py --agents grok,cursor --out /tmp/bench
 ```
 
 Agents without working auth are reported as unavailable rather than failing
-the run. Re-run the bench when a CLI ships a major version and update the
-rules above from the data.
+the run. Re-run the bench when a CLI ships a new version and update the rules
+above from the data.
