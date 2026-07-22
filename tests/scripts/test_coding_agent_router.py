@@ -159,14 +159,18 @@ def test_timeout_kills_whole_process_group(tmp_path):
     assert outcome.state == "timeout"
     child_pid = int(marker.read_text())
     # The descendant must be gone (or a zombie reparented to init, not running).
+    psutil = pytest.importorskip("psutil")
     for _ in range(20):
-        try:
-            os.kill(child_pid, 0)
-        except ProcessLookupError:
+        if not psutil.pid_exists(child_pid):
             break
-        # Still visible — confirm it is not actually running `sleep`.
-        cmdline = Path(f"/proc/{child_pid}/cmdline")
-        if not cmdline.exists() or b"sleep" not in cmdline.read_bytes():
+        # Still visible — confirm it is not actually running `sleep`
+        # (a zombie entry is acceptable; a live sleep process is not).
+        try:
+            child = psutil.Process(child_pid)
+            if child.status() == psutil.STATUS_ZOMBIE or \
+                    "sleep" not in " ".join(child.cmdline()):
+                break
+        except psutil.NoSuchProcess:
             break
         time.sleep(0.1)
     else:

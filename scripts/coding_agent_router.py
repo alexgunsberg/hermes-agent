@@ -285,24 +285,35 @@ class RunOutcome:
     orphans_killed: bool = False
 
 
+_POSIX = os.name == "posix"
+
+
 def run_supervised(argv: list, cwd: Path, timeout: int) -> RunOutcome:
-    """Run argv in its own process group; on timeout TERM then KILL the whole
-    group so no descendant survives the harness."""
+    """Run argv under supervision so no descendant survives the harness.
+
+    POSIX: the child gets its own session/process group; on timeout the whole
+    group is TERMed then KILLed. Windows: the child gets its own process
+    group and ``taskkill /T`` fells the whole tree.
+    """
     start = time.monotonic()
+    popen_kwargs: dict = {}
+    if _POSIX:
+        popen_kwargs["start_new_session"] = True
+    else:  # pragma: no cover - exercised on Windows only
+        popen_kwargs["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
     try:
         proc = subprocess.Popen(
             argv, cwd=cwd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-            text=True, start_new_session=True,
+            text=True, **popen_kwargs,
         )
     except OSError as exc:
         return RunOutcome(state="spawn-error", stderr=str(exc))
-    pgid = os.getpgid(proc.pid)
     try:
         stdout, stderr = proc.communicate(timeout=timeout)
         state, rc = "completed", proc.returncode
-        orphans = _reap_group(pgid)
+        orphans = _reap_tree(proc.pid)
     except subprocess.TimeoutExpired:
-        _terminate_group(pgid)
+        _terminate_tree(proc.pid)
         stdout, stderr = proc.communicate()
         state, rc = "timeout", None
         orphans = True
@@ -312,31 +323,45 @@ def run_supervised(argv: list, cwd: Path, timeout: int) -> RunOutcome:
     )
 
 
-def _terminate_group(pgid: int, grace_s: float = 5.0) -> None:
-    for sig, wait in ((signal.SIGTERM, grace_s), (signal.SIGKILL, 2.0)):
+def _terminate_tree(pid: int, grace_s: float = 5.0) -> None:
+    if not _POSIX:  # pragma: no cover - exercised on Windows only
+        subprocess.run(["taskkill", "/F", "/T", "/PID", str(pid)],
+                       capture_output=True)
+        return
+    sigkill = getattr(signal, "SIGKILL", signal.SIGTERM)  # windows-footgun: ok — POSIX-gated
+    # start_new_session makes the child a session/group leader, so its pid IS
+    # the pgid — and stays valid for signalling surviving group members even
+    # after the leader itself has exited.
+    for sig, wait in ((signal.SIGTERM, grace_s), (sigkill, 2.0)):
         try:
-            os.killpg(pgid, sig)
-        except ProcessLookupError:
+            os.killpg(pid, sig)  # windows-footgun: ok — POSIX-gated
+        except (ProcessLookupError, PermissionError):
             return
         deadline = time.monotonic() + wait
         while time.monotonic() < deadline:
-            if not _group_alive(pgid):
+            if not _tree_alive(pid):
                 return
             time.sleep(0.1)
 
 
-def _reap_group(pgid: int) -> bool:
+def _reap_tree(pid: int) -> bool:
     """After a completed run, kill any descendants the agent left behind.
     Returns True if stragglers had to be killed."""
-    if not _group_alive(pgid):
+    if not _tree_alive(pid):
         return False
-    _terminate_group(pgid, grace_s=1.0)
+    _terminate_tree(pid, grace_s=1.0)
     return True
 
 
-def _group_alive(pgid: int) -> bool:
+def _tree_alive(pid: int) -> bool:
+    if not _POSIX:  # pragma: no cover - exercised on Windows only
+        try:
+            import psutil
+            return psutil.pid_exists(pid)
+        except ImportError:
+            return False
     try:
-        os.killpg(pgid, 0)
+        os.killpg(pid, 0)  # windows-footgun: ok — POSIX-gated
         return True
     except ProcessLookupError:
         return False
