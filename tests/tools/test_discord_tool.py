@@ -1268,7 +1268,14 @@ class TestModelToolsIntegration:
         mock_req.return_value = {"flags": 0}
 
         from model_tools import get_tool_definitions
-        tools = get_tool_definitions(enabled_toolsets=["hermes-discord"], quiet_mode=True)
+        # skip_tool_search_assembly: this test inspects the raw rebuilt
+        # schema; the tool-search progressive-disclosure step may otherwise
+        # defer discord_admin behind the tool_search bridge in small-context
+        # test environments, which is orthogonal to what's asserted here.
+        tools = get_tool_definitions(
+            enabled_toolsets=["hermes-discord"], quiet_mode=True,
+            skip_tool_search_assembly=True,
+        )
         discord_admin_tool = next(
             (t for t in tools if t.get("function", {}).get("name") == "discord_admin"),
             None,

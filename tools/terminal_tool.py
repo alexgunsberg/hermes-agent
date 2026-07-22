@@ -2976,7 +2976,7 @@ TERMINAL_SCHEMA = {
             },
             "timeout": {
                 "type": "integer",
-                "description": f"Foreground wait ceiling in seconds (max {FOREGROUND_MAX_TIMEOUT}); completion returns immediately. Use background for longer work.",
+                "description": f"Foreground wait ceiling in seconds (max {FOREGROUND_MAX_TIMEOUT}); completion returns immediately. Use background=true for longer work.",
                 "minimum": 1
             },
             "workdir": {
