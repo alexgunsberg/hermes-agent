@@ -1,14 +1,14 @@
 ---
 name: grok
 description: "Delegate coding to xAI Grok Build CLI (features, PRs)."
-version: 0.1.0
+version: 0.2.0
 author: Matt Maximo (MattMaximo), Hermes Agent
 license: MIT
 platforms: [linux, macos, windows]
 metadata:
   hermes:
     tags: [Coding-Agent, Grok, xAI, Code-Review, Refactoring, Automation]
-    related_skills: [codex, claude-code, hermes-agent]
+    related_skills: [codex, claude-code, cursor, coding-agent-routing, hermes-agent]
 ---
 
 # Grok Build CLI — Hermes Orchestration Guide
@@ -40,7 +40,8 @@ for interactive sessions.
 - **Auth — SuperGrok / X Premium+ subscription (primary path):**
   - Run `grok login` once → opens a browser for OAuth → token cached in
     `~/.grok/auth.json`. This uses your **SuperGrok or X Premium+** subscription
-    (no per-token API billing).
+    (no per-token API billing). On a headless box use `grok login --device-code`
+    (prints a code to enter on another device).
   - Check sign-in state by looking for `~/.grok/auth.json`, or run a cheap
     headless smoke test: `grok --no-auto-update -p "Say ok."`
   - In the TUI, `/logout` signs out and `/login` (or relaunching) signs back in.
@@ -114,8 +115,23 @@ For pure automation, headless `-p` is still cleaner than the TUI.
 | `--cwd <PATH>` | Set the working directory |
 | `--output-format <FMT>` | `plain` (default), `json`, or `streaming-json` |
 | `--always-approve` | Auto-approve all tool executions (the `--full-auto` / `--yolo` equivalent) |
+| `--permission-mode <MODE>` | Finer-grained than `--always-approve`: `default`, `acceptEdits`, `auto`, `dontAsk`, `bypassPermissions`, `plan` |
 | `--no-alt-screen` | Run inline, no fullscreen TUI takeover |
 | `--no-auto-update` | Skip background update checks (use in all automation) |
+| `--prompt-file <PATH>` | Single-turn prompt read from a file (safer than shell-quoting a long prompt) |
+| `--max-turns <N>` | Cap agent turns (bound runaway autonomous runs) |
+| `--rules <RULES>` | Append extra rules to the system prompt for this run |
+| `--reasoning-effort <EFFORT>` | Reasoning effort for reasoning models |
+| `--sandbox <PROFILE>` | Sandbox profile for filesystem/network access (also `GROK_SANDBOX` env) |
+| `--allow <RULE>` / `--deny <RULE>` | Permission allow/deny rules (compat: `--allowedTools` / `--disallowedTools`) |
+| `--tools` / `--disallowed-tools` | Comma-separated allow/remove lists for built-in tools |
+| `--disable-web-search` | Turn off web search/fetch tools for hermetic runs |
+| `-w, --worktree [<NAME>]` | Run the session in a fresh git worktree (`--worktree-ref` picks the base) |
+| `--best-of-n <N>` | Headless only: run the task N ways in parallel, pick the best |
+| `--check` | Headless only: append a self-verification loop to the prompt |
+| `--json-schema <SCHEMA>` | Constrain output to a JSON Schema (implies `--output-format json`) |
+| `--agents <JSON>` / `--agent <NAME>` | Inline subagent definitions / named agent profile |
+| `--no-subagents` / `--no-plan` / `--no-memory` | Disable subagent spawning / plan mode / cross-session memory |
 
 ### Output Formats
 
@@ -129,6 +145,25 @@ terminal(command="grok --no-auto-update -p 'List all TODO comments in src/' --ou
 
 # Auto-approve for autonomous building
 terminal(command="grok --no-auto-update --always-approve -p 'Refactor the database layer and run the tests'", workdir="/project", timeout=300)
+```
+
+### Pipeline Maximizers (verified on grok 0.2.106)
+
+These headless-only flags are Grok's differentiators over sibling CLIs —
+compose them for high-assurance autonomous pipelines:
+
+```
+# Quality: N parallel attempts, keep the best, then self-verify
+terminal(command="grok --no-auto-update --always-approve --best-of-n 3 --check -p 'Fix the flaky retry logic in gateway/delivery.py and make the tests pass'", workdir="/project", timeout=900)
+
+# Isolation: run in a throwaway git worktree so main checkout is never touched
+terminal(command="grok --no-auto-update --always-approve -w fix-retry -p 'Fix issue #78 and commit'", workdir="/project", timeout=600)
+
+# Structured pipeline output: schema-constrained JSON you can parse blindly
+terminal(command="grok --no-auto-update -p 'Audit src/ for TODOs' --json-schema '{\"type\":\"object\",\"properties\":{\"todos\":{\"type\":\"array\",\"items\":{\"type\":\"string\"}}},\"required\":[\"todos\"]}'", workdir="/project", timeout=300)
+
+# Bounded autonomy: cap turns, deny dangerous tools, no web access
+terminal(command="grok --no-auto-update --always-approve --max-turns 30 --disable-web-search --deny 'Bash(rm *)' -p 'Refactor the auth module'", workdir="/project", timeout=900)
 ```
 
 ### Background Mode (Long Tasks)
@@ -235,6 +270,11 @@ terminal(command="git worktree remove /tmp/issue-78", workdir="~/project")
 | `grok login` / `grok logout` | Sign in / out (SuperGrok / X Premium+ OAuth) |
 | `grok inspect` | Show what Grok discovered in cwd: config sources, instructions, skills, plugins, hooks, MCP servers |
 | `grok agent stdio` | Run as an ACP agent over JSON-RPC (for IDE/tool integration) |
+| `grok models` | List available models and exit |
+| `grok mcp` | Manage MCP server configurations |
+| `grok sessions` | List, search, or restore sessions |
+| `grok export` | Export a session transcript as Markdown |
+| `grok worktree` | Manage git worktrees created with `-w` |
 | `grok update` | Update the CLI (needs the `x.ai` host; skip in automation) |
 
 TUI slash commands (interactive only): `/model <name>`, `/always-approve`,
