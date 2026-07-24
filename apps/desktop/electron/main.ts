@@ -115,6 +115,7 @@ import {
   resolveTimeoutMs,
   TEXT_PREVIEW_SOURCE_MAX_BYTES
 } from './hardening'
+import { createHttpStatusError } from './http-error'
 import { createLinkTitleWindow, guardLinkTitleSession, readLinkTitleWindowTitle } from './link-title-window'
 import { ensureMainWindow } from './main-window-lifecycle'
 import { oauthSessionIsLive, resolveJsonBody, resolveOauthRestAuth } from './native-auth-decisions'
@@ -3839,7 +3840,9 @@ function fetchJson(url, token, options: any = {}) {
           const text = Buffer.concat(chunks).toString('utf8')
 
           if ((res.statusCode || 500) >= 400) {
-            reject(new Error(`${res.statusCode}: ${text || res.statusMessage}`))
+            const statusCode = res.statusCode || 500
+
+            reject(createHttpStatusError(statusCode, text || res.statusMessage || 'Request failed'))
 
             return
           }
@@ -3933,7 +3936,9 @@ function fetchPublicJson(url, options: any = {}) {
           const text = Buffer.concat(chunks).toString('utf8')
 
           if ((res.statusCode || 500) >= 400) {
-            reject(new Error(`${res.statusCode}: ${text || res.statusMessage}`))
+            const statusCode = res.statusCode || 500
+
+            reject(createHttpStatusError(statusCode, text || res.statusMessage || 'Request failed'))
 
             return
           }

@@ -336,6 +336,21 @@ def test_native_token_rejects_wrong_verifier(gated_client):
     assert r.status_code == 400
 
 
+def test_native_token_rejects_non_ascii_verifier_without_500(gated_client):
+    _verifier, challenge = _make_pkce()
+    code, _state = _walk_native_login(
+        gated_client,
+        redirect_uri="http://127.0.0.1:53999/cb",
+        challenge=challenge,
+    )
+    r = gated_client.post(
+        "/auth/native/token",
+        json={"code": code, "code_verifier": "é"},
+    )
+    assert r.status_code == 400
+    assert r.json()["detail"] == "Invalid or expired authorization code."
+
+
 def test_native_authorize_rejects_non_loopback_redirect(gated_client):
     _verifier, challenge = _make_pkce()
     r = gated_client.get(

@@ -23,6 +23,7 @@ values themselves.
 from __future__ import annotations
 
 import os
+import shlex
 import stat
 import sys
 import time
@@ -180,6 +181,27 @@ def test_timeout_kills_hung_helper_and_degrades_to_empty(tmp_path):
     elapsed = time.monotonic() - start
     assert value is None
     assert elapsed < 6.0, f"helper not killed within the bound (took {elapsed:.1f}s)"
+
+
+def test_output_cap_kills_helper_before_timeout(tmp_path):
+    """The cap is a live bound, not a post-communicate size check."""
+    python = shlex.quote(sys.executable)
+    helper = _write_helper(
+        tmp_path,
+        f"{python} -c 'import sys,time; "
+        "sys.stdout.buffer.write(b\"x\" * 131072); "
+        "sys.stdout.flush(); time.sleep(30)'",
+    )
+    start = time.monotonic()
+    value = get_command_secret(
+        command=str(helper),
+        key="CMDTEST_API_KEY",
+        timeout_seconds=5.0,
+        max_output_bytes=64 * 1024,
+    )
+    elapsed = time.monotonic() - start
+    assert value is None
+    assert elapsed < 3.0, f"oversized helper was not killed promptly ({elapsed:.1f}s)"
 
 
 def test_apply_timeout_degrades_to_empty_result(tmp_path):

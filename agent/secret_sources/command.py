@@ -35,9 +35,11 @@ from __future__ import annotations
 import os
 import platform
 import re
+import selectors
 import signal as _signal
 import subprocess
 import sys
+import time
 from pathlib import Path
 from typing import Dict, Optional
 
@@ -199,21 +201,98 @@ def _run_helper(
         )
         return None
 
-    try:
-        stdout_bytes, _stderr_discarded = proc.communicate(timeout=timeout_seconds)
-    except subprocess.TimeoutExpired:
-        # Hard timeout: kill the whole process group (a helper script may
-        # have forked children that would otherwise keep the pipe open).
-        # POSIX-only by construction: _run_helper early-returns on Windows
-        # before ever spawning, so this line can't execute there.
+    def kill_helper() -> None:
+        """Kill the helper and every child that inherited its output pipes."""
         try:
             os.killpg(os.getpgid(proc.pid), _signal.SIGKILL)  # windows-footgun: ok
         except (ProcessLookupError, PermissionError, OSError):
-            proc.kill()
+            try:
+                proc.kill()
+            except OSError:
+                pass
+        for stream in (proc.stdout, proc.stderr):
+            if stream is not None:
+                try:
+                    stream.close()
+                except OSError:
+                    pass
         try:
-            proc.communicate(timeout=1.0)
+            proc.wait(timeout=1.0)
         except (subprocess.TimeoutExpired, ValueError, OSError):
             pass
+
+    # Read both pipes incrementally. ``communicate()`` buffers them to EOF,
+    # which makes a post-hoc size check useless as an OOM guard. The provider
+    # is POSIX-only, so a selector gives us a portable macOS/Linux live cap
+    # while continuously draining (and discarding) stderr.
+    stdout_bytes = bytearray()
+    deadline = time.monotonic() + timeout_seconds
+    timed_out = False
+    oversized = False
+    selector = selectors.DefaultSelector()
+    assert proc.stdout is not None and proc.stderr is not None
+    for stream, keep in ((proc.stdout, True), (proc.stderr, False)):
+        os.set_blocking(stream.fileno(), False)
+        selector.register(stream, selectors.EVENT_READ, (keep, stream))
+
+    try:
+        while selector.get_map():
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                timed_out = True
+                break
+            events = selector.select(remaining)
+            if not events:
+                timed_out = True
+                break
+            for key, _mask in events:
+                keep, stream = key.data
+                try:
+                    chunk = os.read(key.fd, 64 * 1024)
+                except BlockingIOError:
+                    continue
+                if not chunk:
+                    selector.unregister(stream)
+                    stream.close()
+                    continue
+                if keep:
+                    # Retain at most cap+1 bytes: the sentinel byte records
+                    # overflow without ever buffering the helper's full output.
+                    room = max_output_bytes + 1 - len(stdout_bytes)
+                    if room > 0:
+                        stdout_bytes.extend(chunk[:room])
+                    if len(stdout_bytes) > max_output_bytes:
+                        oversized = True
+                        break
+            if oversized:
+                break
+    finally:
+        selector.close()
+
+    if timed_out:
+        # Hard timeout: kill the whole process group (a helper script may
+        # have forked children that would otherwise keep the pipe open).
+        kill_helper()
+        print(
+            f"[secrets:command] helper timed out after {timeout_seconds:g}s; "
+            f"resolving no value",
+            file=sys.stderr,
+        )
+        return None
+
+    if oversized:
+        kill_helper()
+        print(
+            f"[secrets:command] helper output exceeded the "
+            f"{max_output_bytes}-byte cap; resolving no value",
+            file=sys.stderr,
+        )
+        return None
+
+    try:
+        proc.wait(timeout=max(0.0, deadline - time.monotonic()))
+    except subprocess.TimeoutExpired:
+        kill_helper()
         print(
             f"[secrets:command] helper timed out after {timeout_seconds:g}s; "
             f"resolving no value",
@@ -239,15 +318,7 @@ def _run_helper(
         )
         return None
 
-    if len(stdout_bytes) > max_output_bytes:
-        print(
-            f"[secrets:command] helper output exceeded the "
-            f"{max_output_bytes}-byte cap; resolving no value",
-            file=sys.stderr,
-        )
-        return None
-
-    return stdout_bytes.decode("utf-8", errors="replace")
+    return bytes(stdout_bytes).decode("utf-8", errors="replace")
 
 
 def _parse_dotenv_map(stdout: str) -> Dict[str, str]:

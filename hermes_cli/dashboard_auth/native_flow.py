@@ -284,7 +284,10 @@ def redeem_code(
     if issued.expires_at < now:
         raise CodeInvalid("code expired")
     expected = issued.code_challenge
-    actual = _s256(code_verifier)
+    try:
+        actual = _s256(code_verifier)
+    except UnicodeEncodeError as exc:
+        raise CodeInvalid("PKCE verifier must be ASCII") from exc
     if not hmac.compare_digest(expected, actual):
         raise CodeInvalid("PKCE verification failed")
     return issued.session
