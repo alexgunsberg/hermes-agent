@@ -26,7 +26,7 @@ duplicate the user turn (#860 / #42039). This test locks in:
 import tempfile
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 from agent.codex_runtime import run_codex_app_server_turn
 from hermes_state import SessionDB
@@ -74,6 +74,40 @@ def test_codex_success_flushes_and_reports_persisted():
     assert result["completed"] is True
     # With the agent as sole persister, the gateway must SKIP its DB write.
     assert result["agent_persisted"] is True
+
+
+def test_subscription_provider_constructs_oauth_only_session():
+    """The runtime, not a caller convention, selects OAuth-only credentials."""
+    agent = _make_agent(session_db=None)
+    agent._codex_session = None
+    agent.provider = "openai-codex"
+    agent.session_cwd = "/tmp"
+    created = {}
+
+    class FakeSession:
+        def __init__(self, **kwargs):
+            created.update(kwargs)
+
+        def run_turn(self, *, user_input):
+            return _make_turn()
+
+    with (
+        patch(
+            "agent.transports.codex_app_server_session.CodexAppServerSession",
+            FakeSession,
+        ),
+        patch("tools.terminal_tool._get_approval_callback", return_value=None),
+        patch("tools.approval.is_approval_bypass_active", return_value=False),
+    ):
+        run_codex_app_server_turn(
+            agent,
+            user_message="hello",
+            original_user_message="hello",
+            messages=[{"role": "user", "content": "hello"}],
+            effective_task_id="task-1",
+        )
+
+    assert created["provider_credential_policy"] == "oauth_only"
 
 
 def test_codex_turn_persists_each_message_exactly_once():

@@ -31,6 +31,7 @@ _TIER1_SAMPLE = {
 
 _PROVIDER_SAMPLE = {
     "OPENAI_API_KEY": "sk-fake",
+    "CODEX_API_KEY": "sk-codex-fake",
     "ANTHROPIC_API_KEY": "ant-fake",
     "OPENROUTER_API_KEY": "or-fake",
 }

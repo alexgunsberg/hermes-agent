@@ -312,7 +312,12 @@ class TestSpawnEnvSecretStripping:
     """
 
     @staticmethod
-    def _capture_spawn_env(monkeypatch):
+    def _capture_spawn_env(
+        monkeypatch,
+        *,
+        provider_credential_policy="inherit",
+        env=None,
+    ):
         import subprocess
         from agent.transports import codex_app_server as cas
 
@@ -340,7 +345,11 @@ class TestSpawnEnvSecretStripping:
                 pass
 
         monkeypatch.setattr(subprocess, "Popen", FakePopen)
-        client = cas.CodexAppServerClient(codex_bin="codex")
+        client = cas.CodexAppServerClient(
+            codex_bin="codex",
+            provider_credential_policy=provider_credential_policy,
+            env=env,
+        )
         client._closed = True
         return captured["env"]
 
@@ -372,9 +381,56 @@ class TestSpawnEnvSecretStripping:
         env = self._capture_spawn_env(monkeypatch)
         assert env.get("OPENAI_API_KEY") == "sk-codex-needs-this"
 
+    def test_oauth_only_strips_provider_keys_and_preserves_safe_env(self, monkeypatch):
+        monkeypatch.setenv("OPENAI_API_KEY", "sk-ambient")
+        monkeypatch.setenv("CODEX_API_KEY", "sk-codex-ambient")
+
+        env = self._capture_spawn_env(
+            monkeypatch,
+            provider_credential_policy="oauth_only",
+            env={
+                "OPENAI_API_KEY": "sk-explicit",
+                "CODEX_API_KEY": "sk-codex-explicit",
+                "REVIEW_RUN_ID": "review-123",
+            },
+        )
+
+        assert "OPENAI_API_KEY" not in env
+        assert "CODEX_API_KEY" not in env
+        assert env["REVIEW_RUN_ID"] == "review-123"
+
+    def test_invalid_provider_credential_policy_is_rejected(self, monkeypatch):
+        import subprocess
+        from agent.transports import codex_app_server as cas
+
+        monkeypatch.setattr(
+            subprocess,
+            "Popen",
+            lambda *args, **kwargs: pytest.fail("invalid policy must reject before spawn"),
+        )
+        with pytest.raises(ValueError, match="provider_credential_policy"):
+            cas.CodexAppServerClient(
+                codex_bin="codex",
+                provider_credential_policy="ambient",
+            )
+
     def test_home_still_preserved_through_helper(self, monkeypatch):
         """Regression guard: routing through hermes_subprocess_env must not
         rewrite HOME (codex's shell tool spawns gh/git/aws that need it)."""
         monkeypatch.setenv("HOME", "/users/alice")
         env = self._capture_spawn_env(monkeypatch)
         assert env.get("HOME") == "/users/alice"
+
+
+class TestProviderCredentialPolicy:
+    @pytest.mark.parametrize("provider", ["openai-codex", "openai_codex", "codex"])
+    def test_subscription_aliases_are_oauth_only(self, provider):
+        from agent.codex_runtime import _codex_provider_credential_policy
+
+        assert _codex_provider_credential_policy(provider) == "oauth_only"
+
+    @pytest.mark.parametrize("provider", ["openai", "openrouter", None])
+    def test_other_providers_keep_existing_inheritance(self, provider):
+        from agent.codex_runtime import _codex_provider_credential_policy
+
+        assert _codex_provider_credential_policy(provider) == "inherit"

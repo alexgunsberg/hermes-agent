@@ -153,6 +153,7 @@ def _build_provider_env_blocklist() -> frozenset:
     blocked.update({
         "OPENAI_BASE_URL",
         "OPENAI_API_KEY",
+        "CODEX_API_KEY",
         "OPENAI_API_BASE",
         "OPENAI_ORG_ID",
         "OPENAI_ORGANIZATION",

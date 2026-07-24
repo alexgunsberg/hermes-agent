@@ -25,6 +25,12 @@ from typing import Any, Dict, List
 logger = logging.getLogger(__name__)
 
 
+def _codex_provider_credential_policy(provider: Any) -> str:
+    """Keep subscription-backed Codex workers on OAuth credentials only."""
+    normalized = str(provider or "").strip().lower().replace("_", "-")
+    return "oauth_only" if normalized in {"openai-codex", "codex"} else "inherit"
+
+
 def _codex_note_to_tool_progress(note: dict) -> tuple[str, str, dict] | None:
     """Map a Codex app-server ``item/started`` notification to a Hermes
     tool-progress event ``(tool_name, preview, args)``.
@@ -391,6 +397,9 @@ def run_codex_app_server_turn(
 
         agent._codex_session = CodexAppServerSession(
             cwd=cwd,
+            provider_credential_policy=_codex_provider_credential_policy(
+                getattr(agent, "provider", None)
+            ),
             approval_callback=approval_callback,
             request_routing=_ServerRequestRouting(
                 auto_approve_exec=auto_approve_requests,

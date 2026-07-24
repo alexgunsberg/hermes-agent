@@ -139,6 +139,22 @@ class TestTurnInputCoercion:
 # ---- lifecycle ----
 
 class TestLifecycle:
+    def test_credential_policy_is_forwarded_to_client_factory(self):
+        captured = {}
+
+        def client_factory(**kwargs):
+            captured.update(kwargs)
+            return FakeClient()
+
+        session = CodexAppServerSession(
+            cwd="/tmp",
+            provider_credential_policy="oauth_only",
+            client_factory=client_factory,
+        )
+        session.ensure_started()
+
+        assert captured["provider_credential_policy"] == "oauth_only"
+
     def test_ensure_started_is_idempotent(self):
         client = FakeClient()
         s = make_session(client)

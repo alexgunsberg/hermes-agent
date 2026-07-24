@@ -23,13 +23,14 @@ import subprocess
 import threading
 import time
 from dataclasses import dataclass, field
-from typing import Any, Optional
+from typing import Any, Literal, Optional
 
 from tools.environments.local import hermes_subprocess_env
 
 # Default minimum codex version we test against. The PR sets this from the
 # `codex --version` parsed at install time; bumping is a one-line change here.
 MIN_CODEX_VERSION = (0, 125, 0)
+ProviderCredentialPolicy = Literal["inherit", "oauth_only"]
 
 
 @dataclass
@@ -74,8 +75,13 @@ class CodexAppServerClient:
         codex_home: Optional[str] = None,
         extra_args: Optional[list[str]] = None,
         env: Optional[dict[str, str]] = None,
+        provider_credential_policy: ProviderCredentialPolicy = "inherit",
     ) -> None:
         self._codex_bin = codex_bin
+        if provider_credential_policy not in {"inherit", "oauth_only"}:
+            raise ValueError(
+                "provider_credential_policy must be 'inherit' or 'oauth_only'"
+            )
         # codex app-server is a model-driving CLI executor: it runs a
         # model-chosen agentic loop that executes shell commands, so it
         # legitimately needs LLM provider credentials (inherit_credentials=True)
@@ -87,9 +93,17 @@ class CodexAppServerClient:
         # centralized helper so Tier-1 + dynamic-internal secrets are always
         # stripped while provider creds still flow, matching copilot_acp_client
         # (#29157 sibling spawn-site gap).
-        spawn_env = hermes_subprocess_env(inherit_credentials=True)
+        spawn_env = hermes_subprocess_env(
+            inherit_credentials=provider_credential_policy == "inherit"
+        )
         if env:
             spawn_env.update(env)
+        if provider_credential_policy == "oauth_only":
+            # Subscription-backed Codex auth is loaded from CODEX_HOME. Never
+            # let ambient or explicitly supplied API keys silently change the
+            # billing/auth path for an OAuth-only worker.
+            spawn_env.pop("OPENAI_API_KEY", None)
+            spawn_env.pop("CODEX_API_KEY", None)
         if codex_home:
             spawn_env["CODEX_HOME"] = codex_home
 
