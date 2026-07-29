@@ -159,9 +159,49 @@ def test_recover_inserts_via_append_message_and_deletes_file(tmp_path, monkeypat
         session_id="20260728_120000_abc",
         role="user",
         content="lost message",
+        platform_message_id="shutdown-flush:test_session_123",
         timestamp=ts,
     )
     assert not flush_file.exists()
+
+
+def test_recover_is_idempotent_when_file_delete_fails(tmp_path, monkeypatch):
+    """A crash after the DB commit must not replay the same flushed turn."""
+    from hermes_state import SessionDB
+
+    flush_dir = _make_flush_dir(tmp_path)
+    monkeypatch.setattr("gateway.shutdown_flush._get_flush_dir", lambda: flush_dir)
+    session_id = "20260728_120000_abc"
+    payload = {
+        "session_key": "agent:main:telegram:supergroup:123",
+        "reason": "shutdown",
+        "ts": int(time.time()),
+        "data": {"text": "recover exactly once", "session_id": session_id},
+    }
+    flush_file = flush_dir / "retry_safe.json"
+    flush_file.write_text(json.dumps(payload), encoding="utf-8")
+
+    db = SessionDB(db_path=tmp_path / "state.db")
+    db.create_session(session_id=session_id, source="telegram")
+    original_unlink = Path.unlink
+    failed_once = False
+
+    def fail_first_unlink(path, *args, **kwargs):
+        nonlocal failed_once
+        if path == flush_file and not failed_once:
+            failed_once = True
+            raise OSError("simulated crash after commit")
+        return original_unlink(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "unlink", fail_first_unlink)
+    try:
+        assert recover_pending_to_db(db) == 1
+        assert flush_file.exists()
+        assert recover_pending_to_db(db) == 0
+        assert not flush_file.exists()
+        assert db.message_count(session_id) == 1
+    finally:
+        db.close()
 
 
 def test_recover_skips_file_without_session_id(tmp_path, monkeypatch):

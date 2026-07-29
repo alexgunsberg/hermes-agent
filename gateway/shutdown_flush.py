@@ -220,7 +220,7 @@ def recover_pending_to_db(
             if not session_id:
                 # Try to extract from the session_key itself — gateway
                 # session keys contain the session_id as the last segment
-                # in some formats, but that's not guaranteed.  Log and
+                # in some formats, but that's not guaranteed. Log and
                 # skip if we can't resolve it.
                 logger.warning(
                     "Cannot recover pending message for %s: no session_id "
@@ -231,10 +231,26 @@ def recover_pending_to_db(
                 )
                 continue
 
+            recovery_message_id = f"shutdown-flush:{path.stem}"
+            has_platform_message_id = getattr(
+                session_db, "has_platform_message_id", None
+            )
+            if (
+                callable(has_platform_message_id)
+                and has_platform_message_id(session_id, recovery_message_id) is True
+            ):
+                # The DB commit can succeed just before unlink fails or the
+                # process exits. Treat the flush filename as a stable dedupe
+                # key so the next startup removes the already-recovered file
+                # instead of duplicating the user turn.
+                path.unlink(missing_ok=True)
+                continue
+
             session_db.append_message(
                 session_id=session_id,
                 role="user",
                 content=text,
+                platform_message_id=recovery_message_id,
                 timestamp=payload.get("ts", int(time.time())),
             )
             recovered += 1

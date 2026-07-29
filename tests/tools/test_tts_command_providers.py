@@ -476,7 +476,7 @@ class TestRunCommandTts:
                 "import sys, time",
                 "for idx in range(4):",
                 "    print(f'tick {idx}', file=sys.stderr, flush=True)",
-                "    time.sleep(0.15)",
+                "    time.sleep(0.75)",
                 "print('done', flush=True)",
             ]),
             encoding="utf-8",
@@ -484,7 +484,7 @@ class TestRunCommandTts:
 
         result = _run_command_tts(
             _shell_command(sys.executable, "-u", str(script)),
-            timeout=0.25,
+            timeout=2.0,
         )
 
         assert result.returncode == 0

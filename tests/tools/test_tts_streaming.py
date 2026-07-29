@@ -6,6 +6,7 @@ synth path are all mocked. Covers the registry/resolver, provider availability,
 the chunked-streamer playback path, and the universal per-sentence sync fallback.
 """
 
+import asyncio
 import queue
 import threading
 from unittest.mock import MagicMock, patch
@@ -118,6 +119,24 @@ def test_never_swaps_provider_for_streaming(monkeypatch):
     # (non-streaming) provider — that would silently change their voice.
     _register_fake(monkeypatch, "elevenlabs")
     assert ts.resolve_streaming_provider({"provider": "edge"}) is None
+
+
+def test_xai_async_bridge_stops_collecting_at_sentence_cap(monkeypatch):
+    """The async bridge must enforce the cap before buffering WS frames."""
+    streamer = ts.XAIStreamer({}, {})
+    yielded = 0
+
+    async def frames(_text):
+        nonlocal yielded
+        for frame in (b"aaa", b"bbb", b"ccc"):
+            yielded += 1
+            yield frame
+
+    monkeypatch.setattr(ts, "_STREAM_SENTENCE_BYTE_CAP", 4)
+    monkeypatch.setattr(streamer, "_async_frames", frames)
+
+    assert asyncio.run(streamer._drain_async("bounded")) == [b"aaa"]
+    assert yielded == 2
 
 
 # ── Built-in provider availability ───────────────────────────────────────
@@ -268,6 +287,7 @@ def test_streamer_path_writes_pcm_to_output(monkeypatch):
     sd, out = _sd_mock()
     q = _drain_queue(["Hello there, this is a full sentence."])
     stop, done = threading.Event(), threading.Event()
+    monkeypatch.setattr(tts_tool.platform, "system", lambda: "Linux")
 
     with patch("tools.tts_streaming.resolve_streaming_provider", return_value=_Fake({}, {})), \
          patch.object(tts_tool, "_import_sounddevice", return_value=sd):

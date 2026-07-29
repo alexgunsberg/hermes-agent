@@ -433,7 +433,15 @@ class XAIStreamer(StreamingTTSProvider):
 
     async def _drain_async(self, text: str) -> List[bytes]:
         frames: List[bytes] = []
+        total = 0
         async for frame in self._async_frames(text):
+            total += len(frame)
+            if total > _STREAM_SENTENCE_BYTE_CAP:
+                logger.warning(
+                    "xAI streaming TTS exceeded %d bytes for one sentence; truncating",
+                    _STREAM_SENTENCE_BYTE_CAP,
+                )
+                break
             frames.append(frame)
         return frames
 

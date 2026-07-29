@@ -56,6 +56,7 @@ class FakeVoiceAdapter:
         self.begin_count = 0
         self.finish_count = 0
         self.abort_count = 0
+        self.abort_called = threading.Event()
 
     def _should_auto_tts_for_chat(self, chat_id):
         return True
@@ -82,6 +83,7 @@ class FakeVoiceAdapter:
 
     async def abort_streaming_tts(self, handle, error=None):
         self.abort_count += 1
+        self.abort_called.set()
         if handle:
             handle.aborted = True
 
@@ -360,13 +362,19 @@ class TestConsumerLifecycle:
             assert consumer.audible is False
             assert consumer.suppress_whole_file is False
             consumer.abort("streaming TTS finalisation timeout")
-            await asyncio.sleep(0.05)
+            await asyncio.wait_for(
+                asyncio.to_thread(adapter.abort_called.wait, 5.0), timeout=5.0
+            )
             assert adapter.abort_count == 1
 
             streamer.allow_first_chunk.set()
-            await consumer.wait_complete(timeout=1.0)
+            await asyncio.wait_for(
+                asyncio.to_thread(streamer.finished.wait, 5.0), timeout=5.0
+            )
+            await consumer.wait_complete(timeout=5.0)
             assert adapter.written_chunks == []
             assert streamer.finished.is_set() is True
+            assert consumer.done is True
 
         _run_test(run)
 
