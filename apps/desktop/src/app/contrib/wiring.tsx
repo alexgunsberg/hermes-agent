@@ -64,7 +64,7 @@ import {
   setMessages
 } from '@/store/session'
 import { clearSessionTodos, setSessionTodos, todosForHydration } from '@/store/todos'
-import { armWakeWord } from '@/store/wake-word'
+import { armWakeWord, resumeWakeAfterVoice } from '@/store/wake-word'
 import { isSecondaryWindow } from '@/store/windows'
 import { useSkinCommand } from '@/themes/use-skin-command'
 
@@ -114,6 +114,7 @@ import { useSessionTileDelegate } from './hooks/use-session-tile-delegate'
 import { $restartPreviewServer, useTitlebarToolContributions } from './panes'
 import { ChatRoutesSurface, SidebarSurface, StatusbarSurface, TerminalSurface } from './surfaces'
 import type { WiringActions, WiringApi } from './types'
+import { routeWakeDetected, type WakeDetectedPayload } from './wake-routing'
 
 // Overlay views the controller mounts over the shell — lazy, load on demand.
 // The workspace-route full-page views (skills/messaging/artifacts) are the
@@ -138,6 +139,7 @@ export function ContribWiring({ children }: { children: ReactNode }) {
 
   const busyRef = useRef(false)
   const creatingSessionRef = useRef(false)
+  const wakeRoutingGenerationRef = useRef(0)
   // Billing recovery routes to Settings → Billing from surfaces without router
   // context (the sticky toast). The shell owns `navigate`, so it consumes the
   // intent counter here; the ref skips the initial mount value.
@@ -675,7 +677,10 @@ export function ContribWiring({ children }: { children: ReactNode }) {
       emitGatewayEvent(event)
 
       if (event.type === 'wake.detected') {
-        const payload = event.payload as { profile?: null | string; start_new_session?: boolean } | undefined
+        const payload = event.payload as WakeDetectedPayload | undefined
+        const wakeRoutingGeneration = ++wakeRoutingGenerationRef.current
+        const freshSessionGeneration = $freshSessionRequest.get()
+        const selectedSessionId = $selectedStoredSessionId.get()
 
         // Audible confirmation that the wake registered, before voice capture
         // starts. Gated by the shared sound-mute toggle.
@@ -685,20 +690,23 @@ export function ContribWiring({ children }: { children: ReactNode }) {
         // re-homes the gateway to that profile first (live swap — same path
         // as clicking it in the profile rail), then opens the fresh session
         // and starts voice there.
-        const targetProfile = payload?.profile?.trim()
         const activeProfile = normalizeProfileKey($activeGatewayProfile.get())
+        const targetProfile = payload?.profile?.trim()
+        const normalizedPayload = targetProfile
+          ? { ...payload, profile: normalizeProfileKey(targetProfile) }
+          : payload
 
-        if (targetProfile && normalizeProfileKey(targetProfile) !== activeProfile) {
-          if (payload?.start_new_session !== false) {
-            newSessionInProfile(targetProfile)
-          } else {
-            void ensureGatewayProfile(normalizeProfileKey(targetProfile))
-          }
-        } else if (payload?.start_new_session !== false) {
-          startFreshSessionDraft()
-        }
-
-        requestVoiceConversationStart()
+        void routeWakeDetected(normalizedPayload, activeProfile, {
+          ensureGatewayProfile,
+          isCurrent: () =>
+            wakeRoutingGeneration === wakeRoutingGenerationRef.current &&
+            freshSessionGeneration === $freshSessionRequest.get() &&
+            selectedSessionId === $selectedStoredSessionId.get(),
+          newSessionInProfile,
+          recoverWakeListening: isCurrent => resumeWakeAfterVoice(undefined, isCurrent),
+          requestVoiceConversationStart,
+          startFreshSessionDraft
+        }).catch(error => console.error('[wake] Failed to route detected wake:', error))
 
         return
       }

@@ -17,6 +17,14 @@ const requester = (impl: (method: string, params?: Record<string, unknown>) => u
     impl(method, params)
   ) as unknown as WakeRequester
 
+function deferred<T>() {
+  let resolve!: (value: T) => void
+  const promise = new Promise<T>(done => {
+    resolve = done
+  })
+  return { promise, resolve }
+}
+
 beforeEach(() => {
   resetWakeWordState()
 })
@@ -255,6 +263,29 @@ describe('applyWakeStartResult', () => {
 })
 
 describe('resumeWakeAfterVoice (post-voice reconcile)', () => {
+  it('stops reconciling when a newer wake supersedes an in-flight resume', async () => {
+    const resumed = deferred<{ resumed: boolean }>()
+    const calls: string[] = []
+    let current = true
+    const request = requester(async method => {
+      calls.push(method)
+
+      if (method === 'wake.resume') {
+        return resumed.promise
+      }
+
+      return { available: true, enabled: true, listening: false }
+    })
+
+    const recovery = resumeWakeAfterVoice(request, () => current)
+    await Promise.resolve()
+    current = false
+    resumed.resolve({ resumed: false })
+    await recovery
+
+    expect(calls).toEqual(['wake.resume'])
+  })
+
   it('re-arms when config says enabled but the listener is down', async () => {
     const calls: string[] = []
 

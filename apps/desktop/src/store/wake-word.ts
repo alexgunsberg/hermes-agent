@@ -252,9 +252,17 @@ const sleep = (ms: number) => new Promise<void>(resolve => setTimeout(resolve, m
  * the ear silently off until the user re-toggled. Resume, then verify against
  * `wake.status` (config `enabled` is the authority) and re-arm, with a couple
  * of spaced retries to ride out mic-release latency. Never passes `persist` —
- * this is a passive path and must not flip config.
+ * this is a passive path and must not flip config. `isCurrent` fences each
+ * async step when a newer wake or user navigation supersedes this recovery.
  */
-export async function resumeWakeAfterVoice(request: WakeRequester = gatewayRequester): Promise<void> {
+export async function resumeWakeAfterVoice(
+  request: WakeRequester = gatewayRequester,
+  isCurrent: () => boolean = () => true
+): Promise<void> {
+  if (!isCurrent()) {
+    return
+  }
+
   try {
     await request('wake.resume', {})
   } catch {
@@ -262,9 +270,22 @@ export async function resumeWakeAfterVoice(request: WakeRequester = gatewayReque
     return
   }
 
+  if (!isCurrent()) {
+    return
+  }
+
   for (let attempt = 0; attempt < 3; attempt++) {
+    if (!isCurrent()) {
+      return
+    }
+
     try {
       const status = await request<WakeStatusResponse>('wake.status', {})
+
+      if (!isCurrent()) {
+        return
+      }
+
       applyWakeStatus(status)
 
       // Config says off (or the feature can't run) — off is the correct rest
@@ -278,6 +299,11 @@ export async function resumeWakeAfterVoice(request: WakeRequester = gatewayReque
       }
 
       const started = await request<WakeStartResponse>('wake.start', { surface: 'gui' })
+
+      if (!isCurrent()) {
+        return
+      }
+
       applyWakeStartResult(started)
 
       if (started?.started) {

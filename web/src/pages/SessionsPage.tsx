@@ -33,6 +33,7 @@ import {
   Archive,
 } from "lucide-react";
 import { api } from "@/lib/api";
+import { LatestRequestGate } from "@/lib/latest-request-gate";
 import { shouldRefreshSessions } from "@/lib/session-refresh";
 import {
   importSummary,
@@ -823,6 +824,7 @@ export default function SessionsPage() {
   >(null);
   const [searching, setSearching] = useState(false);
   const debounceRef = useRef<ReturnType<typeof setTimeout>>(null);
+  const searchRequestGateRef = useRef(new LatestRequestGate());
   const importInputRef = useRef<HTMLInputElement | null>(null);
   const logScrollRef = useRef<HTMLPreElement | null>(null);
   const [status, setStatus] = useState<StatusResponse | null>(null);
@@ -1249,13 +1251,19 @@ export default function SessionsPage() {
   // Debounced FTS search
   useEffect(() => {
     if (debounceRef.current) clearTimeout(debounceRef.current);
+    const gate = searchRequestGateRef.current;
+    const requestId = gate.begin();
 
     if (!search.trim()) {
       debounceRef.current = setTimeout(() => {
+        if (!gate.isCurrent(requestId)) return;
         setSearchResults(null);
         setSearching(false);
       }, 0);
-      return;
+      return () => {
+        if (debounceRef.current) clearTimeout(debounceRef.current);
+        gate.invalidate(requestId);
+      };
     }
 
     debounceRef.current = setTimeout(() => {
@@ -1263,13 +1271,20 @@ export default function SessionsPage() {
       setSearchResults(null);
       api
         .searchSessions(search.trim(), sessionQueryOptions)
-        .then((resp) => setSearchResults(resp.results))
-        .catch(() => setSearchResults(null))
-        .finally(() => setSearching(false));
+        .then((resp) => {
+          if (gate.isCurrent(requestId)) setSearchResults(resp.results);
+        })
+        .catch(() => {
+          if (gate.isCurrent(requestId)) setSearchResults(null);
+        })
+        .finally(() => {
+          if (gate.isCurrent(requestId)) setSearching(false);
+        });
     }, 300);
 
     return () => {
       if (debounceRef.current) clearTimeout(debounceRef.current);
+      gate.invalidate(requestId);
     };
   }, [search, sessionQueryOptions]);
 
