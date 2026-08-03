@@ -616,6 +616,23 @@ class TestAtomicWriteNewFilePermissions:
         assert dest.read_text() == "#!/bin/sh\necho updated\n"
         assert dest.stat().st_mode & 0o777 == 0o755
 
+    def test_failed_write_cleans_temp_in_space_path(self, tmp_path):
+        """The EXIT trap must quote temp paths containing spaces."""
+        parent = tmp_path / "directory with spaces"
+        parent.mkdir()
+        unwritable_target = parent / "unwritable-target"
+        unwritable_target.mkdir()
+        unwritable_target.chmod(0o555)
+        ops = ShellFileOperations(make_real_subprocess_env(str(tmp_path)))
+
+        try:
+            result = ops._atomic_write(str(unwritable_target), "partial data\n")
+        finally:
+            unwritable_target.chmod(0o755)
+
+        assert result.exit_code != 0
+        assert list(parent.glob(".hermes-tmp*")) == []
+
 
 class TestAtomicWriteThroughSymlink:
     """_atomic_write must edit a symlink's target, not replace the link.
