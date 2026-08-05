@@ -321,6 +321,18 @@ def test_capture_output_surfaces_string_exit_code_as_command_error():
     assert "No credential matching" in str(exc_info.value)
 
 
+def test_capture_output_surfaces_arbitrary_exit_code_as_command_error():
+    from hermes_cli.console_engine import ConsoleCommandError, _capture_output
+
+    def _boom():
+        raise SystemExit(RuntimeError("credential backend failed"))
+
+    with pytest.raises(ConsoleCommandError) as exc_info:
+        _capture_output(_boom)
+
+    assert str(exc_info.value) == "credential backend failed"
+
+
 def test_capture_output_preserves_integer_exit_code_message():
     from hermes_cli.console_engine import ConsoleCommandError, _capture_output
 
@@ -328,6 +340,15 @@ def test_capture_output_preserves_integer_exit_code_message():
         _capture_output(lambda: sys.exit(3))
 
     assert "status 3" in str(exc_info.value)
+
+
+def test_capture_output_normalizes_boolean_exit_code_message():
+    from hermes_cli.console_engine import ConsoleCommandError, _capture_output
+
+    with pytest.raises(ConsoleCommandError) as exc_info:
+        _capture_output(lambda: sys.exit(True))
+
+    assert str(exc_info.value) == "Command exited with status 1"
 
 
 def test_execute_handler_string_exit_returns_error_not_crash(_isolate_hermes_home):

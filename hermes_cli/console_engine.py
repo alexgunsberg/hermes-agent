@@ -64,14 +64,16 @@ def _capture_output(fn: Callable[[], object]) -> str:
             if isinstance(result, int) and result:
                 raise SystemExit(result)
         except SystemExit as exc:
-            # sys.exit("msg") / raise SystemExit("msg") is the standard non-zero-exit idiom:
-            # exc.code is the message string, not an int. int() would raise ValueError here,
-            # which escapes execute()'s ConsoleCommandError handler and crashes the REPL.
-            if isinstance(exc.code, str):
-                message = exc.code
-                code = 1
+            # Python treats None as success, integers as explicit statuses,
+            # and every other object as a status-1 message. Preserve that
+            # contract instead of coercing arbitrary objects with int().
+            if exc.code is None:
+                code = 0
+            elif isinstance(exc.code, int):
+                code = int(exc.code)
             else:
-                code = int(exc.code or 0)
+                message = str(exc.code)
+                code = 1
     text = stdout.getvalue() + stderr.getvalue()
     if code:
         raise ConsoleCommandError(message.strip() or text.strip() or f"Command exited with status {code}")
