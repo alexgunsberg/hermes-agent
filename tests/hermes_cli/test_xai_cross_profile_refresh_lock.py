@@ -8,6 +8,8 @@ import threading
 import time
 from pathlib import Path
 
+import pytest
+
 from hermes_cli import auth
 
 
@@ -114,6 +116,18 @@ def _install_rotating_refresh_stub(monkeypatch) -> tuple[dict[str, int], str]:
     return calls, fresh_access
 
 
+def _install_single_profile(
+    tmp_path: Path,
+    thread_state: threading.local,
+    store: dict,
+) -> Path:
+    profile_home = tmp_path / "profiles" / "single"
+    profile_home.mkdir(parents=True, exist_ok=True)
+    (profile_home / "auth.json").write_text(json.dumps(store), encoding="utf-8")
+    thread_state.home = profile_home
+    return profile_home / "auth.json"
+
+
 def test_direct_refresh_serializes_on_shared_root_source(tmp_path, monkeypatch):
     thread_state, root_path = _install_thread_scoped_profile_paths(
         monkeypatch, tmp_path
@@ -166,3 +180,120 @@ def test_pool_refresh_serializes_on_shared_root_source(tmp_path, monkeypatch):
         "xai-oauth"
     ]["tokens"]
     assert root_tokens["refresh_token"] == "refresh-1"
+
+
+def test_direct_refresh_ignores_unusable_profile_shadow(tmp_path, monkeypatch):
+    thread_state, root_path = _install_thread_scoped_profile_paths(
+        monkeypatch, tmp_path
+    )
+    _write_root_state(
+        root_path,
+        _jwt_with_exp(int(time.time()) - 10),
+        "refresh-0",
+    )
+    profile_path = _install_single_profile(
+        tmp_path,
+        thread_state,
+        {
+            "version": 1,
+            "providers": {"xai-oauth": {"tokens": {}, "last_auth_error": {}}},
+        },
+    )
+    _calls, fresh_access = _install_rotating_refresh_stub(monkeypatch)
+
+    resolved = auth.resolve_xai_oauth_runtime_credentials()
+
+    assert resolved["api_key"] == fresh_access
+    root_tokens = json.loads(root_path.read_text(encoding="utf-8"))["providers"][
+        "xai-oauth"
+    ]["tokens"]
+    assert root_tokens["refresh_token"] == "refresh-1"
+    profile_tokens = json.loads(profile_path.read_text(encoding="utf-8"))[
+        "providers"
+    ]["xai-oauth"]["tokens"]
+    assert profile_tokens == {}
+
+
+def test_pool_refresh_ignores_unusable_profile_shadow(tmp_path, monkeypatch):
+    from agent import credential_pool as pool_mod
+
+    thread_state, root_path = _install_thread_scoped_profile_paths(
+        monkeypatch, tmp_path
+    )
+    monkeypatch.setattr(pool_mod, "_global_auth_file_path", lambda: root_path)
+    _write_root_state(
+        root_path,
+        _jwt_with_exp(int(time.time()) - 10),
+        "refresh-0",
+    )
+    profile_path = _install_single_profile(
+        tmp_path,
+        thread_state,
+        {
+            "version": 1,
+            "providers": {"xai-oauth": {"tokens": {}, "last_auth_error": {}}},
+        },
+    )
+    _calls, fresh_access = _install_rotating_refresh_stub(monkeypatch)
+
+    selected = pool_mod.load_pool("xai-oauth").select()
+
+    assert selected is not None
+    assert selected.access_token == fresh_access
+    root_tokens = json.loads(root_path.read_text(encoding="utf-8"))["providers"][
+        "xai-oauth"
+    ]["tokens"]
+    assert root_tokens["refresh_token"] == "refresh-1"
+    profile_tokens = json.loads(profile_path.read_text(encoding="utf-8"))[
+        "providers"
+    ]["xai-oauth"]["tokens"]
+    assert profile_tokens == {}
+
+
+def test_direct_refresh_surfaces_required_root_persistence_failure(
+    tmp_path, monkeypatch
+):
+    thread_state, root_path = _install_thread_scoped_profile_paths(
+        monkeypatch, tmp_path
+    )
+    _write_root_state(
+        root_path,
+        _jwt_with_exp(int(time.time()) - 10),
+        "refresh-0",
+    )
+    _install_single_profile(tmp_path, thread_state, {"version": 1, "providers": {}})
+    _install_rotating_refresh_stub(monkeypatch)
+
+    def _fail_persist(*_args, **_kwargs):
+        raise OSError("simulated root persistence failure")
+
+    monkeypatch.setattr(auth, "_persist_provider_state_to_store", _fail_persist)
+
+    with pytest.raises(OSError, match="simulated root persistence failure"):
+        auth.resolve_xai_oauth_runtime_credentials()
+
+
+def test_pool_refresh_surfaces_required_root_persistence_failure(
+    tmp_path, monkeypatch
+):
+    from agent import credential_pool as pool_mod
+
+    thread_state, root_path = _install_thread_scoped_profile_paths(
+        monkeypatch, tmp_path
+    )
+    monkeypatch.setattr(pool_mod, "_global_auth_file_path", lambda: root_path)
+    _write_root_state(
+        root_path,
+        _jwt_with_exp(int(time.time()) - 10),
+        "refresh-0",
+    )
+    _install_single_profile(tmp_path, thread_state, {"version": 1, "providers": {}})
+    _install_rotating_refresh_stub(monkeypatch)
+
+    def _fail_persist(*_args, **_kwargs):
+        raise OSError("simulated root persistence failure")
+
+    monkeypatch.setattr(auth, "_persist_provider_state_to_store", _fail_persist)
+
+    with pytest.raises(OSError, match="simulated root persistence failure"):
+        pool_mod.load_pool("xai-oauth").select()
