@@ -1396,6 +1396,37 @@ def _provider_state_transaction(provider_id: str):
             yield auth_store, source_state, source_path
 
 
+@contextmanager
+def _xai_oauth_refresh_transaction(
+    *,
+    timeout_seconds: float = AUTH_LOCK_TIMEOUT_SECONDS,
+):
+    """Serialize one xAI refresh across profiles sharing the global root.
+
+    xAI refresh tokens rotate on every use.  A profile lock alone is not a
+    shared boundary: two profiles can each hold their own ``auth.lock`` while
+    spending the same root-fallback refresh token.  Hold the active profile
+    lock and, when distinct, the global-root auth lock for the entire
+    re-read -> refresh POST -> persist sequence.
+
+    The profile-before-root order matches the existing write-through paths,
+    avoiding a lock inversion during rolling upgrades with older processes.
+    Profiles with independent xAI grants are conservatively serialized too;
+    refreshes are rare and correctness is more important than parallelism.
+    """
+    with _auth_store_lock(timeout_seconds=timeout_seconds):
+        active_path = _auth_file_path()
+        global_path = _global_auth_file_path()
+        if global_path is None or _same_path(global_path, active_path):
+            yield
+            return
+        with _auth_store_lock(
+            timeout_seconds=timeout_seconds,
+            target_path=global_path,
+        ):
+            yield
+
+
 def _load_provider_state(auth_store: Dict[str, Any], provider_id: str) -> Optional[Dict[str, Any]]:
     """Return a provider's persisted state.
 
@@ -4994,7 +5025,12 @@ def resolve_xai_oauth_runtime_credentials(
     if (not should_refresh) and refresh_if_expiring:
         should_refresh = _xai_access_token_is_expiring(access_token, effective_skew)
     if should_refresh:
-        with _auth_store_lock(timeout_seconds=max(float(AUTH_LOCK_TIMEOUT_SECONDS), refresh_timeout_seconds + 5.0)):
+        with _xai_oauth_refresh_transaction(
+            timeout_seconds=max(
+                float(AUTH_LOCK_TIMEOUT_SECONDS),
+                refresh_timeout_seconds + 5.0,
+            )
+        ):
             data = _read_xai_oauth_tokens(_lock=False)
             tokens = dict(data["tokens"])
             access_token = str(tokens.get("access_token", "") or "").strip()

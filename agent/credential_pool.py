@@ -1303,14 +1303,27 @@ class CredentialPool:
         # the lock, the in-lock re-sync below picks up the rotated token the
         # winner persisted and skips the POST.
         if self.provider in ("openai-codex", "xai-oauth"):
-            sync_entry = (
-                self._sync_codex_entry_from_auth_store
-                if self.provider == "openai-codex"
-                else self._sync_xai_oauth_entry_from_pool_store
-            )
-            with _auth_store_lock(
-                timeout_seconds=self._single_use_refresh_lock_timeout()
-            ):
+            if self.provider == "openai-codex":
+                sync_entry = self._sync_codex_entry_from_auth_store
+                refresh_transaction = _auth_store_lock(
+                    timeout_seconds=self._single_use_refresh_lock_timeout()
+                )
+            else:
+                # Singleton-seeded xAI entries can resolve from the global
+                # root while each profile persists its own pool mirror.  The
+                # profile pool row is therefore not authoritative across
+                # profiles; re-read the singleton while holding both the
+                # profile and root locks.  Manual entries remain profile-local
+                # and sync from their exact pool row as before.
+                sync_entry = (
+                    self._sync_xai_oauth_entry_from_auth_store
+                    if entry.source == "device_code"
+                    else self._sync_xai_oauth_entry_from_pool_store
+                )
+                refresh_transaction = auth_mod._xai_oauth_refresh_transaction(
+                    timeout_seconds=self._single_use_refresh_lock_timeout()
+                )
+            with refresh_transaction:
                 synced = sync_entry(entry)
                 if self.provider == "openai-codex":
                     if synced is not entry:
