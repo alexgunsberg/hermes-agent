@@ -11,9 +11,9 @@
 
 import assert from 'node:assert/strict'
 
-import { test } from 'vitest'
+import { test, vi } from 'vitest'
 
-import { probeGatewayWebSocket } from './gateway-ws-probe'
+import { probeGatewayWebSocket, probeLocalGatewayWebSocket } from './gateway-ws-probe'
 
 // Minimal WebSocket double: records listeners synchronously (the probe attaches
 // them in its executor) and exposes emit() so the test can replay events.
@@ -114,6 +114,33 @@ test('probe times out when the socket never opens', async () => {
 
   assert.equal(result.ok, false)
   assert.match(result.reason, /Timed out/)
+})
+
+test('local probe survives a cold start longer than the generic ten-second budget', async () => {
+  vi.useFakeTimers()
+  const { FakeWs, instances } = makeFakeWs()
+
+  try {
+    let settled = false
+
+    const promise = probeLocalGatewayWebSocket('ws://127.0.0.1/api/ws?token=t', {
+      WebSocketImpl: FakeWs,
+      readyGraceMs: 10
+    }).then(result => {
+      settled = true
+
+      return result
+    })
+
+    await vi.advanceTimersByTimeAsync(10_001)
+    assert.equal(settled, false)
+
+    instances[0].emit('open')
+    await vi.advanceTimersByTimeAsync(10)
+    assert.deepEqual(await promise, { ok: true })
+  } finally {
+    vi.useRealTimers()
+  }
 })
 
 test('probe fails gracefully when the constructor throws', async () => {

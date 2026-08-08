@@ -26,6 +26,7 @@
  */
 
 const DEFAULT_CONNECT_TIMEOUT_MS = 10_000
+const LOCAL_BACKEND_CONNECT_TIMEOUT_MS = 60_000
 // After the upgrade is accepted, a gateway that rejects the credential
 // post-handshake closes the socket almost immediately. Wait a short grace
 // window: a frame (gateway.ready) or a still-open socket means success; an
@@ -169,6 +170,24 @@ function probeGatewayWebSocket<T>(
   })
 }
 
+/**
+ * A cold desktop-owned backend may still be loading plugins and secret sources
+ * after /api/status is reachable. Give that local startup path a longer bounded
+ * handshake budget without slowing remote-gateway validation failures.
+ */
+function probeLocalGatewayWebSocket<T>(
+  wsUrl: string,
+  options: {
+    WebSocketImpl?: any
+    readyGraceMs?: number
+  } = {}
+) {
+  return probeGatewayWebSocket<T>(wsUrl, {
+    ...options,
+    connectTimeoutMs: LOCAL_BACKEND_CONNECT_TIMEOUT_MS
+  })
+}
+
 function addListener(socket, type, handler) {
   if (typeof socket.addEventListener === 'function') {
     socket.addEventListener(type, handler)
@@ -224,4 +243,10 @@ function closeReason(event, fallback) {
   return fallback
 }
 
-export { DEFAULT_CONNECT_TIMEOUT_MS, DEFAULT_READY_GRACE_MS, probeGatewayWebSocket }
+export {
+  DEFAULT_CONNECT_TIMEOUT_MS,
+  DEFAULT_READY_GRACE_MS,
+  LOCAL_BACKEND_CONNECT_TIMEOUT_MS,
+  probeGatewayWebSocket,
+  probeLocalGatewayWebSocket
+}
