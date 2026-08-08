@@ -87,6 +87,7 @@ import time
 from contextvars import ContextVar, Token
 from dataclasses import dataclass, field
 from pathlib import Path
+from datetime import datetime, timezone
 from typing import Any, Iterable, Mapping, Optional
 
 from hermes_cli.sqlite_util import add_column_if_missing as _add_column_if_missing
@@ -155,6 +156,40 @@ def normalize_reasoning_effort(effort: Optional[str]) -> Optional[str]:
     raise ValueError(
         f"reasoning_effort must be one of {allowed}, got {effort!r}"
     )
+
+
+def normalize_not_before(value: Optional[str]) -> Optional[str]:
+    """Normalize a machine-readable ``not_before`` timestamp into a storable form.
+
+    Accepts either an ISO8601 UTC string or a ``datetime`` (naive is treated
+    as UTC). Returns a canonical ``...Z`` ISO8601 UTC render, or ``None`` when
+    the input is empty/None (no clock gate). Raises ``ValueError`` on anything
+    unparseable — a malformed gate must not silently store ``None`` and make
+    the card immediately actable.
+
+    This function only validates/normalizes the *stored* value. It performs no
+    clock comparison (enforcement belongs to the not-before guard, t_f66a8de1
+    / t_2ae6fdc1).
+    """
+    if value is None:
+        return None
+    if isinstance(value, datetime):
+        dt = value
+    else:
+        raw = str(value).strip()
+        if not raw:
+            return None
+        try:
+            dt = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+        except ValueError:
+            raise ValueError(
+                f"not_before must be ISO8601 UTC (e.g. '2026-08-08T11:26:00Z'), "
+                f"got {value!r}"
+            )
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    # Canonical render: UTC, second precision, trailing Z.
+    return dt.astimezone(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
 
 
 KNOWN_TOOLSET_NAMES = frozenset(name.casefold() for name in get_toolset_names())
@@ -993,6 +1028,12 @@ class Task:
     # Unblock-loop counter. See the column comment in SCHEMA_SQL and
     # ``BLOCK_RECURRENCE_LIMIT``. Reset only on successful completion.
     block_recurrences: int = 0
+    # Optional machine-readable "do not act before" timestamp (ISO8601 UTC,
+    # e.g. ``2026-08-08T11:26:00Z``). Carried by scheduled cards; a downstream
+    # guard uses it to refuse to claim/complete/bypass the card before its
+    # clock gate. ``None`` = no gate. Stored as a canonical ``...Z`` string;
+    # enforcement logic lives elsewhere (see t_f66a8de1 / t_2ae6fdc1).
+    not_before: Optional[str] = None
 
     @classmethod
     def from_row(cls, row: sqlite3.Row) -> "Task":
@@ -1086,6 +1127,9 @@ class Task:
                 int(row["block_recurrences"])
                 if "block_recurrences" in keys and row["block_recurrences"] is not None
                 else 0
+            ),
+            not_before=(
+                row["not_before"] if "not_before" in keys and row["not_before"] else None
             ),
         )
 
@@ -1274,7 +1318,15 @@ CREATE TABLE IF NOT EXISTS tasks (
     -- ``blocked`` so a cron can't spin it forever. Reset to 0 only on a
     -- successful completion — NOT on unblock (resetting on unblock is exactly
     -- the amnesia that let the loop run unbounded).
-    block_recurrences    INTEGER NOT NULL DEFAULT 0
+    block_recurrences    INTEGER NOT NULL DEFAULT 0,
+    -- Optional machine-readable "do not act before" timestamp (ISO8601
+    -- UTC, e.g. ``2026-08-08T11:26:00Z``). Carried by scheduled cards so a
+    -- downstream guard can refuse to claim/complete/bypass the card before
+    -- its clock gate. NULL = no gate (act at any time). Stored as TEXT in a
+    -- canonical ``...Z`` rendering; enforcement logic lives elsewhere — this
+    -- column only persists and round-trips the value. See task t_ebd81989
+    -- (schema) and t_f66a8de1 / t_2ae6fdc1 (enforcement).
+    not_before           TEXT
 );
 
 CREATE TABLE IF NOT EXISTS task_links (
@@ -2474,6 +2526,12 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
             "block_recurrences INTEGER NOT NULL DEFAULT 0",
         )
 
+    if "not_before" not in cols:
+        # Optional machine-readable "do not act before" timestamp (ISO8601 UTC).
+        # NULL on legacy rows = no clock gate, which matches pre-existing
+        # behaviour (everything was schedulable at any time).
+        _add_column_if_missing(conn, "tasks", "not_before", "not_before TEXT")
+
     # Indexes over additive ``tasks`` columns must be created after the
     # columns exist. Keeping them in SCHEMA_SQL breaks legacy boards: SQLite
     # parses each statement in ``executescript`` against the live schema, so a
@@ -2906,6 +2964,7 @@ def create_task(
     board: Optional[str] = None,
     project_id: Optional[str] = None,
     project_source_task_id: Optional[str] = None,
+    not_before: Optional[str] = None,
 ) -> str:
     """Create a new task and optionally link it under parent tasks.
 
@@ -2967,6 +3026,9 @@ def create_task(
         branch_name = str(branch_name).strip() or None
     if branch_name and workspace_kind != "worktree":
         raise ValueError("branch_name is only valid for worktree workspaces")
+    # Normalize + validate the optional not-before clock gate. A malformed
+    # value raises here (before any write); None/empty stores NULL = no gate.
+    not_before = normalize_not_before(not_before)
 
     # Inherit the board's scoped project when the caller didn't name one, so a
     # project-scoped board anchors every new task to that project's repo
@@ -3217,8 +3279,8 @@ def create_task(
                         max_runtime_seconds,
                         skills, max_retries, model_override, provider_override,
                         reasoning_effort,
-                        goal_mode, goal_max_turns, session_id
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        goal_mode, goal_max_turns, session_id, not_before
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         task_id,
@@ -3244,6 +3306,7 @@ def create_task(
                         1 if goal_mode else 0,
                         int(goal_max_turns) if goal_max_turns is not None else None,
                         session_id,
+                        not_before,
                     ),
                 )
                 for pid in parents:
@@ -3268,6 +3331,7 @@ def create_task(
                         "goal_mode": bool(goal_mode) or None,
                         "model_override": model_override,
                         "provider_override": provider_override,
+                        "not_before": not_before,
                     },
                 )
                 _inherit_notify_subs(conn, task_id, parents, created_at=now)
@@ -9341,6 +9405,145 @@ def run_daemon(
 # ---------------------------------------------------------------------------
 # Worker context builder (what a spawned worker sees)
 # ---------------------------------------------------------------------------
+# Optional worker preamble — ops markers from Buzz mem (hosted community
+# engrams, see BUZZ_MEM_SLUG_POLICY). This is STRICTLY best-effort: any
+# failure (binary missing, no relay/key, relay unreachable, slug absent,
+# slug denied) degrades to a one-line note rather than raising, so worker
+# startup / kanban_show never crashes on the absence of Buzz. Disabled by
+# default (no slugs configured) so it adds zero overhead and zero network
+# calls unless an operator opts in via ``kanban.worker_preamble``.
+# ---------------------------------------------------------------------------
+
+# Slugs that are safe to surface in a worker's context. This is enforced
+# even when the operator misconfigures the list — anything outside the
+# allow-list is reported but never read, mirroring the slug policy's
+# default-deny posture. Keys are normalised to lower-case.
+_PREAMBLE_SLUG_ALLOWLIST = frozenset({
+    "sl/", "fw/", "ops/", "bz/",
+})
+
+
+def _resolve_buzz_cli(configured: str = "") -> str:
+    """Resolve the ``buzz`` CLI binary path.
+
+    Order: explicit config value → ``buzz`` on PATH → ``~/bin/buzz``.
+    Returns "" when nothing is found so callers can degrade gracefully.
+    """
+    if configured:
+        p = Path(configured).expanduser()
+        if p.is_file():
+            return str(p)
+    found = shutil.which("buzz")
+    if found:
+        return found
+    fallback = Path.home() / "bin" / "buzz"
+    if fallback.is_file():
+        return str(fallback)
+    return ""
+
+
+def _slug_is_allowed(slug: str) -> bool:
+    """True when ``slug`` begins with an allow-listed namespace."""
+    return any(slug.startswith(ns) for ns in _PREAMBLE_SLUG_ALLOWLIST)
+
+
+def _load_buzz_mem_value(
+    slug: str, *, cli_path: str, timeout: float
+) -> "tuple[Optional[str], Optional[str]]":
+    """Best-effort read of a Buzz mem slug's value.
+
+    Returns ``(value, None)`` on success, ``(None, reason)`` on any
+    failure. The relay URL and Nostr private key are taken from the
+    process environment (``BUZZ_RELAY_URL`` / ``BUZZ_PRIVATE_KEY``), the
+    same mechanism the Buzz platform adapter and CLI use; nothing is
+    logged that could leak the key.
+    """
+    env = os.environ.copy()
+    args = [cli_path, "mem", "get", slug]
+    try:
+        proc = subprocess.run(
+            args,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            env=env,
+            timeout=timeout,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        return None, f"cli error ({type(exc).__name__})"
+    if proc.returncode != 0:
+        err = (proc.stderr or b"").decode("utf-8", "replace").strip()
+        # Guard against accidentally surfacing a key-like value from an
+        # error body: redact anything that looks like a secret.
+        if "nsec" in err.lower() or "private" in err.lower():
+            err = "(auth/relay error)"
+        return None, f"exit {proc.returncode}" + (f": {err[:120]}" if err else "")
+    val = (proc.stdout or b"").decode("utf-8", "replace").strip()
+    return val, None
+
+
+def _build_worker_preamble() -> "list[str]":
+    """Return optional best-effort preamble lines for the worker context.
+
+    No-op (empty list) unless ``kanban.worker_preamble.buzz_mem_slugs`` is
+    configured with at least one allow-listed slug. Every error path is
+    caught and turned into a visible note — this function never raises.
+    """
+    out: "list[str]" = []
+    try:
+        from hermes_cli.config import load_config
+
+        preamble_cfg = (load_config().get("kanban") or {}).get("worker_preamble") or {}
+    except Exception:
+        return out
+
+    raw_slugs = preamble_cfg.get("buzz_mem_slugs") or []
+    slugs = [str(s).strip().lower() for s in raw_slugs if str(s).strip()]
+    if not slugs:
+        return out
+
+    cli_path = _resolve_buzz_cli(str(preamble_cfg.get("buzz_cli_path") or ""))
+    if not cli_path:
+        out.append("## Worker preamble")
+        out.append("")
+        out.append(
+            "_Buzz mem unavailable: `buzz` CLI not found — worker preamble skipped._"
+        )
+        out.append("")
+        return out
+
+    try:
+        timeout = float(preamble_cfg.get("buzz_timeout") or 10.0)
+    except (TypeError, ValueError):
+        timeout = 10.0
+
+    out.append("## Worker preamble")
+    out.append("")
+    out.append(
+        "_Best-effort ops markers loaded from Buzz mem (hosted community "
+        "engram store). Treat as point-in-time; re-verify against the source "
+        "before acting on it as current._"
+    )
+    out.append("")
+    for slug in slugs:
+        if not _slug_is_allowed(slug):
+            out.append(f"- `{slug}`: _denied (not an allow-listed namespace)_")
+            continue
+        try:
+            val, err = _load_buzz_mem_value(slug, cli_path=cli_path, timeout=timeout)
+        except Exception as exc:  # never let the preamble crash worker startup
+            _log.debug("worker preamble: buzz mem get %s failed: %s", slug, exc)
+            out.append(f"- `{slug}`: _unavailable: {type(exc).__name__}_")
+            continue
+        if err:
+            out.append(f"- `{slug}`: _unavailable: {err}_")
+        elif val:
+            out.append(f"- `{slug}`: `{val}`")
+        else:
+            out.append(f"- `{slug}`: _(not set)_")
+    out.append("")
+    return out
+
 
 def build_worker_context(conn: sqlite3.Connection, task_id: str) -> str:
     """Return the full text a worker should read to understand its task.
@@ -9369,6 +9572,14 @@ def build_worker_context(conn: sqlite3.Connection, task_id: str) -> str:
     if not task:
         raise ValueError(f"unknown task {task_id}")
 
+    # Optional worker preamble (best-effort): ops markers from Buzz mem,
+    # surfaced when the board operator opts in via
+    # ``kanban.worker_preamble.buzz_mem_slugs``. Degrades to nothing on
+    # misconfiguration / missing Buzz and never raises (see
+    # _build_worker_preamble). Pre-built so its (possibly empty) output is
+    # stable for the life of this call.
+    preamble_lines = _build_worker_preamble()
+
     # Single clock reading shared by every relative-age stamp below, so all
     # ages in one rendering are consistent ("3h ago" / "3h ago", not drifting
     # by the seconds it takes to build the block).
@@ -9391,6 +9602,8 @@ def build_worker_context(conn: sqlite3.Connection, task_id: str) -> str:
     if task.tenant:
         lines.append(f"Tenant:   {task.tenant}")
     lines.append(f"Workspace: {task.workspace_kind} @ {task.workspace_path or '(unresolved)'}")
+    if task.not_before:
+        lines.append(f"Not-before: {task.not_before} (do not claim/complete before this UTC time)")
     if task.max_runtime_seconds is not None:
         terminal_timeout = _worker_terminal_timeout_env(
             task.max_runtime_seconds,
@@ -9586,6 +9799,13 @@ def build_worker_context(conn: sqlite3.Connection, task_id: str) -> str:
             lines.append(f"comment from worker `{safe_author}` at {ts_disp}:")
             lines.append(_cap(c.body, _CTX_MAX_COMMENT_BYTES))
             lines.append("")
+
+    # Optional worker preamble (Buzz mem markers) — appended last so it
+    # sits beneath the task's own facts and is easy to scroll past when
+    # absent. Empty when not configured, so it never perturbs existing
+    # context layouts.
+    if preamble_lines:
+        lines.extend(preamble_lines)
 
     return "\n".join(lines).rstrip() + "\n"
 

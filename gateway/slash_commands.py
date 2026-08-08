@@ -481,11 +481,31 @@ class GatewaySlashCommandsMixin:
         except Exception as exc:  # pragma: no cover - defensive
             return t("gateway.kanban.error_prefix", error=exc)
 
-        # Auto-subscribe on create. Parse the task id from the CLI's standard
-        # success line ("Created t_abcd  (ready, assignee=...)"). If the user
-        # passed --json we don't subscribe; they're clearly scripting and
-        # can call /kanban notify-subscribe explicitly.
-        if is_create and output:
+        # Auto-subscribe on create only when the install-level notification
+        # gate allows it.  The agent-tool create path already honors this
+        # setting; the slash-command path must do the same or a backup chat
+        # can silently recreate terminal-event fan-out after the user opts out.
+        auto_subscribe = True
+        try:
+            from hermes_cli.config import load_config
+
+            auto_subscribe = bool(
+                cfg_get(
+                    load_config(),
+                    "kanban",
+                    "auto_subscribe_on_create",
+                    default=True,
+                )
+            )
+        except Exception:
+            # Preserve the historical default if config loading fails.
+            pass
+
+        # Parse the task id from the CLI's standard success line
+        # ("Created t_abcd  (ready, assignee=...)"). If the user passed --json
+        # we don't subscribe; they're clearly scripting and can call
+        # /kanban notify-subscribe explicitly.
+        if is_create and output and auto_subscribe:
             m = re.search(r"Created\s+(t_[0-9a-f]+)\b", output)
             if m:
                 task_id = m.group(1)

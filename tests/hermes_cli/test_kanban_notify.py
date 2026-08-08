@@ -3,6 +3,8 @@ import pytest
 
 from pathlib import Path
 from types import SimpleNamespace
+from typing import cast
+from gateway.platforms.base import MessageEvent
 from hermes_cli import kanban_db as kb
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -118,6 +120,42 @@ async def test_gateway_create_autosubscribes_on_explicit_board(kanban_home):
 
     conn = kb.connect(board="default")
     try:
+        assert kb.list_notify_subs(conn) == []
+    finally:
+        conn.close()
+
+
+@pytest.mark.asyncio
+async def test_gateway_create_respects_disabled_auto_subscribe(kanban_home):
+    """A backup gateway must not recreate terminal-event notifications when opted out."""
+    from gateway.run import GatewayRunner
+    from gateway.config import Platform
+
+    (kanban_home / "config.yaml").write_text(
+        "kanban:\n  auto_subscribe_on_create: false\n"
+    )
+    runner = object.__new__(GatewayRunner)
+    event = SimpleNamespace(
+        text='/kanban create "quiet task" --assignee alice',
+        source=SimpleNamespace(
+            platform=Platform.TELEGRAM,
+            chat_id="chat1",
+            chat_type="dm",
+            thread_id="",
+            user_id="u1",
+        ),
+        message_id="462",
+        reply_to_message_id=None,
+    )
+
+    out = await GatewayRunner._handle_kanban_command(
+        runner, cast(MessageEvent, event)
+    )
+
+    assert "subscribed" not in out.lower()
+    conn = kb.connect(board="default")
+    try:
+        assert [task.title for task in kb.list_tasks(conn)] == ["quiet task"]
         assert kb.list_notify_subs(conn) == []
     finally:
         conn.close()

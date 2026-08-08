@@ -1583,3 +1583,120 @@ def test_bare_connect_does_not_close_on_context_exit(tmp_path):
     # Still usable after with-block exit (the leak).
     conn.execute("SELECT 1").fetchone()
     conn.close()  # explicit close to avoid leaking THIS test
+
+
+# ---------------------------------------------------------------------------
+# not_before clock-gate field (task t_ebd81989): schema + persistence +
+# serialization + validation. Enforcement lives in t_f66a8de1 / t_2ae6fdc1.
+# ---------------------------------------------------------------------------
+
+
+def test_not_before_round_trips_through_create_and_get(kanban_home):
+    """A scheduled card can carry an ISO8601 not_before that survives a round-trip."""
+    with kb.connect() as conn:
+        tid = kb.create_task(
+            conn,
+            title="gated destructive child",
+            assignee="default",
+            not_before="2026-08-08T11:26:00Z",
+        )
+        task = kb.get_task(conn, tid)
+    assert task is not None
+    assert task.not_before == "2026-08-08T11:26:00Z"
+    # And it shows up on the persisted row verbatim.
+    with kb.connect() as conn:
+        raw = conn.execute(
+            "SELECT not_before FROM tasks WHERE id = ?", (tid,)
+        ).fetchone()
+    assert raw["not_before"] == "2026-08-08T11:26:00Z"
+
+
+def test_not_before_defaults_to_none(kanban_home):
+    """Cards created without not_before store NULL and stay immediately actable."""
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="no gate", assignee="default")
+        task = kb.get_task(conn, tid)
+    assert task.not_before is None
+    # Schema column exists and is queryable after a fresh migration.
+    with kb.connect() as conn:
+        cols = {r["name"] for r in conn.execute("PRAGMA table_info(tasks)")}
+    assert "not_before" in cols
+
+
+def test_not_before_normalizes_offset_and_naive_to_zulu(kanban_home):
+    """normalize_not_before canonicalizes offsets and naive stamps to UTC ``...Z``."""
+    # +02:00 offset collapses to the equivalent UTC instant.
+    assert (
+        kb.normalize_not_before("2026-08-08T11:26:00+02:00")
+        == "2026-08-08T09:26:00Z"
+    )
+    # Naive stamp is treated as UTC.
+    assert (
+        kb.normalize_not_before("2026-08-08T11:26:00")
+        == "2026-08-08T11:26:00Z"
+    )
+    # Existing Zulu string is preserved (second precision, no microseconds).
+    assert (
+        kb.normalize_not_before("2026-08-08T11:26:00.500000Z")
+        == "2026-08-08T11:26:00Z"
+    )
+
+
+def test_not_before_rejects_malformed_value(kanban_home):
+    """A malformed not_before must raise, never silently store NULL."""
+    with kb.connect() as conn:
+        with pytest.raises(ValueError):
+            kb.create_task(
+                conn,
+                title="bad gate",
+                assignee="default",
+                not_before="not a timestamp",
+            )
+        # No row should have been written on validation failure.
+        rows = conn.execute(
+            "SELECT id FROM tasks WHERE title = 'bad gate'"
+        ).fetchall()
+    assert rows == []
+
+
+def test_not_before_empty_and_none_are_no_gate(kanban_home):
+    """Empty string and None both mean no gate (NULL)."""
+    assert kb.normalize_not_before("") is None
+    assert kb.normalize_not_before(None) is None
+    with kb.connect() as conn:
+        tid = kb.create_task(
+            conn, title="empty gate", assignee="default", not_before=""
+        )
+        task = kb.get_task(conn, tid)
+    assert task.not_before is None
+
+
+def test_not_before_added_by_legacy_migration(tmp_path):
+    """A legacy DB lacking not_before migrates cleanly on open (additive ALTER)."""
+    db_path = tmp_path / "legacy.db"
+    conn = sqlite3.connect(str(db_path))
+    # Minimal pre-not_before tasks table.
+    conn.execute(
+        """
+        CREATE TABLE tasks (
+            id TEXT PRIMARY KEY, title TEXT NOT NULL, body TEXT, assignee TEXT,
+            status TEXT NOT NULL, priority INTEGER NOT NULL DEFAULT 0,
+            created_by TEXT, created_at INTEGER NOT NULL, started_at INTEGER,
+            completed_at INTEGER, workspace_kind TEXT NOT NULL DEFAULT 'scratch',
+            workspace_path TEXT, claim_lock TEXT, claim_expires INTEGER
+        )
+        """
+    )
+    conn.execute(
+        "INSERT INTO tasks (id, title, status, created_at) "
+        "VALUES ('legacy', 'old', 'ready', 1)"
+    )
+    conn.commit()
+    conn.close()
+
+    with kb.connect(db_path=db_path) as migrated:
+        cols = {r["name"] for r in migrated.execute("PRAGMA table_info(tasks)")}
+        assert "not_before" in cols
+        # Legacy row is preserved and reads as no-gate.
+        task = kb.get_task(migrated, "legacy")
+    assert task.not_before is None

@@ -13,6 +13,9 @@ stale value and its ``echo $HERMES_SESSION_ID`` reported a FOREIGN session's id
 The fix strips the per-session bridged vars (HERMES_SESSION_* / UI /
 CRON_AUTO_DELIVER_) from the snapshot at both dump sites in
 ``tools/environments/base.py``; they are re-injected fresh on every command.
+Cron/delegation lineage and profile-location variables are execution identity
+too: persisting any of them can make a later root/profile session fail closed
+as the wrong execution class or read the wrong profile state.
 """
 
 import os
@@ -50,6 +53,12 @@ def test_export_snippet_shape():
     assert "${!HERMES_SESSION_*}" in snippet
     assert "${!HERMES_CRON_AUTO_DELIVER_*}" in snippet
     assert "HERMES_UI_SESSION_ID" in snippet
+    assert "HERMES_CRON_SESSION" in snippet
+    assert "HERMES_DELEGATED_CHILD_CONTEXT" in snippet
+    assert "HERMES_HOME" in snippet
+    assert "HERMES_PROFILE" in snippet
+    assert "HERMES_CONFIG" in snippet
+    assert "HERMES_ENV" in snippet
     assert "grep -vE" not in snippet
     assert '"$__hermes_snap_tmp"' in snippet
     # The redirection must be attached to a brace group wrapping the dump,

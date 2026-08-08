@@ -399,6 +399,13 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
                           help="Initial card status. Use 'blocked' for cards "
                                "that require immediate human ops (R3 gate) "
                                "to skip the brief running-to-blocked transition.")
+    p_create.add_argument("--not-before", default=None, dest="not_before",
+                          metavar="ISO8601_UTC",
+                          help="Optional machine-readable 'do not act before' "
+                               "timestamp (ISO8601 UTC, e.g. "
+                               "'2026-08-08T11:26:00Z'). Stored on the card for "
+                               "a downstream not-before guard to enforce; has no "
+                               "effect on its own until that guard is wired in.")
     p_create.add_argument("--json", action="store_true", help="Emit JSON output")
 
     # --- swarm ---
@@ -1519,6 +1526,7 @@ def _cmd_create(args: argparse.Namespace) -> int:
             goal_mode=bool(getattr(args, "goal_mode", False)),
             goal_max_turns=getattr(args, "goal_max_turns", None),
             initial_status=getattr(args, "initial_status", "running"),
+            not_before=getattr(args, "not_before", None),
         )
         task = kb.get_task(conn, task_id)
     if getattr(args, "json", False):
