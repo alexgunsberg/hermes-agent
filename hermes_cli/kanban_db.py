@@ -3153,6 +3153,22 @@ def create_task(
         if board_default:
             workspace_path = str(board_default)
 
+    # Tenant/project-scoped body templates (deterministic; no LLM).
+    # Suomen Liittokunta implementation cards get the local-first delivery
+    # checklist; unrelated tenants are untouched.
+    try:
+        from hermes_cli.kanban_tenant_templates import apply_local_first_checklist
+
+        _project_slug = getattr(project_obj, "slug", None) if project_obj else None
+        body = apply_local_first_checklist(
+            body,
+            tenant=tenant,
+            project_slug=_project_slug,
+            title=title,
+        )
+    except Exception as _tpl_exc:  # never block task creation on a template
+        _log.debug("kanban body template skipped: %s", _tpl_exc)
+
     # Retry once on the extremely unlikely id collision.
     for attempt in range(2):
         task_id = _new_task_id()
@@ -5994,7 +6010,8 @@ def specify_triage_task(
     assignee = _canonical_assignee(assignee)
     with write_txn(conn):
         existing = conn.execute(
-            "SELECT title, body, assignee FROM tasks WHERE id = ? AND status = 'triage'",
+            "SELECT title, body, assignee, tenant FROM tasks "
+            "WHERE id = ? AND status = 'triage'",
             (task_id,),
         ).fetchone()
         if existing is None:
@@ -6006,10 +6023,29 @@ def specify_triage_task(
             sets.append("title = ?")
             params.append(title.strip())
             changed_fields.append("title")
-        if body is not None and (body or "") != (existing["body"] or ""):
-            sets.append("body = ?")
-            params.append(body)
-            changed_fields.append("body")
+        if body is not None:
+            # Deterministic SL local-first checklist on specify promotion.
+            try:
+                from hermes_cli.kanban_tenant_templates import (
+                    apply_local_first_checklist,
+                )
+
+                effective_title = (
+                    title.strip()
+                    if title is not None and title.strip()
+                    else (existing["title"] or "")
+                )
+                body = apply_local_first_checklist(
+                    body,
+                    tenant=existing["tenant"] if "tenant" in existing.keys() else None,
+                    title=effective_title,
+                )
+            except Exception as _tpl_exc:
+                _log.debug("kanban specify body template skipped: %s", _tpl_exc)
+            if (body or "") != (existing["body"] or ""):
+                sets.append("body = ?")
+                params.append(body)
+                changed_fields.append("body")
         if assignee is not None and assignee != (existing["assignee"] or None):
             sets.append("assignee = ?")
             params.append(assignee)
@@ -6172,6 +6208,21 @@ def decompose_triage_task(
             new_id = _new_task_id()
             title = child["title"].strip()
             body = child.get("body")
+            if not isinstance(body, str):
+                body = None
+            # Deterministic SL local-first checklist on decomposed children.
+            try:
+                from hermes_cli.kanban_tenant_templates import (
+                    apply_local_first_checklist,
+                )
+
+                body = apply_local_first_checklist(
+                    body,
+                    tenant=tenant,
+                    title=title,
+                )
+            except Exception as _tpl_exc:
+                _log.debug("kanban decompose body template skipped: %s", _tpl_exc)
             assignee = _canonical_assignee(child.get("assignee"))
             # Per-child override wins; otherwise inherit the root's
             # workspace. A child that sets workspace_kind without a path
@@ -6202,7 +6253,7 @@ def decompose_triage_task(
                 (
                     new_id,
                     title,
-                    body if isinstance(body, str) else None,
+                    body,
                     assignee,
                     child_ws_kind,
                     child_ws_path,

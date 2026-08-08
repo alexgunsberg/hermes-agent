@@ -312,6 +312,15 @@ def decompose_task(
     )
 
     try:
+        from hermes_cli.kanban_tenant_templates import local_first_prompt_addendum
+
+        system_prompt = _SYSTEM_PROMPT + local_first_prompt_addendum(
+            tenant=getattr(task, "tenant", None),
+        )
+    except Exception:
+        system_prompt = _SYSTEM_PROMPT
+
+    try:
         # Route through call_llm so auxiliary.kanban_decomposer.* config
         # (provider/model/base_url, extra_body, reasoning_effort, retries)
         # all apply — the previous direct client.chat.completions.create()
@@ -319,7 +328,7 @@ def decompose_task(
         resp = call_llm(
             task="kanban_decomposer",
             messages=[
-                {"role": "system", "content": _SYSTEM_PROMPT},
+                {"role": "system", "content": system_prompt},
                 {"role": "user", "content": user_msg},
             ],
             temperature=0.3,
