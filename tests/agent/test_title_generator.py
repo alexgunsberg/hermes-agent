@@ -189,9 +189,11 @@ class TestAutoTitleSession:
 class TestMaybeAutoTitle:
     """Tests for maybe_auto_title() — the fire-and-forget entry point."""
 
-    def test_skips_if_not_first_exchange(self):
-        """Should not fire for conversations with more than 2 user messages."""
+    def test_repairs_without_llm_after_second_exchange(self):
+        """Older untitled sessions use deterministic repair, not a new LLM call."""
         db = MagicMock()
+        db.get_session_title.return_value = None
+        db.set_auto_title_if_empty.return_value = True
         history = [
             {"role": "user", "content": "first"},
             {"role": "assistant", "content": "response 1"},
@@ -207,6 +209,7 @@ class TestMaybeAutoTitle:
             import time
             time.sleep(0.1)
             mock_auto.assert_not_called()
+        db.set_auto_title_if_empty.assert_called_once_with("sess-1", "first")
 
     def test_fires_on_first_exchange(self):
         """Should fire a background thread for the first exchange."""

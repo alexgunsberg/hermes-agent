@@ -84,6 +84,7 @@ import sys
 import threading
 import logging
 import time
+import unicodedata
 from contextvars import ContextVar, Token
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -9062,6 +9063,33 @@ def _retag_legacy_worker_sessions(workspaces_root_path: str) -> None:
         _retagged_workspace_roots.add(workspaces_root_path)
     except Exception as exc:
         _log.debug("kanban worker: legacy session retag skipped (%s)", exc)
+
+
+def kanban_worker_session_title(task: Task) -> str:
+    """Return a meaningful, unique title for a dispatcher-owned worker run.
+
+    The semantic title is already known by the dispatcher, so worker sessions
+    must not depend on the auxiliary title model (quiet one-shot CLI mode does
+    not run that asynchronous hook anyway). The task id suffix preserves the
+    globally unique session-title constraint when cards share a title.
+    """
+    cleaned = []
+    for char in task.title or "":
+        if char.isspace():
+            cleaned.append(" ")
+        elif unicodedata.category(char) not in {"Cc", "Cf"}:
+            cleaned.append(char)
+    base = " ".join("".join(cleaned).split()) or "Kanban task"
+
+    suffix = f" · {task.id}"
+    base_budget = max(1, 80 - len(suffix))
+    if len(base) > base_budget:
+        body_budget = max(1, base_budget - 3)
+        body = base[:body_budget].rstrip()
+        if " " in body:
+            body = body.rsplit(" ", 1)[0].rstrip()
+        base = body + "..."
+    return f"{base}{suffix}"
 
 
 def _default_spawn(

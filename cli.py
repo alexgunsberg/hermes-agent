@@ -18391,6 +18391,7 @@ def main(
             # path or URL into a kanban task body never get it routed to the
             # model's vision input.
             single_query_image_urls: list[str] = []
+            _kanban_session_title: Optional[str] = None
             _kanban_task_id = os.environ.get("HERMES_KANBAN_TASK", "").strip()
             if _kanban_task_id:
                 try:
@@ -18406,6 +18407,8 @@ def main(
                         except Exception:
                             pass
                     _body = getattr(_task, "body", "") if _task is not None else ""
+                    if _task is not None:
+                        _kanban_session_title = _kb.kanban_worker_session_title(_task)
                     if _body:
                         _kb_paths, _kb_urls = _extract_refs(_body)
                         if _kb_paths:
@@ -18420,6 +18423,11 @@ def main(
                 except Exception as _exc:
                     # Best-effort enrichment; never block worker startup on it.
                     logger.debug("kanban image-ref extraction failed: %s", _exc)
+            # Both ``-q`` and fully quiet ``-Q`` workers know the card title
+            # before agent construction. Queue it here so either branch persists
+            # the source-owned title synchronously when the session row is made.
+            if _kanban_session_title:
+                cli._pending_title = _kanban_session_title
             if quiet:
                 # Quiet mode: suppress banner, spinner, tool previews.
                 # Only print the final response and parseable session info.
@@ -18516,6 +18524,25 @@ def main(
                             and cli.agent.session_id != cli.session_id
                         ):
                             cli.session_id = cli.agent.session_id
+                        # A transient pre-turn DB failure can leave a queued
+                        # source-owned title unapplied. Retry on the final
+                        # continuation id after the conversation has persisted.
+                        if cli._pending_title and cli._session_db:
+                            try:
+                                from agent.title_generator import _persist_session_title
+
+                                _persist_session_title(
+                                    cli._session_db,
+                                    cli.session_id,
+                                    cli._pending_title,
+                                )
+                                if cli._session_db.get_session_title(cli.session_id):
+                                    cli._pending_title = None
+                            except Exception:
+                                logger.debug(
+                                    "Could not retry pending one-shot title",
+                                    exc_info=True,
+                                )
                         response = result.get("final_response", "") if isinstance(result, dict) else str(result)
                         # Surface backend errors that produced no visible output
                         # (e.g. invalid model slug → provider 4xx). Mirrors the

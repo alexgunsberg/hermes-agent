@@ -5,7 +5,9 @@ adds latency to the user-facing reply.
 """
 
 import logging
+import re
 import threading
+import unicodedata
 from typing import Callable, Optional
 
 from agent.auxiliary_client import call_llm
@@ -37,6 +39,43 @@ _TITLE_PROMPT_PINNED_LANGUAGE = (
     "following exchange. The title should capture the main topic or intent. "
     "Write the title in {language}. "
     "Return ONLY the title text, nothing else. No quotes, no punctuation at the end, no prefixes."
+)
+
+_TITLE_MAX_CHARS = 80
+_TRUNCATED_TITLE_BODY_CHARS = _TITLE_MAX_CHARS - 3
+
+# Desktop/WebUI transports may prepend workspace metadata and append attachment
+# or memory context to the human's request. Those wrappers are useful to the
+# agent but make terrible outage-path titles ("Workspace::v1…"). Keep this
+# deliberately narrow: only remove wrappers Hermes itself emits.
+_MEMORY_CONTEXT_RE = re.compile(
+    r"<memory-context>.*?</memory-context>", re.IGNORECASE | re.DOTALL
+)
+_UI_METADATA_LINE_RE = re.compile(
+    r"^\s*\[(?:Workspace::v\d+|Attached files?):[^\]\n]*\]\s*$",
+    re.IGNORECASE | re.MULTILINE,
+)
+_GATEWAY_REPLY_PREFIX_RE = re.compile(
+    r'^\[Replying to(?: your previous message)?:.*?\]\r?\n\r?\n',
+    re.IGNORECASE | re.DOTALL,
+)
+_DISCORD_TRIGGER_PREFIX_RE = re.compile(
+    r'^\[Triggering message id: `[^`\r\n]+` — use as `message_id` for '
+    r'reply/react/pin via the discord tools\.\]\r?\n\r?\n',
+    re.IGNORECASE,
+)
+_DOCUMENT_CONTEXT_PREFIX_RE = re.compile(
+    r"^\[The user sent a (?:text )?document:.*?\]\r?\n\r?\n",
+    re.IGNORECASE | re.DOTALL,
+)
+_EXACT_REPLY_PREFIX_RE = re.compile(
+    r"^reply\s+(?:with\s+)?exactly"
+    r"(?:\s+this(?:\s+token)?\s+and\s+nothing\s+else)?\s*[:\-]?\s*",
+    re.IGNORECASE,
+)
+_KANBAN_WORKER_PROMPT_RE = re.compile(
+    r"^work\s+kanban\s+task\s+\S+\s*(?:[:—-]\s*(.*))?$",
+    re.IGNORECASE | re.DOTALL,
 )
 
 
@@ -71,6 +110,17 @@ def _auto_title_enabled() -> bool:
         return True
 
 
+def _clean_title_text(text: str) -> str:
+    """Remove display-control characters and normalize whitespace."""
+    cleaned = []
+    for char in str(text or ""):
+        if char.isspace():
+            cleaned.append(" ")
+        elif unicodedata.category(char) not in {"Cc", "Cf"}:
+            cleaned.append(char)
+    return " ".join("".join(cleaned).split())
+
+
 def _summarize_user_message(user_message: str) -> str:
     """Collapse a slash-skill-expanded turn back to what the user typed.
 
@@ -90,6 +140,75 @@ def _summarize_user_message(user_message: str) -> str:
         logger.debug("Skill-scaffolding summary failed; titling raw", exc_info=True)
         return user_message
     return described if described is not None else user_message
+
+
+def derive_fallback_title(user_message: str) -> Optional[str]:
+    """Derive a bounded, language-preserving title without an LLM call.
+
+    This is the availability path, not a second title-generation heuristic:
+    the LLM remains preferred when reachable. The fallback keeps the first
+    meaningful sentence/clause of what the user actually typed, strips only
+    Hermes-owned transport wrappers, and truncates on a word boundary.
+
+    A bare kanban worker prompt contains identity but no meaning, so it returns
+    ``None`` rather than persisting ``work kanban task t_…`` as a title. Source
+    owners that know the semantic task title should pass that title directly.
+    """
+    if not user_message:
+        return None
+
+    text = _summarize_user_message(str(user_message))
+    # Gateway reply/document context can nest around the Discord trigger note.
+    # Remove only exact producer formats with their blank-line delimiter so
+    # literal user prose such as ``[Replying to: ...] please compare`` survives.
+    for _ in range(3):
+        original = text
+        for prefix in (
+            _GATEWAY_REPLY_PREFIX_RE,
+            _DOCUMENT_CONTEXT_PREFIX_RE,
+            _DISCORD_TRIGGER_PREFIX_RE,
+        ):
+            text = prefix.sub("", text, count=1)
+        if text == original:
+            break
+    text = _MEMORY_CONTEXT_RE.sub(" ", text)
+    text = _UI_METADATA_LINE_RE.sub(" ", text)
+    text = _clean_title_text(text)
+    if not text:
+        return None
+
+    kanban_match = _KANBAN_WORKER_PROMPT_RE.fullmatch(text)
+    if kanban_match:
+        text = (kanban_match.group(1) or "").strip()
+        if not text:
+            return None
+
+    # Smoke/health-check prompts are more useful under the token being checked
+    # than under the repeated boilerplate "Reply exactly…".
+    exact_reply = _EXACT_REPLY_PREFIX_RE.sub("", text, count=1).strip()
+    if exact_reply:
+        text = exact_reply
+
+    text = re.sub(r"^[#>*\-]+\s*", "", text).strip()
+    if not text:
+        return None
+
+    # Prefer the first complete sentence. Do not split decimal/version dots or
+    # punctuation without following whitespace.
+    sentence = re.split(r"(?<=[.!?])\s+", text, maxsplit=1)[0].strip()
+    if sentence:
+        text = sentence
+
+    text = text.rstrip(" \t\r\n.,!?;:—-")
+    if not text:
+        return None
+    if len(text) <= _TITLE_MAX_CHARS:
+        return text
+
+    body = text[:_TRUNCATED_TITLE_BODY_CHARS].rstrip()
+    if " " in body:
+        body = body.rsplit(" ", 1)[0].rstrip(" \t\r\n.,!?;:—-")
+    return body.rstrip(" \t\r\n.,!?;:—-") + "..."
 
 
 def generate_title(
@@ -170,8 +289,8 @@ def generate_title(
         # non-empty line — the closest thing to a title in that response.
         title = next((line.strip() for line in title.splitlines() if line.strip()), "")
         # Enforce reasonable length
-        if len(title) > 80:
-            title = title[:77] + "..."
+        if len(title) > _TITLE_MAX_CHARS:
+            title = title[:_TRUNCATED_TITLE_BODY_CHARS] + "..."
         return title if title else None
     except Exception as e:
         # Log at WARNING so this shows up in agent.log without debug mode.
@@ -301,6 +420,11 @@ def _auto_title_session(
     """Body of :func:`auto_title_session` — see its docstring."""
     if not session_db or not session_id:
         return
+    # ``maybe_auto_title`` checks this before spawning, but keep the worker safe
+    # for direct callers and for a config change between scheduling and execution.
+    if not _auto_title_enabled():
+        logger.debug("Auto-title skipped: auxiliary.title_generation.enabled=false")
+        return
 
     # Check if title already exists (user may have set one via /title before first response)
     try:
@@ -329,28 +453,105 @@ def _auto_title_session(
     # recorded against this session (task='title_generation', #23270).
     set_accounting_context(session_db, session_id)
 
+    generation_failure: list[tuple[str, BaseException]] = []
+
+    def _capture_generation_failure(task_name: str, exc: BaseException) -> None:
+        generation_failure.append((task_name, exc))
+
+    def _surface_generation_failure() -> None:
+        if failure_callback is None or not generation_failure:
+            return
+        try:
+            failure_callback(*generation_failure[0])
+        except Exception:
+            logger.debug("Title generation failure_callback raised", exc_info=True)
+
     title = generate_title(
         user_message,
         assistant_response,
-        failure_callback=failure_callback,
+        # An auxiliary-model outage is no longer user-actionable when the local
+        # fallback succeeds. Delay the external callback until persistence is known.
+        failure_callback=_capture_generation_failure,
         main_runtime=main_runtime,
         runtime_validator=runtime_validator,
     )
+    # Honor a disable that landed while the background request was running.
+    # This also distinguishes config skips (no persistence) from empty output or
+    # runtime-model skips, which may still use the enabled deterministic fallback.
+    if not _auto_title_enabled():
+        logger.debug("Auto-title disabled before persistence; discarding result")
+        return
     if not title:
+        title = derive_fallback_title(user_message)
+    if not title:
+        _surface_generation_failure()
         return
 
     try:
         persisted = _persist_session_title(session_db, session_id, title)
-        if persisted is None:
-            return
-        logger.debug("Auto-generated session title: %s", persisted)
-        if title_callback is not None:
-            try:
-                title_callback(persisted)
-            except Exception:
-                logger.debug("Auto-title callback failed", exc_info=True)
     except Exception as e:
         logger.debug("Failed to set auto-generated title: %s", e)
+        # Do not suppress the original auxiliary outage unless its fallback was
+        # actually persisted (or a concurrent manual title is confirmed below).
+        _surface_generation_failure()
+        return
+
+    if persisted is None:
+        if generation_failure:
+            try:
+                existing = session_db.get_session_title(session_id)
+            except Exception:
+                existing = None
+            if not existing:
+                _surface_generation_failure()
+        return
+
+    logger.debug("Auto-generated session title: %s", persisted)
+    if title_callback is not None:
+        try:
+            title_callback(persisted)
+        except Exception:
+            logger.debug("Auto-title callback failed", exc_info=True)
+
+
+def _repair_title_from_history(
+    session_db,
+    session_id: str,
+    conversation_history: list,
+    current_user_message: str,
+    title_callback: Optional[TitleCallback] = None,
+) -> None:
+    """Synchronously repair an older untitled session without another LLM call."""
+    candidate = None
+    for message in conversation_history or []:
+        if not isinstance(message, dict) or message.get("role") != "user":
+            continue
+        content = message.get("content")
+        if not isinstance(content, str):
+            continue
+        candidate = derive_fallback_title(content)
+        if candidate:
+            break
+    if not candidate:
+        candidate = derive_fallback_title(current_user_message)
+    if not candidate:
+        return
+    # Honor a config toggle that races with history scanning.
+    if not _auto_title_enabled():
+        return
+
+    try:
+        persisted = _persist_session_title(session_db, session_id, candidate)
+    except Exception:
+        # A later turn will retry. Keep this path quiet because the primary
+        # conversation already succeeded and there is no auxiliary outage to fix.
+        logger.debug("Deterministic session-title repair failed", exc_info=True)
+        return
+    if persisted and title_callback is not None:
+        try:
+            title_callback(persisted)
+        except Exception:
+            logger.debug("Auto-title repair callback failed", exc_info=True)
 
 
 def maybe_auto_title(
@@ -364,27 +565,40 @@ def maybe_auto_title(
     title_callback: Optional[TitleCallback] = None,
     runtime_validator: Optional[RuntimeValidator] = None,
 ) -> None:
-    """Fire-and-forget title generation after the first exchange.
+    """Create or repair a semantic title after a completed exchange.
 
-    Only generates a title when:
-    - This appears to be the first user→assistant exchange
-    - No title is already set
+    The first two exchanges use asynchronous LLM-preferred generation. Later
+    turns synchronously repair a still-untitled session from its earliest
+    meaningful user request, without another model call. Explicit/manual titles
+    and the auto-title disable switch remain authoritative.
     """
     if not session_db or not session_id or not user_message or not assistant_response:
         return
 
-    # Count user messages in history to detect first exchange.
-    # conversation_history includes the exchange that just happened,
-    # so for a first exchange we expect exactly 1 user message
-    # (or 2 counting system). Be generous: generate on first 2 exchanges.
-    user_msg_count = sum(1 for m in (conversation_history or []) if m.get("role") == "user")
-    if user_msg_count > 2:
+    try:
+        if session_db.get_session_title(session_id):
+            return
+    except Exception:
+        logger.debug("Could not check existing session title", exc_info=True)
         return
 
-    # Config read comes after the cheap first-exchange guard so the file
-    # isn't touched on every subsequent turn of a long session.
     if not _auto_title_enabled():
         logger.debug("Auto-title skipped: auxiliary.title_generation.enabled=false")
+        return
+
+    user_msg_count = sum(
+        1
+        for message in (conversation_history or [])
+        if isinstance(message, dict) and message.get("role") == "user"
+    )
+    if user_msg_count > 2:
+        _repair_title_from_history(
+            session_db,
+            session_id,
+            conversation_history,
+            user_message,
+            title_callback=title_callback,
+        )
         return
 
     thread = threading.Thread(

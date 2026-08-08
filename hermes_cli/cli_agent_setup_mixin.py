@@ -330,6 +330,47 @@ class CLIAgentSetupMixin:
         route["request_overrides"] = overrides
         return route
 
+    def _apply_pending_session_title(self) -> None:
+        """Persist a queued title once the agent owns a durable session row.
+
+        Interactive ``/title`` keeps strict duplicate rejection and its visible
+        status line. Quiet one-shot source titles use the auto-title compare-and-
+        set/dedupe path and never contaminate machine-readable stdout.
+        """
+        if not self._pending_title or not self._session_db or not self.agent:
+            return
+
+        from cli import _cprint, logger
+
+        try:
+            self.agent._ensure_db_session()
+            if not self.agent._session_db_created:
+                return
+            if getattr(self, "_single_query_mode", False):
+                from agent.title_generator import _persist_session_title
+
+                persisted_title = _persist_session_title(
+                    self._session_db,
+                    self.session_id,
+                    self._pending_title,
+                )
+                if persisted_title:
+                    self._pending_title = None
+                return
+
+            self._session_db.set_session_title(
+                self.session_id,
+                self._pending_title,
+            )
+            _cprint(f"  Session title applied: {self._pending_title}")
+            self._pending_title = None
+        except Exception as e:
+            if not getattr(self, "_single_query_mode", False):
+                _cprint(f"  Could not apply pending title: {e}")
+            else:
+                logger.debug("Could not apply pending one-shot title: %s", e)
+            # Keep _pending_title so it can be retried after row creation succeeds.
+
     def _init_agent(self, *, model_override: str = None, runtime_override: dict = None, request_overrides: dict | None = None) -> bool:
         """
         Initialize the agent on first use.
@@ -567,18 +608,9 @@ class CLIAgentSetupMixin:
                 tuple(runtime.get("args") or ()),
             )
 
-            # Force-create DB row on /title intent, then apply title.
-            if self._pending_title and self._session_db and self.agent:
-                try:
-                    self.agent._ensure_db_session()
-                    if self.agent._session_db_created:
-                        self._session_db.set_session_title(self.session_id, self._pending_title)
-                        _cprint(f"  Session title applied: {self._pending_title}")
-                        self._pending_title = None
-                    # else: row creation failed transiently — keep _pending_title for retry
-                except (ValueError, Exception) as e:
-                    _cprint(f"  Could not apply pending title: {e}")
-                    # Keep _pending_title so it can be retried after row creation succeeds
+            # Force-create DB row on /title or source-owned title intent, then
+            # apply it without contaminating quiet one-shot stdout.
+            self._apply_pending_session_title()
             return True
         except Exception as e:
             console = ChatConsole()
