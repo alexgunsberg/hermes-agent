@@ -2460,6 +2460,7 @@ from gateway.restart import (
     DEFAULT_GATEWAY_RESTART_DRAIN_TIMEOUT,
     GATEWAY_FATAL_CONFIG_EXIT_CODE,
     GATEWAY_SERVICE_RESTART_EXIT_CODE,
+    is_global_startup_conflict,
     parse_restart_after_turn_timeout,
     parse_restart_drain_timeout,
 )
@@ -11295,7 +11296,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         connected_count = 0
         enabled_platform_count = 0
-        startup_nonretryable_errors: list[str] = []
+        # Each entry: (platform_value, error_code|None, human message)
+        startup_nonretryable_errors: list[tuple[str, str | None, str]] = []
         startup_retryable_errors: list[str] = []
         
         # Initialize and connect each configured platform
@@ -11401,14 +11403,17 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                             error_code=adapter.fatal_error_code,
                             error_message=adapter.fatal_error_message,
                         )
-                        target = (
-                            startup_retryable_errors
-                            if adapter.fatal_error_retryable
-                            else startup_nonretryable_errors
-                        )
-                        target.append(
-                            f"{platform.value}: {adapter.fatal_error_message}"
-                        )
+                        detail = f"{platform.value}: {adapter.fatal_error_message}"
+                        if adapter.fatal_error_retryable:
+                            startup_retryable_errors.append(detail)
+                        else:
+                            startup_nonretryable_errors.append(
+                                (
+                                    platform.value,
+                                    adapter.fatal_error_code,
+                                    adapter.fatal_error_message or detail,
+                                )
+                            )
                         # Queue for reconnection if the error is retryable
                         if adapter.fatal_error_retryable:
                             self._failed_platforms[platform] = {
@@ -11519,9 +11524,38 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     _skipped.value,
                 )
 
+        # When no platform connected, decide between fatal exit-78 (true
+        # single-writer conflicts only) and degraded continue (platform-local
+        # auth/config). Track local-only degrade so we do not clobber the
+        # diagnostic gateway_state with a later "running" write.
+        startup_local_degraded = False
         if connected_count == 0:
-            if startup_nonretryable_errors and not startup_retryable_errors:
-                reason = "; ".join(startup_nonretryable_errors)
+            def _format_nonretryable(entries: list[tuple[str, str | None, str]]) -> str:
+                return "; ".join(f"{plat}: {msg}" for plat, _code, msg in entries)
+
+            global_conflicts = [
+                entry
+                for entry in startup_nonretryable_errors
+                if is_global_startup_conflict(entry[1], entry[2])
+            ]
+            local_nonretryable = [
+                entry
+                for entry in startup_nonretryable_errors
+                if not is_global_startup_conflict(entry[1], entry[2])
+            ]
+
+            # True single-writer / exclusive-ownership conflicts remain fatal
+            # whenever nothing is connected and nothing is merely retryable.
+            # Platform-local auth/config failures alone must not kill
+            # cron/Kanban/other gateway duties (production: optional Buzz
+            # relay_membership_required previously exited 78).
+            if global_conflicts and not startup_retryable_errors:
+                reason = _format_nonretryable(global_conflicts)
+                if local_nonretryable:
+                    reason = (
+                        f"{reason}; also parked: "
+                        f"{_format_nonretryable(local_nonretryable)}"
+                    )
                 logger.error("Gateway hit a non-retryable startup conflict: %s", reason)
                 try:
                     from gateway.status import write_runtime_status
@@ -11533,26 +11567,33 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 self._startup_restore_in_progress = False
                 return True
             if startup_nonretryable_errors:
-                # Mixed failure mode (NS-609): some platforms are fatally
-                # misconfigured (e.g. WhatsApp enabled but never paired) while
-                # others hit merely transient errors (e.g. Telegram TimedOut
-                # during polling startup).  Exiting with
+                # Platform-local-only and/or mixed-with-retryable failure mode
+                # (NS-609 + optional-platform isolation). Exiting with
                 # GATEWAY_FATAL_CONFIG_EXIT_CODE here is wrong in both
                 # supervision worlds: under supervisors that honor the
                 # exit-78 contract (systemd RestartPreventExitStatus, s6
                 # finish→125 since #51228) the gateway goes PERMANENTLY down
-                # over a network blip; under anything else it crash-loops.
-                # Either way the retryable platforms never get their retry.
-                # Log the fatal side loudly, then fall through to the
-                # degraded/retry path below: the reconnect watcher recovers
-                # the retryable platforms; the non-retryable ones remain
-                # fatal-parked and visible in runtime status.
+                # over an optional adapter; under anything else it crash-loops.
+                # Log the fatal side loudly, then fall through so cron/Kanban
+                # and any retryable platforms keep running; non-retryable
+                # adapters remain fatal-parked in runtime status.
                 logger.error(
                     "%d platform(s) fatally misconfigured and parked: %s. "
-                    "Staying alive so retryable platforms can recover.",
+                    "Staying alive so gateway duties and any recoverable "
+                    "platforms can continue.",
                     len(startup_nonretryable_errors),
-                    "; ".join(startup_nonretryable_errors),
+                    _format_nonretryable(startup_nonretryable_errors),
                 )
+                if local_nonretryable and not startup_retryable_errors:
+                    startup_local_degraded = True
+                    try:
+                        from gateway.status import write_runtime_status
+                        write_runtime_status(
+                            gateway_state="degraded",
+                            exit_reason=None,
+                        )
+                    except Exception:
+                        pass
             if enabled_platform_count > 0:
                 if startup_retryable_errors:
                     # All enabled platforms hit retryable failures (network
@@ -11581,16 +11622,17 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         pass
                     # Fall through to the normal "running" state — reconnect
                     # watcher takes it from here.
-                # All enabled platforms had no adapter (missing library or credentials).
-                # In fleet deployments the same config.yaml is shared across nodes that
-                # may only have credentials for a subset of platforms.  Rather than
-                # failing hard, degrade gracefully and allow cron jobs to run (#5196).
-                logger.warning(
-                    "No adapter could be created for any of the %d configured platform(s). "
-                    "Check that required dependencies are installed and credentials are set. "
-                    "Gateway will continue for cron job execution.",
-                    enabled_platform_count,
-                )
+                elif not startup_nonretryable_errors:
+                    # All enabled platforms had no adapter (missing library or credentials).
+                    # In fleet deployments the same config.yaml is shared across nodes that
+                    # may only have credentials for a subset of platforms.  Rather than
+                    # failing hard, degrade gracefully and allow cron jobs to run (#5196).
+                    logger.warning(
+                        "No adapter could be created for any of the %d configured platform(s). "
+                        "Check that required dependencies are installed and credentials are set. "
+                        "Gateway will continue for cron job execution.",
+                        enabled_platform_count,
+                    )
             else:
                 logger.warning("No messaging platforms enabled.")
                 logger.info("Gateway will continue running for cron job execution.")
@@ -11602,7 +11644,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         self._wire_teams_pipeline_runtime()
 
         self._running = True
-        self._update_runtime_status("running")
+        # Preserve degraded diagnostics when optional platforms are parked and
+        # nothing connected; platform fatal state already holds the detail.
+        if not startup_local_degraded:
+            self._update_runtime_status("running")
 
         # Loop-liveness heartbeat (#66892): an asyncio task so a frozen loop
         # stops refreshing ``state/gateway.heartbeat``. Cancelled with the

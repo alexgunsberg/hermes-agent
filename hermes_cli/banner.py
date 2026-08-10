@@ -127,6 +127,19 @@ _UPDATE_CHECK_CACHE_SECONDS = 6 * 3600
 # (e.g. nix-built hermes — no local git history to count against).
 UPDATE_AVAILABLE_NO_COUNT = -1
 
+# How many extra commits to pull when recovering a countable merge-base on a
+# shallow installer checkout. Bounded so passive checks never unshallow the
+# whole history; enough that typical candidate lag becomes countable.
+_SHALLOW_DEEPEN_COMMITS = 200
+
+# ``shallow.lock`` is only held for the duration of a fetch that rewrites the
+# shallow boundary. Anything older than this is treated as abandoned debris
+# from a crashed/interrupted fetch. We deliberately do NOT sweep
+# index.lock / HEAD.lock / packed-refs.lock — those can be held by a live
+# concurrent git process (status, commit, rebase) and unlinking them races
+# that process.
+_STALE_SHALLOW_LOCK_MIN_AGE_SECONDS = 120
+
 _UPSTREAM_REPO_URL = "https://github.com/NousResearch/hermes-agent.git"
 _OFFICIAL_REPO_CANONICAL = "github.com/nousresearch/hermes-agent"
 
@@ -182,6 +195,94 @@ def _git_stdout(args: list[str], *, cwd: Path, timeout: int = 5) -> Optional[str
     return (result.stdout or "").strip()
 
 
+def _resolve_git_dirs(repo_dir: Path) -> list[Path]:
+    """Return unique absolute git-dir paths for ``repo_dir``.
+
+    Linked worktrees / candidate installs share objects via the *common*
+    git dir (``git rev-parse --git-common-dir``). Lock files written by a
+    fetch live there, not in the per-worktree git dir — so callers that
+    only look at ``repo_dir / ".git"`` miss the debris that actually
+    wedges subsequent fetches.
+    """
+    dirs: list[Path] = []
+    for flag in ("--git-common-dir", "--git-dir"):
+        raw = _git_stdout(["rev-parse", flag], cwd=repo_dir)
+        if not raw:
+            continue
+        root = Path(raw)
+        if not root.is_absolute():
+            root = (repo_dir / root).resolve()
+        else:
+            root = root.resolve()
+        if root not in dirs:
+            dirs.append(root)
+    return dirs
+
+
+def _clear_stale_shallow_locks(
+    repo_dir: Path,
+    *,
+    min_age_seconds: Optional[int] = None,
+    now: Optional[float] = None,
+) -> list[str]:
+    """Remove abandoned ``shallow.lock`` files that block deepen/fetch.
+
+    Scope is intentionally narrow:
+
+    * only ``shallow.lock`` (never index/HEAD/packed-refs locks — those can
+      be held by a live concurrent git process);
+    * only when the lock's mtime is older than
+      :data:`_STALE_SHALLOW_LOCK_MIN_AGE_SECONDS` (live fetches finish well
+      under that window; younger locks are presumed in use);
+    * both ``--git-common-dir`` and ``--git-dir`` so shared-git candidate
+      worktrees are covered.
+
+    Returns the list of removed paths. Never raises.
+    """
+    removed: list[str] = []
+    age = (
+        _STALE_SHALLOW_LOCK_MIN_AGE_SECONDS
+        if min_age_seconds is None
+        else min_age_seconds
+    )
+    cutoff = (time.time() if now is None else now) - age
+    try:
+        for root in _resolve_git_dirs(repo_dir):
+            lock = root / "shallow.lock"
+            try:
+                if lock.is_file() and lock.stat().st_mtime < cutoff:
+                    lock.unlink()
+                    removed.append(str(lock))
+                    logger.info("Removed stale git shallow.lock at %s", lock)
+            except OSError:
+                logger.debug("Could not clear %s (skipping)", lock, exc_info=True)
+    except Exception:
+        logger.debug("stale shallow.lock sweep failed", exc_info=True)
+    return removed
+
+
+def _count_commits_behind(repo_dir: Path, target_ref: str) -> Optional[int]:
+    """Return ``rev-list --count HEAD..<target_ref>`` when countable."""
+    try:
+        result = subprocess.run(
+            ["git", "rev-list", "--count", f"HEAD..{target_ref}"],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=5,
+            cwd=str(repo_dir),
+        )
+    except Exception:
+        return None
+    if result.returncode != 0:
+        return None
+    text = (result.stdout or "").strip()
+    if not text.isdigit():
+        return None
+    return int(text)
+
+
 def _check_via_rev(local_rev: str) -> Optional[int]:
     """Compare an embedded git revision to upstream main via ls-remote.
 
@@ -214,16 +315,22 @@ def _check_via_local_git(repo_dir: Path) -> Optional[int]:
             return 1
         return checked
 
-    # Installer checkouts are shallow (`git clone --depth 1`). On a shallow
-    # clone the history stops at a single commit, so a plain `git fetch` would
-    # unshallow the repo (dragging in the whole history) and
-    # `rev-list --count HEAD..origin/main` would report a huge bogus "behind"
-    # number (e.g. "12492 commits behind"). Detect shallow up front: fetch with
-    # --depth 1 to preserve the boundary and compare tip SHAs instead of
-    # counting. Full clones (developers, Docker dev images) keep the exact
-    # count path unchanged. Mirrors the desktop fix in apps/desktop/electron/main.cjs.
+    # Installer / candidate checkouts are often shallow (`git clone --depth 1`
+    # or a linked worktree sharing a shallow common dir). A plain unscoped
+    # fetch would unshallow the whole history, and ``rev-list --count`` without
+    # a merge-base walks remote ancestry into a huge bogus "behind" number
+    # (see #51922). Strategy:
+    #   1. Clear abandoned shallow.lock debris (common-dir aware).
+    #   2. Refresh with ``--deepen N`` — never ``--depth 1``, which re-shallows
+    #      and destroys any previously recovered merge-base.
+    #   3. Tip-equal → 0. Tip-differs → deepen again, count only when
+    #      merge-base exists; otherwise fall back to UPDATE_AVAILABLE_NO_COUNT
+    #      (Desktop maps -1 → "(update)", >0 → "(+N)").
+    # Full clones keep the exact ``HEAD..origin/main`` count path.
     shallow = _git_stdout(["rev-parse", "--is-shallow-repository"], cwd=repo_dir)
     is_shallow = shallow == "true"
+
+    _clear_stale_shallow_locks(repo_dir)
 
     try:
         # Scope the fetch to the one branch the behind-count compares against.
@@ -236,7 +343,7 @@ def _check_via_local_git(repo_dir: Path) -> Optional[int]:
         # scoped fetch also updates.
         fetch_args = ["git", "fetch", "origin", "main"]
         if is_shallow:
-            fetch_args += ["--depth", "1"]
+            fetch_args += ["--deepen", str(_SHALLOW_DEEPEN_COMMITS)]
         fetch_args.append("--quiet")
         subprocess.run(
             fetch_args,
@@ -247,9 +354,10 @@ def _check_via_local_git(repo_dir: Path) -> Optional[int]:
         pass  # Offline or timeout — use stale refs, that's fine
 
     if is_shallow:
-        # No history to count across the shallow boundary. `origin/main` may not
-        # be a tracking ref in a `clone --depth 1`, so prefer FETCH_HEAD (just
-        # updated by the fetch above) and fall back to origin/main.
+        # Depth-1 clones can compare tips, but tip inequality alone cannot
+        # produce a commit count. Prefer FETCH_HEAD (just updated above), then
+        # origin/main. When tips differ, deepen enough to connect history and
+        # return a real rev-list count when merge-base exists.
         head_rev = _git_stdout(["rev-parse", "HEAD"], cwd=repo_dir)
         target_rev = (
             _git_stdout(["rev-parse", "FETCH_HEAD"], cwd=repo_dir)
@@ -257,19 +365,47 @@ def _check_via_local_git(repo_dir: Path) -> Optional[int]:
         )
         if not head_rev or not target_rev:
             return None
-        return 0 if head_rev == target_rev else UPDATE_AVAILABLE_NO_COUNT
+        if head_rev == target_rev:
+            return 0
 
-    try:
-        result = subprocess.run(
-            ["git", "rev-list", "--count", "HEAD..origin/main"],
-            capture_output=True, text=True, encoding="utf-8", errors="replace",
-            timeout=5,
-            cwd=str(repo_dir),
+        # Best-effort second deepen so HEAD..upstream is countable. Ignore
+        # failures (offline / immutable). Scoped to main to match the fetch
+        # above. Clear abandoned shallow.lock again first — a crashed first
+        # deepen is exactly how the lock gets left behind.
+        _clear_stale_shallow_locks(repo_dir)
+        try:
+            subprocess.run(
+                [
+                    "git",
+                    "fetch",
+                    "--deepen",
+                    str(_SHALLOW_DEEPEN_COMMITS),
+                    "origin",
+                    "main",
+                    "--quiet",
+                ],
+                capture_output=True,
+                timeout=30,
+                cwd=str(repo_dir),
+            )
+        except Exception:
+            pass
+
+        target_ref = (
+            "FETCH_HEAD"
+            if _git_stdout(["rev-parse", "FETCH_HEAD"], cwd=repo_dir)
+            else "origin/main"
         )
-        if result.returncode == 0:
-            return int(result.stdout.strip())
-    except Exception:
-        pass
+        merge_base = _git_stdout(["merge-base", "HEAD", target_ref], cwd=repo_dir)
+        if merge_base:
+            counted = _count_commits_behind(repo_dir, target_ref)
+            if counted is not None:
+                return counted
+        return UPDATE_AVAILABLE_NO_COUNT
+
+    counted = _count_commits_behind(repo_dir, "origin/main")
+    if counted is not None:
+        return counted
     return None
 
 

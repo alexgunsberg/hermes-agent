@@ -27,6 +27,27 @@ def test_managed_env_beats_user_env(env_homes, monkeypatch):
     assert os.environ["OPENAI_API_BASE"] == "https://org.example/v1"
 
 
+def test_managed_env_beats_shell(env_homes, monkeypatch):
+    from hermes_cli.env_loader import load_hermes_dotenv
+
+    home, managed = env_homes
+    monkeypatch.setenv("OPENAI_API_BASE", "https://shell.example/v1")
+    (managed / ".env").write_text("OPENAI_API_BASE=https://org.example/v1\n", encoding="utf-8")
+    load_hermes_dotenv(hermes_home=str(home))
+    assert os.environ["OPENAI_API_BASE"] == "https://org.example/v1"
+
+
+def test_managed_env_leaves_unmanaged_keys_alone(env_homes, monkeypatch):
+    from hermes_cli.env_loader import load_hermes_dotenv
+
+    home, managed = env_homes
+    (home / ".env").write_text("USER_ONLY=keepme\n", encoding="utf-8")
+    (managed / ".env").write_text("OPENAI_API_BASE=https://org.example/v1\n", encoding="utf-8")
+    load_hermes_dotenv(hermes_home=str(home))
+    assert os.environ["USER_ONLY"] == "keepme"
+    assert os.environ["OPENAI_API_BASE"] == "https://org.example/v1"
+
+
 def test_no_managed_env_is_noop(env_homes, monkeypatch):
     from hermes_cli.env_loader import load_hermes_dotenv
 
@@ -35,3 +56,25 @@ def test_no_managed_env_is_noop(env_homes, monkeypatch):
     (home / ".env").write_text("SOME_VALUE=from_user\n", encoding="utf-8")
     load_hermes_dotenv(hermes_home=str(home))
     assert os.environ["SOME_VALUE"] == "from_user"
+
+
+def test_managed_env_permission_error_does_not_block_startup(env_homes, monkeypatch):
+    from hermes_cli import managed_scope
+    from hermes_cli.env_loader import load_hermes_dotenv
+
+    class UnreadableManagedEnv:
+        def exists(self):
+            raise PermissionError("managed .env is not readable")
+
+    class ManagedDir:
+        def __truediv__(self, name):
+            assert name == ".env"
+            return UnreadableManagedEnv()
+
+    home, _managed = env_homes
+    (home / ".env").write_text("USER_ONLY=keepme\n", encoding="utf-8")
+    monkeypatch.setattr(managed_scope, "get_managed_dir", lambda: ManagedDir())
+
+    load_hermes_dotenv(hermes_home=str(home))
+
+    assert os.environ["USER_ONLY"] == "keepme"
