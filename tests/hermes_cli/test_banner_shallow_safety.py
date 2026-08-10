@@ -101,13 +101,13 @@ def test_real_shallow_clone_equal_tips_no_progressive_deepen(tmp_path):
     before = _reachable_count(clone)
     assert before == 1
 
-    behind1, err1, rev1 = banner._check_via_local_git(clone)
+    behind1, err1, rev1, _ = banner._check_via_local_git_details(clone)
     assert err1 is None
     assert behind1 == 0
     assert rev1
     mid = _reachable_count(clone)
 
-    behind2, err2, _ = banner._check_via_local_git(clone)
+    behind2, err2, _, _ = banner._check_via_local_git_details(clone)
     assert err2 is None
     assert behind2 == 0
     after = _reachable_count(clone)
@@ -128,7 +128,7 @@ def test_real_shallow_clone_behind_returns_positive_count(tmp_path):
     clone = _shallow_clone(upstream, tmp_path / "clone", depth=1, branch="release")
     # Point origin/main tracking intent: fetch main from origin.
     # HEAD is release tip; origin has main 4 commits ahead.
-    behind, err, rev = banner._check_via_local_git(clone)
+    behind, err, rev, _ = banner._check_via_local_git_details(clone)
     assert err is None
     assert rev
     # Should be a real positive count (4) when merge-base connects, else -1.
@@ -161,7 +161,7 @@ def test_old_but_live_shallow_lock_is_never_unlinked(tmp_path):
 
     # Holding shallow.lock may make fetch fail; checker must still return
     # without deleting locks.
-    behind, err, rev = banner._check_via_local_git(clone)
+    behind, err, rev, _ = banner._check_via_local_git_details(clone)
     assert rev is not None
     # Result is either 0 (ls-remote equal) or NO_COUNT/error — never crash.
     assert behind is None or isinstance(behind, int)
@@ -240,7 +240,7 @@ def test_failed_fetch_with_stale_fetch_head_real_repo(tmp_path, monkeypatch):
 
     monkeypatch.setattr(banner, "_ls_remote_main_sha", fake_ls)
 
-    behind, err, rev = banner._check_via_local_git(clone)
+    behind, err, rev, _ = banner._check_via_local_git_details(clone)
     assert rev == head
     # Must NOT return 0 from stale FETCH_HEAD == HEAD.
     assert behind != 0
@@ -263,7 +263,7 @@ def test_real_shallow_linked_worktree_common_dir(tmp_path):
     assert _common_dir(wt) == _common_dir(main_clone)
     assert _git(wt, "rev-parse", "--is-shallow-repository").stdout.strip() == "true"
 
-    behind, err, rev = banner._check_via_local_git(wt)
+    behind, err, rev, _ = banner._check_via_local_git_details(wt)
     assert err is None
     assert rev
     assert behind is not None
@@ -298,9 +298,9 @@ def test_absolute_depth_is_idempotent_when_behind(tmp_path):
     original = banner._SHALLOW_HISTORY_TARGET
     try:
         banner._SHALLOW_HISTORY_TARGET = 10
-        b1, e1, _ = banner._check_via_local_git(clone)
+        b1, e1, _, _ = banner._check_via_local_git_details(clone)
         c1 = _reachable_count(clone)
-        b2, e2, _ = banner._check_via_local_git(clone)
+        b2, e2, _, _ = banner._check_via_local_git_details(clone)
         c2 = _reachable_count(clone)
     finally:
         banner._SHALLOW_HISTORY_TARGET = original
@@ -364,7 +364,7 @@ def test_unknown_shallow_state_never_runs_unbounded_fetch(tmp_path, monkeypatch)
     monkeypatch.setattr(banner, "_git_run", recording_run)
     monkeypatch.setattr(banner, "_ls_remote_main_sha", lambda *_args, **_kwargs: "f" * 40)
 
-    behind, err, rev = banner._check_via_local_git(repo)
+    behind, err, rev, _ = banner._check_via_local_git_details(repo)
 
     assert rev == _git(repo, "rev-parse", "HEAD").stdout.strip()
     assert behind == banner.UPDATE_AVAILABLE_NO_COUNT

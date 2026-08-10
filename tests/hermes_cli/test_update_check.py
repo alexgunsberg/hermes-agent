@@ -13,6 +13,59 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 
+def test_local_git_compatibility_wrapper_returns_two_fields(monkeypatch, tmp_path):
+    import hermes_cli.banner as banner
+
+    monkeypatch.setattr(
+        banner,
+        "_check_via_local_git_details",
+        lambda _repo: (3, None, "a" * 40, "b" * 40),
+    )
+
+    assert banner._check_via_local_git(tmp_path) == (3, None)
+
+
+def test_update_cache_rejects_non_object_revision_provenance(monkeypatch, tmp_path):
+    import hermes_cli.banner as banner
+    import hermes_cli.config as config
+
+    cache_file = tmp_path / ".update_check"
+    cache_file.write_text(
+        json.dumps(
+            {
+                "ts": time.time(),
+                "behind": 0,
+                "rev": None,
+                "ver": banner.VERSION,
+                "error_code": None,
+                "current_revision": "HEAD",
+                "upstream_revision": "origin/main",
+                "message": None,
+                "repo_writable": True,
+            }
+        ),
+        encoding="utf-8",
+    )
+    calls = {"n": 0}
+
+    def checked(_repo):
+        calls["n"] += 1
+        return 4, None, "a" * 40, "b" * 40
+
+    monkeypatch.setattr(banner, "get_hermes_home", lambda: tmp_path)
+    monkeypatch.setattr(config, "detect_install_method", lambda _root: "source")
+    monkeypatch.setattr(banner, "_check_via_local_git_details", checked)
+    monkeypatch.setattr(banner, "repo_install_writable", lambda _repo: True)
+    monkeypatch.delenv("HERMES_REVISION", raising=False)
+
+    result = banner.check_for_updates_details()
+
+    assert calls["n"] == 1
+    assert result["behind"] == 4
+    assert result["current_revision"] == "a" * 40
+    assert result["upstream_revision"] == "b" * 40
+
+
 def test_check_for_updates_uses_cache(tmp_path, monkeypatch):
     """When cache is fresh, check_for_updates should return cached value without calling git."""
     from hermes_cli.banner import check_for_updates
@@ -102,7 +155,7 @@ def test_check_via_local_git_ownership_falls_back_to_ls_remote(tmp_path, monkeyp
         return R(128, "", "unexpected: " + " ".join(argv))
 
     monkeypatch.setattr(banner.subprocess, "run", fake_run)
-    behind, err, rev = banner._check_via_local_git(repo)
+    behind, err, rev, _ = banner._check_via_local_git_details(repo)
     assert behind == banner.UPDATE_AVAILABLE_NO_COUNT
     assert err is None
     assert rev == head
@@ -128,7 +181,7 @@ def test_check_via_local_git_head_failure_is_error_not_zero(tmp_path, monkeypatc
         return R()
 
     monkeypatch.setattr(banner.subprocess, "run", fake_run)
-    behind, err, rev = banner._check_via_local_git(repo)
+    behind, err, rev, _ = banner._check_via_local_git_details(repo)
     assert behind is None
     assert err == "git-ownership"
     assert rev is None
@@ -193,7 +246,7 @@ def test_failed_fetch_never_trusts_stale_fetch_head(tmp_path, monkeypatch):
         return R(128, "", "unexpected: " + " ".join(argv))
 
     monkeypatch.setattr(banner.subprocess, "run", fake_run)
-    behind, err, rev = banner._check_via_local_git(repo)
+    behind, err, rev, _ = banner._check_via_local_git_details(repo)
     assert fetch_attempted["n"] >= 1
     # Behind unknown count (real upstream differs from HEAD), not 0 from stale.
     assert behind == banner.UPDATE_AVAILABLE_NO_COUNT
@@ -250,7 +303,7 @@ def test_shallow_fetch_uses_absolute_depth_target_not_deepen(tmp_path, monkeypat
         return R(128, "", "unexpected: " + " ".join(argv))
 
     monkeypatch.setattr(banner.subprocess, "run", fake_run)
-    behind, err, rev = banner._check_via_local_git(repo)
+    behind, err, rev, _ = banner._check_via_local_git_details(repo)
     assert behind == 7
     assert err is None
     assert rev == head
@@ -300,7 +353,7 @@ def test_equal_tips_skip_depth_fetch(tmp_path, monkeypatch):
         return R(128, "", "unexpected: " + " ".join(argv))
 
     monkeypatch.setattr(banner.subprocess, "run", fake_run)
-    behind, err, rev = banner._check_via_local_git(repo)
+    behind, err, rev, _ = banner._check_via_local_git_details(repo)
     assert behind == 0
     assert err is None
     assert rev == tip

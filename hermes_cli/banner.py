@@ -529,10 +529,10 @@ def _check_via_local_git_details(
 
 def _check_via_local_git(
     repo_dir: Path,
-) -> tuple[Optional[int], Optional[str], Optional[str]]:
-    """Compatibility wrapper returning the historical three-field result."""
-    behind, error_code, current_revision, _ = _check_via_local_git_details(repo_dir)
-    return behind, error_code, current_revision
+) -> tuple[Optional[int], Optional[str]]:
+    """Compatibility wrapper returning only count and structured error."""
+    behind, error_code, _, _ = _check_via_local_git_details(repo_dir)
+    return behind, error_code
 
 
 def check_for_updates_details() -> Dict[str, Optional[object]]:
@@ -571,6 +571,13 @@ def check_for_updates_details() -> Dict[str, Optional[object]]:
                 now - cached.get("ts", 0) < _UPDATE_CHECK_CACHE_SECONDS
                 and cached.get("rev") == embedded_rev
                 and cached.get("ver") == VERSION
+                and all(
+                    revision is None or _is_full_git_sha(revision)
+                    for revision in (
+                        cached.get("current_revision"),
+                        cached.get("upstream_revision"),
+                    )
+                )
             ):
                 return {
                     "behind": cached.get("behind"),

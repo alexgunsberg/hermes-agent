@@ -9,7 +9,7 @@ import pytest
 
 from hermes_cli.banner import (
     UPDATE_AVAILABLE_NO_COUNT,
-    _check_via_local_git,
+    _check_via_local_git_details,
     _classify_git_stderr,
     repo_install_writable,
 )
@@ -95,7 +95,7 @@ def test_check_via_local_git_falls_back_to_ls_remote_when_fetch_blocked(tmp_path
 
     monkeypatch.setattr(banner.subprocess, "run", fake_run)
 
-    behind, error_code, current_revision = _check_via_local_git(repo)
+    behind, error_code, current_revision, _ = _check_via_local_git_details(repo)
 
     assert behind == UPDATE_AVAILABLE_NO_COUNT
     assert error_code is None
@@ -133,7 +133,7 @@ def test_check_via_local_git_reports_ownership_when_head_unreadable(tmp_path, mo
 
     monkeypatch.setattr(banner.subprocess, "run", fake_run)
 
-    behind, error_code, current_revision = _check_via_local_git(repo)
+    behind, error_code, current_revision, _ = _check_via_local_git_details(repo)
     assert behind is None
     assert error_code == "git-ownership"
     assert current_revision is None
