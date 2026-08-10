@@ -377,3 +377,47 @@ def test_unknown_shallow_state_never_runs_unbounded_fetch(tmp_path, monkeypatch)
     assert behind == banner.UPDATE_AVAILABLE_NO_COUNT
     assert err is None
     assert fetch_calls == []
+
+
+def test_concurrent_fetch_head_overwrite_cannot_report_latest(tmp_path, monkeypatch):
+    """A second real fetch after main fetch cannot substitute its FETCH_HEAD."""
+    upstream = _build_linear_upstream(tmp_path / "upstream", n_commits=6)
+    old = _git(upstream, "rev-parse", "HEAD~2").stdout.strip()
+    _git(upstream, "branch", "release", old)
+    _git(upstream, "branch", "other", old)
+    clone = tmp_path / "clone"
+    _git(
+        tmp_path,
+        "clone",
+        "--branch",
+        "release",
+        f"file://{upstream.resolve()}",
+        clone.name,
+    )
+    local_head = _git(clone, "rev-parse", "HEAD").stdout.strip()
+    main_tip = _git(upstream, "rev-parse", "main").stdout.strip()
+    assert local_head != main_tip
+
+    original_run = banner._git_run
+
+    def overwrite_after_main_fetch(args, **kwargs):
+        result = original_run(args, **kwargs)
+        if (
+            args[:3] == ["fetch", "origin", "main"]
+            and result is not None
+            and result.returncode == 0
+        ):
+            # This is a genuine concurrent-style overwrite of shared
+            # FETCH_HEAD with a different branch that equals local HEAD.
+            _git(clone, "fetch", "origin", "other")
+        return result
+
+    monkeypatch.setattr(banner, "_git_run", overwrite_after_main_fetch)
+
+    behind, err, rev = banner._check_via_local_git(clone)
+
+    assert rev == local_head
+    assert err is None
+    assert behind == banner.UPDATE_AVAILABLE_NO_COUNT
+    assert behind != 0
+    assert _git(clone, "rev-parse", "FETCH_HEAD").stdout.strip() == local_head

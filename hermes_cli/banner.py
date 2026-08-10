@@ -469,36 +469,34 @@ def _check_via_local_git(
             return checked, None, head_rev
         return None, fetch_error or "offline", head_rev
 
-    # FETCH_HEAD is authoritative for both shallow and full clones because it
-    # is produced by the successful fetch in this call.  origin/main may stay
-    # stale under a valid narrowed remote.origin.fetch refspec.
+    # Capture FETCH_HEAD once, validate it against the read-only main-tip probe,
+    # then use the immutable object ID for every graph operation.  FETCH_HEAD
+    # is shared mutable state: another concurrent fetch can overwrite it after
+    # our successful fetch and before these subprocesses run.
     target_rev = _git_stdout(
         ["rev-parse", "FETCH_HEAD"], cwd=repo_dir, relax_ownership=True
     )
-    if not target_rev:
-        if upstream_tip is not None:
-            behind = 0 if head_rev == upstream_tip else UPDATE_AVAILABLE_NO_COUNT
-            return behind, None, head_rev
-        checked = _check_via_rev(head_rev)
-        if checked is not None:
-            return checked, None, head_rev
-        return None, "check-failed", head_rev
+    if not target_rev or upstream_tip is None or target_rev != upstream_tip:
+        # Missing or contradictory evidence must never report "latest".  The
+        # earlier equal-tip path already returned 0, so unknown count is the
+        # conservative truthful result here.
+        return UPDATE_AVAILABLE_NO_COUNT, None, head_rev
     if head_rev == target_rev:
         return 0, None, head_rev
 
     if is_shallow:
         merge_base = _git_stdout(
-            ["merge-base", "HEAD", "FETCH_HEAD"],
+            ["merge-base", "HEAD", target_rev],
             cwd=repo_dir,
             relax_ownership=True,
         )
         if merge_base:
-            counted = _count_commits_behind(repo_dir, "FETCH_HEAD")
+            counted = _count_commits_behind(repo_dir, target_rev)
             if counted is not None:
                 return counted, None, head_rev
         return UPDATE_AVAILABLE_NO_COUNT, None, head_rev
 
-    counted = _count_commits_behind(repo_dir, "FETCH_HEAD")
+    counted = _count_commits_behind(repo_dir, target_rev)
     if counted is not None:
         return counted, None, head_rev
 
