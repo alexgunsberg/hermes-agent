@@ -4270,10 +4270,16 @@ async def check_hermes_update(force: bool = False):
                 check could not run (offline, no remote, etc.)
         update_available: convenience bool (behind is non-zero and not null)
         can_apply: True when the dashboard's update button can apply it
-                   in place (git); False for other install methods where the
-                   user must update out-of-band
+                   in place (writable git install); False when the user
+                   must update out-of-band
         update_command: the recommended command for this install method
-        message: human-readable guidance for non-applyable methods
+        message: human-readable guidance
+        error_code: stable machine-readable failure reason when the check
+                    failed (e.g. git-ownership, git-permission, offline,
+                    check-failed). Absent/null for unsupported install
+                    methods (docker/managed) where behind is null without
+                    an error.
+        current_revision: git HEAD (or HERMES_REVISION) when known
         commits: for git installs that are behind, a list of the commits
                  the local checkout is behind upstream by — each
                  {sha, summary, author, at}. Absent/empty otherwise. The
@@ -4292,30 +4298,43 @@ async def check_hermes_update(force: bool = False):
                 "Hermes updates are managed outside this dashboard in "
                 "containerized environments."
             ),
+            "error_code": None,
+            "current_revision": None,
         }
 
     install_method = detect_install_method(PROJECT_ROOT)
     update_command = recommended_update_command_for_method(install_method)
+
+    repo_writable = True
+    if install_method == "git":
+        try:
+            from hermes_cli.banner import repo_install_writable
+
+            repo_writable = repo_install_writable(PROJECT_ROOT)
+        except Exception:
+            repo_writable = os.access(PROJECT_ROOT, os.W_OK)
 
     payload: Dict[str, Any] = {
         "install_method": install_method,
         "current_version": __version__,
         "behind": None,
         "update_available": False,
-        "can_apply": install_method == "git",
+        "can_apply": install_method == "git" and repo_writable,
         "update_command": update_command,
         "message": None,
+        "error_code": None,
+        "current_revision": None,
     }
 
     if install_method == "docker":
         payload["message"] = format_docker_update_message()
         return payload
 
-    # banner.check_for_updates() handles git / nix-revision paths and
+    # banner.check_for_updates_details() handles git / nix-revision paths and
     # caches the result for 6h. ``force`` busts the cache so the "Check now"
     # button reflects reality immediately.
     try:
-        from hermes_cli.banner import check_for_updates
+        from hermes_cli.banner import check_for_updates_details
 
         if force:
             try:
@@ -4323,18 +4342,55 @@ async def check_hermes_update(force: bool = False):
             except OSError:
                 pass
 
-        behind = await asyncio.to_thread(check_for_updates)
+        details = await asyncio.to_thread(check_for_updates_details)
     except Exception:
         _log.exception("Update check failed")
-        behind = None
+        details = {
+            "behind": None,
+            "error_code": "check-failed",
+            "current_revision": None,
+            "message": "Couldn't check for updates — try again later.",
+            "repo_writable": repo_writable if install_method == "git" else None,
+        }
+
+    behind = details.get("behind")
+    error_code = details.get("error_code")
+    current_revision = details.get("current_revision")
+    detail_message = details.get("message")
+    detail_writable = details.get("repo_writable")
+
+    if install_method == "git":
+        if detail_writable is False:
+            repo_writable = False
+        payload["can_apply"] = bool(repo_writable)
 
     payload["behind"] = behind
+    payload["error_code"] = error_code
+    payload["current_revision"] = current_revision
+
     if behind is None:
-        payload["message"] = "Couldn't reach the update source — try again later."
+        if error_code:
+            payload["message"] = (
+                detail_message
+                or "Couldn't check for updates — try again later."
+            )
+        else:
+            # Unsupported / N/A (no error_code) — keep prior guidance when set.
+            payload["message"] = (
+                detail_message
+                or "Couldn't reach the update source — try again later."
+            )
     elif behind == 0:
         payload["message"] = "You're on the latest version."
     else:
         payload["update_available"] = True
+        if install_method == "git" and not repo_writable:
+            payload["message"] = detail_message or (
+                "An update is available, but this install directory isn't "
+                "writable by the backend process. Update from an account that "
+                "owns the install (or reinstall into a user-writable location), "
+                f"then run: {update_command}"
+            )
         # Enrich with the actual commits we're behind by, so the desktop's
         # remote update overlay can show "what's changed". git only;
         # best-effort (empty list on any failure).

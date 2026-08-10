@@ -130,6 +130,12 @@ UPDATE_AVAILABLE_NO_COUNT = -1
 _UPSTREAM_REPO_URL = "https://github.com/NousResearch/hermes-agent.git"
 _OFFICIAL_REPO_CANONICAL = "github.com/nousresearch/hermes-agent"
 
+# Absolute shallow-history target for passive update checks. Used as
+# ``git fetch --depth <N>`` (idempotent absolute depth), never relative
+# ``--deepen`` on every cache expiry. Passive at or near N once and stays
+# there; equal-tip checks avoid depth recovery entirely via ls-remote.
+_SHALLOW_HISTORY_TARGET = 200
+
 
 def _canonical_github_remote(url: str | None) -> str:
     """Return ``host/owner/repo`` for common GitHub remote URL forms."""
@@ -161,10 +167,59 @@ def _is_official_ssh_remote(url: str | None) -> bool:
     return _is_ssh_remote(url) and _canonical_github_remote(url) == _OFFICIAL_REPO_CANONICAL
 
 
-def _git_stdout(args: list[str], *, cwd: Path, timeout: int = 5) -> Optional[str]:
+def _classify_git_stderr(stderr: str | None) -> Optional[str]:
+    """Map git stderr to a stable machine-readable error code."""
+    text = (stderr or "").lower()
+    if not text:
+        return None
+    if "dubious ownership" in text or "safe.directory" in text:
+        return "git-ownership"
+    if (
+        "permission denied" in text
+        or "read-only file system" in text
+        or "operation not permitted" in text
+    ):
+        return "git-permission"
+    # Lock contention is not offline — callers fail closed without trusting
+    # stale FETCH_HEAD, and must never unlink locks from the passive path.
+    if "could not lock" in text or ("unable to create" in text and "lock" in text):
+        return "check-failed"
+    if (
+        "could not resolve host" in text
+        or "unable to access" in text
+        or "network is unreachable" in text
+        or "connection refused" in text
+        or "timed out" in text
+        or "temporary failure in name resolution" in text
+    ):
+        return "offline"
+    return None
+
+
+def _git_cmd_prefix(cwd: Path, *, relax_ownership: bool) -> list[str]:
+    """Build a ``git`` argv prefix.
+
+    When ``relax_ownership`` is True, add a *process-local*
+    ``-c safe.directory=<abs>`` so read-only probes work on root-owned
+    checkouts (e.g. ``/opt/hermes-agent``). Never writes global git config.
+    """
+    cmd = ["git"]
+    if relax_ownership:
+        cmd.extend(["-c", f"safe.directory={cwd.resolve()}"])
+    return cmd
+
+
+def _git_run(
+    args: list[str],
+    *,
+    cwd: Path,
+    timeout: int = 5,
+    relax_ownership: bool = False,
+) -> Optional[subprocess.CompletedProcess]:
+    """Run a bounded argv-only git subprocess. Never shell=True."""
     try:
-        result = subprocess.run(
-            ["git", *args],
+        return subprocess.run(
+            [*_git_cmd_prefix(cwd, relax_ownership=relax_ownership), *args],
             capture_output=True,
             text=True,
             # git output is UTF-8; on Windows text=True defaults to the ANSI
@@ -177,9 +232,83 @@ def _git_stdout(args: list[str], *, cwd: Path, timeout: int = 5) -> Optional[str
         )
     except Exception:
         return None
-    if result.returncode != 0:
+
+
+def _git_stdout(
+    args: list[str],
+    *,
+    cwd: Path,
+    timeout: int = 5,
+    relax_ownership: bool = False,
+) -> Optional[str]:
+    result = _git_run(
+        args, cwd=cwd, timeout=timeout, relax_ownership=relax_ownership
+    )
+    if result is None or result.returncode != 0:
         return None
     return (result.stdout or "").strip()
+
+
+def _resolve_git_dirs(repo_dir: Path) -> list[Path]:
+    """Return unique absolute git-dir paths for ``repo_dir``.
+
+    Linked worktrees / candidate installs share objects via the *common*
+    git dir (``git rev-parse --git-common-dir``). Passiveability and shallow
+    state live there, not only in the per-worktree git dir.
+    """
+    dirs: list[Path] = []
+    for flag in ("--git-common-dir", "--git-dir"):
+        raw = _git_stdout(
+            ["rev-parse", flag], cwd=repo_dir, relax_ownership=True
+        )
+        if not raw:
+            continue
+        root = Path(raw)
+        if not root.is_absolute():
+            root = (repo_dir / root).resolve()
+        else:
+            root = root.resolve()
+        if root not in dirs:
+            dirs.append(root)
+    return dirs
+
+
+def _count_commits_behind(repo_dir: Path, target_ref: str) -> Optional[int]:
+    """Return ``rev-list --count HEAD..<target_ref>`` when countable."""
+    result = _git_run(
+        ["rev-list", "--count", f"HEAD..{target_ref}"],
+        cwd=repo_dir,
+        relax_ownership=True,
+    )
+    if result is None or result.returncode != 0:
+        return None
+    text = (result.stdout or "").strip()
+    if not text.isdigit():
+        return None
+    return int(text)
+
+
+def _ls_remote_main_sha(
+    remote: str = _UPSTREAM_REPO_URL,
+    *,
+    timeout: int = 10,
+) -> Optional[str]:
+    """Return the tip SHA of ``refs/heads/main`` at ``remote``, or None."""
+    try:
+        result = subprocess.run(
+            ["git", "ls-remote", remote, "refs/heads/main"],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=timeout,
+        )
+    except Exception:
+        return None
+    if result.returncode != 0 or not result.stdout:
+        return None
+    upstream_rev = result.stdout.split()[0]
+    return upstream_rev or None
 
 
 def _check_via_rev(local_rev: str) -> Optional[int]:
@@ -188,89 +317,313 @@ def _check_via_rev(local_rev: str) -> Optional[int]:
     Returns 0 if up-to-date, ``UPDATE_AVAILABLE_NO_COUNT`` if behind,
     or ``None`` on failure.
     """
-    try:
-        result = subprocess.run(
-            ["git", "ls-remote", _UPSTREAM_REPO_URL, "refs/heads/main"],
-            capture_output=True, text=True, encoding="utf-8", errors="replace",
-            timeout=10,
-        )
-    except Exception:
-        return None
-    if result.returncode != 0 or not result.stdout:
-        return None
-    upstream_rev = result.stdout.split()[0]
+    upstream_rev = _ls_remote_main_sha(_UPSTREAM_REPO_URL)
     if not upstream_rev:
         return None
     return 0 if upstream_rev == local_rev else UPDATE_AVAILABLE_NO_COUNT
 
 
-def _check_via_local_git(repo_dir: Path) -> Optional[int]:
-    """Count commits behind origin/main in a local checkout."""
-    origin_url = _git_stdout(["remote", "get-url", "origin"], cwd=repo_dir)
-    if _is_official_ssh_remote(origin_url):
-        head_rev = _git_stdout(["rev-parse", "HEAD"], cwd=repo_dir)
-        checked = _check_via_rev(head_rev) if head_rev else None
-        if checked == UPDATE_AVAILABLE_NO_COUNT:
-            return 1
-        return checked
+def repo_install_writable(repo_dir: Path) -> bool:
+    """True when this process can write the install root and its git dirs.
 
-    # Installer checkouts are shallow (`git clone --depth 1`). On a shallow
-    # clone the history stops at a single commit, so a plain `git fetch` would
-    # unshallow the repo (dragging in the whole history) and
-    # `rev-list --count HEAD..origin/main` would report a huge bogus "behind"
-    # number (e.g. "12492 commits behind"). Detect shallow up front: fetch with
-    # --depth 1 to preserve the boundary and compare tip SHAs instead of
-    # counting. Full clones (developers, Docker dev images) keep the exact
-    # count path unchanged. Mirrors the desktop fix in apps/desktop/electron/main.cjs.
-    shallow = _git_stdout(["rev-parse", "--is-shallow-repository"], cwd=repo_dir)
+    Linked worktrees point ``.git`` at a file; writability of the *common*
+    git dir is what matters for fetch/update, so both common-dir and
+    git-dir are checked when resolvable.
+    """
+    try:
+        if not os.access(repo_dir, os.W_OK):
+            return False
+        git_paths = _resolve_git_dirs(repo_dir)
+        if not git_paths:
+            git_entry = repo_dir / ".git"
+            if git_entry.exists() and not os.access(git_entry, os.W_OK):
+                return False
+            return True
+        for path in git_paths:
+            if path.exists() and not os.access(path, os.W_OK):
+                return False
+        return True
+    except OSError:
+        return False
+
+
+def _check_via_local_git(
+    repo_dir: Path,
+) -> tuple[Optional[int], Optional[str], Optional[str]]:
+    """Count commits behind origin/main in a local checkout.
+
+    Returns ``(behind, error_code, current_revision)``.
+
+    Safety contract for passive update checks:
+      * never unlink ``shallow.lock`` / ``index.lock`` / ``HEAD.lock`` /
+        ``packed-refs.lock`` (lock recovery is explicit maintenance only);
+      * never progressively ``--deepen`` on every cache expiry — shallow
+        recovery uses an absolute ``--depth`` target once tips differ;
+      * trust ``FETCH_HEAD`` only after a successful fetch in *this* call;
+        failed fetch + stale FETCH_HEAD fails closed (ls-remote / error);
+      * argv-only bounded subprocesses; linked-worktree common-dir aware
+        writable probes.
+
+    Uses process-local ``safe.directory`` for **read-only** git ops so
+    root-owned installs still report availability. Fetch writes ``.git``
+    without ownership relax; failures fall back to ``HEAD`` + ls-remote.
+    """
+    head = _git_run(
+        ["rev-parse", "HEAD"], cwd=repo_dir, relax_ownership=True
+    )
+    head_rev = (head.stdout or "").strip() if head and head.returncode == 0 else None
+    head_err = _classify_git_stderr(head.stderr if head else None)
+
+    if not head_rev:
+        return None, head_err or "check-failed", None
+
+    origin = _git_run(
+        ["remote", "get-url", "origin"], cwd=repo_dir, relax_ownership=True
+    )
+    origin_url = (
+        (origin.stdout or "").strip()
+        if origin and origin.returncode == 0
+        else None
+    )
+
+    if _is_official_ssh_remote(origin_url):
+        checked = _check_via_rev(head_rev)
+        if checked is None:
+            return None, "offline", head_rev
+        if checked == UPDATE_AVAILABLE_NO_COUNT:
+            return 1, None, head_rev
+        return checked, None, head_rev
+
+    shallow = _git_stdout(
+        ["rev-parse", "--is-shallow-repository"],
+        cwd=repo_dir,
+        relax_ownership=True,
+    )
     is_shallow = shallow == "true"
 
+    # Tip probe that never writes local git state. Equal tips short-circuit
+    # before any depth recovery so repeated checks cannot progressively
+    # deepen a shallow clone that is already current.
+    remote_for_ls = origin_url or _UPSTREAM_REPO_URL
+    upstream_tip = _ls_remote_main_sha(remote_for_ls)
+    if upstream_tip is None and origin_url and origin_url != _UPSTREAM_REPO_URL:
+        upstream_tip = _ls_remote_main_sha(_UPSTREAM_REPO_URL)
+    if upstream_tip is not None and upstream_tip == head_rev:
+        return 0, None, head_rev
+
+    fetch_ok = False
+    fetch_error: Optional[str] = None
     try:
         # Scope the fetch to the one branch the behind-count compares against.
         # An unscoped ``git fetch origin`` transfers every remote head (~1,400
         # on this repo — measured 3.0 s vs 0.55 s scoped) and can burn the full
         # 10 s timeout on slow links. ``cmd_update`` already scopes its fetch
-        # for the same reason. Modern git updates the ``origin/main`` tracking
-        # ref on a scoped fetch, so the ``HEAD..origin/main`` count below is
-        # unaffected; the shallow path compares against FETCH_HEAD, which a
-        # scoped fetch also updates.
-        fetch_args = ["git", "fetch", "origin", "main"]
+        # for the same reason.
+        #
+        # Shallow path: absolute ``--depth TARGET`` (idempotent), never
+        # relative ``--deepen`` and never passive lock unlinks. Full clones
+        # keep a plain scoped fetch for exact counts.
+        fetch_args = ["fetch", "origin", "main"]
         if is_shallow:
-            fetch_args += ["--depth", "1"]
+            fetch_args += ["--depth", str(_SHALLOW_HISTORY_TARGET)]
         fetch_args.append("--quiet")
-        subprocess.run(
-            fetch_args,
-            capture_output=True, timeout=10,
-            cwd=str(repo_dir),
+        # Fetch writes into ``.git`` — never pass process-local safe.directory.
+        fetch_result = _git_run(
+            fetch_args, cwd=repo_dir, timeout=30 if is_shallow else 10,
+            relax_ownership=False,
         )
+        if fetch_result is not None and fetch_result.returncode == 0:
+            fetch_ok = True
+        elif fetch_result is not None:
+            fetch_error = (
+                _classify_git_stderr(fetch_result.stderr) or "check-failed"
+            )
     except Exception:
-        pass  # Offline or timeout — use stale refs, that's fine
+        fetch_error = "check-failed"
+
+    if not fetch_ok:
+        # Failed fetch: NEVER trust stale FETCH_HEAD. Fall back to the
+        # ls-remote tip probe (already computed) or a fresh official compare.
+        if upstream_tip is not None:
+            if upstream_tip == head_rev:
+                return 0, None, head_rev
+            return UPDATE_AVAILABLE_NO_COUNT, None, head_rev
+        checked = _check_via_rev(head_rev)
+        if checked is not None:
+            return checked, None, head_rev
+        return None, fetch_error or "offline", head_rev
 
     if is_shallow:
-        # No history to count across the shallow boundary. `origin/main` may not
-        # be a tracking ref in a `clone --depth 1`, so prefer FETCH_HEAD (just
-        # updated by the fetch above) and fall back to origin/main.
-        head_rev = _git_stdout(["rev-parse", "HEAD"], cwd=repo_dir)
+        # FETCH_HEAD is trustworthy only because fetch_ok is True above.
         target_rev = (
-            _git_stdout(["rev-parse", "FETCH_HEAD"], cwd=repo_dir)
-            or _git_stdout(["rev-parse", "origin/main"], cwd=repo_dir)
+            _git_stdout(
+                ["rev-parse", "FETCH_HEAD"], cwd=repo_dir, relax_ownership=True
+            )
+            or _git_stdout(
+                ["rev-parse", "origin/main"], cwd=repo_dir, relax_ownership=True
+            )
         )
-        if not head_rev or not target_rev:
-            return None
-        return 0 if head_rev == target_rev else UPDATE_AVAILABLE_NO_COUNT
+        if not target_rev:
+            if upstream_tip is not None:
+                behind = (
+                    0 if head_rev == upstream_tip else UPDATE_AVAILABLE_NO_COUNT
+                )
+                return behind, None, head_rev
+            checked = _check_via_rev(head_rev)
+            if checked is not None:
+                return checked, None, head_rev
+            return None, "check-failed", head_rev
+        if head_rev == target_rev:
+            return 0, None, head_rev
+
+        target_ref = (
+            "FETCH_HEAD"
+            if _git_stdout(
+                ["rev-parse", "FETCH_HEAD"], cwd=repo_dir, relax_ownership=True
+            )
+            else "origin/main"
+        )
+        merge_base = _git_stdout(
+            ["merge-base", "HEAD", target_ref],
+            cwd=repo_dir,
+            relax_ownership=True,
+        )
+        if merge_base:
+            counted = _count_commits_behind(repo_dir, target_ref)
+            if counted is not None:
+                return counted, None, head_rev
+        return UPDATE_AVAILABLE_NO_COUNT, None, head_rev
+
+    counted = _count_commits_behind(repo_dir, "origin/main")
+    if counted is not None:
+        return counted, None, head_rev
+
+    # Count failed (missing origin/main ref, etc.) — last-resort SHA compare.
+    if upstream_tip is not None:
+        behind = 0 if head_rev == upstream_tip else UPDATE_AVAILABLE_NO_COUNT
+        return behind, None, head_rev
+    checked = _check_via_rev(head_rev)
+    if checked is not None:
+        return checked, None, head_rev
+    return None, "check-failed", head_rev
+
+
+def check_for_updates_details() -> Dict[str, Optional[object]]:
+    """Rich update check for API consumers.
+
+    Returns a dict with:
+      - behind: int | None (null only on true failure / N/A)
+      - error_code: str | None (set when behind is null due to a failed check)
+      - current_revision: str | None
+      - message: str | None
+      - repo_writable: bool | None (git installs only)
+    """
+    hermes_home = get_hermes_home()
+    cache_file = hermes_home / ".update_check"
+    embedded_rev = os.environ.get("HERMES_REVISION") or None
 
     try:
-        result = subprocess.run(
-            ["git", "rev-list", "--count", "HEAD..origin/main"],
-            capture_output=True, text=True, encoding="utf-8", errors="replace",
-            timeout=5,
-            cwd=str(repo_dir),
-        )
-        if result.returncode == 0:
-            return int(result.stdout.strip())
+        from hermes_cli.config import detect_install_method, get_project_root
+        if detect_install_method(get_project_root()) == "docker":
+            return {
+                "behind": None,
+                "error_code": None,
+                "current_revision": None,
+                "message": None,
+                "repo_writable": None,
+            }
     except Exception:
         pass
-    return None
+
+    now = time.time()
+    try:
+        if cache_file.exists():
+            cached = json.loads(cache_file.read_text(encoding="utf-8"))
+            if (
+                now - cached.get("ts", 0) < _UPDATE_CHECK_CACHE_SECONDS
+                and cached.get("rev") == embedded_rev
+                and cached.get("ver") == VERSION
+            ):
+                return {
+                    "behind": cached.get("behind"),
+                    "error_code": cached.get("error_code"),
+                    "current_revision": cached.get("current_revision"),
+                    "message": cached.get("message"),
+                    "repo_writable": cached.get("repo_writable"),
+                }
+    except Exception:
+        pass
+
+    behind: Optional[int] = None
+    error_code: Optional[str] = None
+    current_revision: Optional[str] = embedded_rev
+    message: Optional[str] = None
+    repo_writable: Optional[bool] = None
+
+    if embedded_rev:
+        behind = _check_via_rev(embedded_rev)
+        if behind is None:
+            error_code = "offline"
+            message = "Couldn't reach the update source — try again later."
+    else:
+        # Prefer the running code's location over the profile-scoped path.
+        # $HERMES_HOME/hermes-agent/ may be a stale copy from --clone-all;
+        # Path(__file__) always resolves to the actual installed checkout.
+        repo_dir = Path(__file__).parent.parent.resolve()
+        if not (repo_dir / ".git").exists():
+            repo_dir = hermes_home / "hermes-agent"
+        if not (repo_dir / ".git").exists():
+            behind = None
+            # No checkout — not a failed check; caller (docker/unknown) decides.
+            error_code = None
+        else:
+            repo_writable = repo_install_writable(repo_dir)
+            behind, error_code, current_revision = _check_via_local_git(repo_dir)
+            if behind is None and error_code:
+                if error_code == "git-ownership":
+                    message = (
+                        "Git refused this checkout due to ownership mismatch. "
+                        "Updates can't be applied from this process; reinstall "
+                        "or fix directory ownership, then retry."
+                    )
+                elif error_code == "git-permission":
+                    message = (
+                        "The Hermes install directory isn't writable by this "
+                        "process, so the update check couldn't refresh refs. "
+                        "Update from an account that owns the install, or "
+                        "reinstall into a user-writable location."
+                    )
+                elif error_code == "offline":
+                    message = "Couldn't reach the update source — try again later."
+                else:
+                    message = "Couldn't check for updates — try again later."
+
+    try:
+        cache_file.write_text(
+            json.dumps(
+                {
+                    "ts": now,
+                    "behind": behind,
+                    "rev": embedded_rev,
+                    "ver": VERSION,
+                    "error_code": error_code,
+                    "current_revision": current_revision,
+                    "message": message,
+                    "repo_writable": repo_writable,
+                }
+            ),
+            encoding="utf-8",
+        )
+    except Exception:
+        pass
+
+    return {
+        "behind": behind,
+        "error_code": error_code,
+        "current_revision": current_revision,
+        "message": message,
+        "repo_writable": repo_writable,
+    }
 
 
 def check_for_updates() -> Optional[int]:
@@ -284,65 +637,7 @@ def check_for_updates() -> Optional[int]:
     if behind but the count is unknown, ``0`` if up-to-date, or ``None`` if
     the check failed or doesn't apply. Cached for 6 hours.
     """
-    hermes_home = get_hermes_home()
-    cache_file = hermes_home / ".update_check"
-    embedded_rev = os.environ.get("HERMES_REVISION") or None
-
-    # Docker images have no working tree to count commits against — the
-    # published image excludes `.git` (see .dockerignore) and sets no
-    # HERMES_REVISION (that's nix-only). Returning None makes both the Rich
-    # banner (build_welcome_banner) and the Ink badge (branding.tsx, guarded
-    # on `typeof === 'number' && > 0`) show nothing. The dashboard's REST
-    # `/api/hermes/update/check` endpoint short-circuits docker the same way
-    # (web_server.py); mirror that here so the banner/TUI surfaces agree.
-    try:
-        from hermes_cli.config import detect_install_method, get_project_root
-        if detect_install_method(get_project_root()) == "docker":
-            return None
-    except Exception:
-        pass
-
-    # Read cache — invalidate if the embedded rev OR installed version has
-    # changed since the last check.
-    now = time.time()
-    try:
-        if cache_file.exists():
-            cached = json.loads(cache_file.read_text(encoding="utf-8"))
-            if (
-                now - cached.get("ts", 0) < _UPDATE_CHECK_CACHE_SECONDS
-                and cached.get("rev") == embedded_rev
-                and cached.get("ver") == VERSION
-            ):
-                return cached.get("behind")
-    except Exception:
-        pass
-
-    if embedded_rev:
-        behind = _check_via_rev(embedded_rev)
-    else:
-        # Prefer the running code's location over the profile-scoped path.
-        # $HERMES_HOME/hermes-agent/ may be a stale copy from --clone-all;
-        # Path(__file__) always resolves to the actual installed checkout.
-        repo_dir = Path(__file__).parent.parent.resolve()
-        if not (repo_dir / ".git").exists():
-            repo_dir = hermes_home / "hermes-agent"
-        if not (repo_dir / ".git").exists():
-            # No git checkout and no embedded revision — can't determine
-            # update status. This is the Docker path (already short-circuited
-            # above) or an unsupported install without a source tree.
-            behind = None
-        else:
-            behind = _check_via_local_git(repo_dir)
-
-    try:
-        cache_file.write_text(
-            json.dumps({"ts": now, "behind": behind, "rev": embedded_rev, "ver": VERSION}),
-            encoding="utf-8",
-        )
-    except Exception:
-        pass
-
-    return behind
+    return check_for_updates_details().get("behind")  # type: ignore[return-value]
 
 
 def _resolve_repo_dir() -> Optional[Path]:
