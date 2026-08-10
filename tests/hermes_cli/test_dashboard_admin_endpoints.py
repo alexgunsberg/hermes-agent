@@ -783,7 +783,18 @@ class TestUpdateCheckEndpoint:
         # Stub the shared checker so the contract is deterministic (no network).
         import hermes_cli.banner as banner
 
-        monkeypatch.setattr(banner, "check_for_updates", lambda: 5)
+        monkeypatch.setattr(
+            banner,
+            "check_for_updates_details",
+            lambda: {
+                "behind": 5,
+                "error_code": None,
+                "current_revision": "abc123",
+                "message": None,
+                "repo_writable": True,
+            },
+        )
+        monkeypatch.setattr(banner, "repo_install_writable", lambda *_a, **_k: True)
 
         r = self.client.get("/api/hermes/update/check")
         assert r.status_code == 200
@@ -802,8 +813,8 @@ class TestUpdateCheckEndpoint:
         assert body["update_available"] is True
         # git/pip installs can apply the update in place from the dashboard.
         assert body["can_apply"] is True
-
-
+        assert body.get("error_code") in (None, "")
+        assert body.get("current_revision") == "abc123"
 
     def test_managed_runtime_dashboard_is_not_applyable(self, monkeypatch):
         import hermes_cli.web_server as ws
@@ -822,9 +833,46 @@ class TestUpdateCheckEndpoint:
         assert body["can_apply"] is False
         assert body["update_available"] is False
         assert body["behind"] is None
+        assert body.get("error_code") in (None, "")
         assert "managed outside this dashboard" in body["message"]
 
+    def test_docker_behind_null_is_unsupported_not_error(self, monkeypatch):
+        import hermes_cli.web_server as ws
 
+        monkeypatch.setattr(ws, "detect_install_method", lambda *a, **k: "docker")
+        monkeypatch.setattr(
+            ws, "format_docker_update_message", lambda: "Docker images are immutable."
+        )
+
+        body = self.client.get("/api/hermes/update/check").json()
+        assert body["behind"] is None
+        assert body["update_available"] is False
+        assert body.get("error_code") in (None, "")
+
+    def test_git_check_failure_exposes_error_code_not_latest(self, monkeypatch):
+        import hermes_cli.web_server as ws
+        import hermes_cli.banner as banner
+
+        monkeypatch.setattr(ws, "detect_install_method", lambda *a, **k: "git")
+        monkeypatch.setattr(banner, "repo_install_writable", lambda *_a, **_k: False)
+        monkeypatch.setattr(
+            banner,
+            "check_for_updates_details",
+            lambda: {
+                "behind": None,
+                "error_code": "git-ownership",
+                "current_revision": None,
+                "message": "Git refused this checkout due to ownership mismatch.",
+                "repo_writable": False,
+            },
+        )
+
+        body = self.client.get("/api/hermes/update/check").json()
+        assert body["behind"] is None
+        assert body["update_available"] is False
+        assert body["error_code"] == "git-ownership"
+        assert body["can_apply"] is False
+        assert "ownership" in (body.get("message") or "").lower()
 
 
 class TestDebugShareEndpoint:

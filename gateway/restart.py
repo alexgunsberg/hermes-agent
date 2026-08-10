@@ -10,10 +10,57 @@ from hermes_cli.config import DEFAULT_CONFIG
 GATEWAY_SERVICE_RESTART_EXIT_CODE = 75
 
 # EX_CONFIG from sysexits.h — fatal configuration error (e.g. token
-# collision, no messaging platforms).  The s6 finish script translates
-# this into exit 125 (permanent failure) so the supervisor stops
-# restarting the gateway.  See #51228.
+# collision / single-writer lock conflict).  The s6 finish script
+# translates this into exit 125 (permanent failure) so the supervisor
+# stops restarting the gateway.  See #51228.
+#
+# Platform-local auth/config failures (missing membership, unpaired
+# bridge, missing adapter credentials) are NOT EX_CONFIG: they park the
+# affected adapter and leave cron/Kanban/other platforms running.
 GATEWAY_FATAL_CONFIG_EXIT_CODE = 78
+
+
+def is_global_startup_conflict(
+    error_code: str | None = None,
+    message: str | None = None,
+) -> bool:
+    """Return True when a platform failure is a gateway-global single-writer conflict.
+
+    Production token locks (Discord/Telegram/Slack/WhatsApp/Signal) are
+    emitted by ``BasePlatformAdapter._acquire_platform_lock`` with
+    ``retryable=True`` so a *later* reconnect can recover after a live
+    holder exits. At zero-connected startup, however, those failures are
+    still exclusive-ownership conflicts and must force
+    ``GATEWAY_FATAL_CONFIG_EXIT_CODE`` — classification inspects the
+    conflict semantics (code/message), not the retryable flag alone.
+
+    Platform-local auth/config errors (Buzz membership, missing
+    credentials, unpaired bridges) must stay isolated so optional
+    adapters cannot take down unrelated gateway duties.
+    """
+    code = (error_code or "").strip().lower()
+    if code:
+        if code == "lock_conflict":
+            return True
+        if code.endswith("_lock"):
+            return True
+        if "polling_conflict" in code:
+            return True
+        return False
+
+    msg = (message or "").lower()
+    if "already in use" not in msg:
+        return False
+    return any(
+        marker in msg
+        for marker in (
+            "stop the other gateway",
+            "another local hermes",
+            "another profile",
+            "pid ",
+        )
+    )
+
 
 # Set by ``hermes gateway run --external-supervisor``. Unlike systemd's
 # INVOCATION_ID and launchd's XPC_SERVICE_NAME, this survives wrappers that
