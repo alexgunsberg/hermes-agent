@@ -4201,9 +4201,11 @@ async def update_hermes():
 
 
 def _recent_upstream_commits(
-    upstream_revision: Optional[str], n: int = 20
+    current_revision: Optional[str],
+    upstream_revision: Optional[str],
+    n: int = 20,
 ) -> List[Dict[str, Any]]:
-    """Commits behind an immutable upstream-main object ID, newest first.
+    """Commits between captured immutable local/upstream objects, newest first.
 
     The tracking ref may remain stale under a valid narrowed fetch refspec and
     ``FETCH_HEAD`` is shared mutable state.  Accept only the freshly probed
@@ -4212,8 +4214,9 @@ def _recent_upstream_commits(
     Best-effort: returns [] if the SHA is invalid/unavailable, the object is not
     present locally, or git is unavailable. Never raises into the request path.
     """
-    if not isinstance(upstream_revision, str) or not re.fullmatch(
-        r"[0-9a-fA-F]{40}", upstream_revision
+    if not all(
+        isinstance(revision, str) and re.fullmatch(r"[0-9a-fA-F]{40}", revision)
+        for revision in (current_revision, upstream_revision)
     ):
         return []
     try:
@@ -4224,7 +4227,7 @@ def _recent_upstream_commits(
                 str(PROJECT_ROOT),
                 "log",
                 "--format=%H%x1f%s%x1f%an%x1f%ct",
-                f"HEAD..{upstream_revision}",
+                f"{current_revision}..{upstream_revision}",
                 f"-n{int(n)}",
             ],
             capture_output=True,
@@ -4404,7 +4407,7 @@ async def check_hermes_update(force: bool = False):
         # best-effort (empty list on any failure).
         if install_method == "git":
             payload["commits"] = await asyncio.to_thread(
-                _recent_upstream_commits, upstream_revision
+                _recent_upstream_commits, current_revision, upstream_revision
             )
 
     return payload

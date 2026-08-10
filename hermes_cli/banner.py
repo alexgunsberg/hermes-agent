@@ -273,10 +273,24 @@ def _resolve_git_dirs(repo_dir: Path) -> list[Path]:
     return dirs
 
 
-def _count_commits_behind(repo_dir: Path, target_ref: str) -> Optional[int]:
-    """Return ``rev-list --count HEAD..<target_ref>`` when countable."""
+def _is_full_git_sha(value: Optional[str]) -> bool:
+    return (
+        isinstance(value, str)
+        and len(value) == 40
+        and all(char in "0123456789abcdefABCDEF" for char in value)
+    )
+
+
+def _count_commits_behind(
+    repo_dir: Path, current_revision: str, target_revision: str
+) -> Optional[int]:
+    """Count between two captured immutable revisions when graphable."""
+    if not _is_full_git_sha(current_revision) or not _is_full_git_sha(
+        target_revision
+    ):
+        return None
     result = _git_run(
-        ["rev-list", "--count", f"HEAD..{target_ref}"],
+        ["rev-list", "--count", f"{current_revision}..{target_revision}"],
         cwd=repo_dir,
         relax_ownership=True,
     )
@@ -489,17 +503,17 @@ def _check_via_local_git_details(
 
     if is_shallow:
         merge_base = _git_stdout(
-            ["merge-base", "HEAD", target_rev],
+            ["merge-base", head_rev, target_rev],
             cwd=repo_dir,
             relax_ownership=True,
         )
         if merge_base:
-            counted = _count_commits_behind(repo_dir, target_rev)
+            counted = _count_commits_behind(repo_dir, head_rev, target_rev)
             if counted is not None:
                 return counted, None, head_rev, target_rev
         return UPDATE_AVAILABLE_NO_COUNT, None, head_rev, target_rev
 
-    counted = _count_commits_behind(repo_dir, target_rev)
+    counted = _count_commits_behind(repo_dir, head_rev, target_rev)
     if counted is not None:
         return counted, None, head_rev, target_rev
 

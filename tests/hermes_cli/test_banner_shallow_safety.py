@@ -415,3 +415,40 @@ def test_concurrent_fetch_head_overwrite_cannot_report_latest(tmp_path, monkeypa
     assert behind != 0
     assert target == main_tip
     assert _git(clone, "rev-parse", "FETCH_HEAD").stdout.strip() == local_head
+
+
+def test_checkout_move_after_capture_keeps_count_bound_to_captured_head(
+    tmp_path, monkeypatch
+):
+    """A concurrent checkout cannot change the local side of the count."""
+    upstream = _build_linear_upstream(tmp_path / "upstream", n_commits=6)
+    old = _git(upstream, "rev-parse", "HEAD~2").stdout.strip()
+    _git(upstream, "branch", "release", old)
+    clone = tmp_path / "clone"
+    _git(
+        tmp_path,
+        "clone",
+        "--branch",
+        "release",
+        f"file://{upstream.resolve()}",
+        clone.name,
+    )
+    local_head = _git(clone, "rev-parse", "HEAD").stdout.strip()
+    main_tip = _git(upstream, "rev-parse", "main").stdout.strip()
+    original_stdout = banner._git_stdout
+
+    def move_head_after_target_capture(args, **kwargs):
+        value = original_stdout(args, **kwargs)
+        if args == ["rev-parse", "FETCH_HEAD"] and value == main_tip:
+            _git(clone, "checkout", "--detach", main_tip)
+        return value
+
+    monkeypatch.setattr(banner, "_git_stdout", move_head_after_target_capture)
+
+    behind, err, current, target = banner._check_via_local_git_details(clone)
+
+    assert err is None
+    assert current == local_head
+    assert target == main_tip
+    assert behind == 2
+    assert _git(clone, "rev-parse", "HEAD").stdout.strip() == main_tip

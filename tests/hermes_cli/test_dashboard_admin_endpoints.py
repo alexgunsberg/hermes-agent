@@ -832,16 +832,19 @@ class TestUpdateCheckEndpoint:
             return Result()
 
         monkeypatch.setattr(ws.subprocess, "run", fake_run)
+        current = "c" * 40
         target = "a" * 40
 
-        rows = ws._recent_upstream_commits(target)
+        rows = ws._recent_upstream_commits(current, target)
 
         assert rows and rows[0]["summary"] == "summary"
-        assert f"HEAD..{target}" in calls[0]
+        assert f"{current}..{target}" in calls[0]
+        assert f"HEAD..{target}" not in calls[0]
         assert "HEAD..origin/main" not in calls[0]
 
         before = len(calls)
-        assert ws._recent_upstream_commits("origin/main") == []
+        assert ws._recent_upstream_commits(current, "origin/main") == []
+        assert ws._recent_upstream_commits("HEAD", target) == []
         assert len(calls) == before
 
     def test_managed_runtime_dashboard_is_not_applyable(self, monkeypatch):
