@@ -394,12 +394,20 @@ def _check_via_local_git(
             return 1, None, head_rev
         return checked, None, head_rev
 
-    shallow = _git_stdout(
+    shallow_state = _git_stdout(
         ["rev-parse", "--is-shallow-repository"],
         cwd=repo_dir,
         relax_ownership=True,
     )
-    is_shallow = shallow == "true"
+    if shallow_state == "true":
+        is_shallow: Optional[bool] = True
+    elif shallow_state == "false":
+        is_shallow = False
+    else:
+        # Unknown is not equivalent to a full clone.  A plain fetch can
+        # silently unshallow/download unbounded history, so fail closed to the
+        # read-only tip comparison below.
+        is_shallow = None
 
     # Tip probe that never writes local git state. Equal tips short-circuit
     # before any depth recovery so repeated checks cannot progressively
@@ -410,6 +418,14 @@ def _check_via_local_git(
         upstream_tip = _ls_remote_main_sha(_UPSTREAM_REPO_URL)
     if upstream_tip is not None and upstream_tip == head_rev:
         return 0, None, head_rev
+
+    if is_shallow is None:
+        if upstream_tip is not None:
+            return UPDATE_AVAILABLE_NO_COUNT, None, head_rev
+        checked = _check_via_rev(head_rev)
+        if checked is not None:
+            return checked, None, head_rev
+        return None, "check-failed", head_rev
 
     fetch_ok = False
     fetch_error: Optional[str] = None
@@ -453,48 +469,36 @@ def _check_via_local_git(
             return checked, None, head_rev
         return None, fetch_error or "offline", head_rev
 
-    if is_shallow:
-        # FETCH_HEAD is trustworthy only because fetch_ok is True above.
-        target_rev = (
-            _git_stdout(
-                ["rev-parse", "FETCH_HEAD"], cwd=repo_dir, relax_ownership=True
-            )
-            or _git_stdout(
-                ["rev-parse", "origin/main"], cwd=repo_dir, relax_ownership=True
-            )
-        )
-        if not target_rev:
-            if upstream_tip is not None:
-                behind = (
-                    0 if head_rev == upstream_tip else UPDATE_AVAILABLE_NO_COUNT
-                )
-                return behind, None, head_rev
-            checked = _check_via_rev(head_rev)
-            if checked is not None:
-                return checked, None, head_rev
-            return None, "check-failed", head_rev
-        if head_rev == target_rev:
-            return 0, None, head_rev
+    # FETCH_HEAD is authoritative for both shallow and full clones because it
+    # is produced by the successful fetch in this call.  origin/main may stay
+    # stale under a valid narrowed remote.origin.fetch refspec.
+    target_rev = _git_stdout(
+        ["rev-parse", "FETCH_HEAD"], cwd=repo_dir, relax_ownership=True
+    )
+    if not target_rev:
+        if upstream_tip is not None:
+            behind = 0 if head_rev == upstream_tip else UPDATE_AVAILABLE_NO_COUNT
+            return behind, None, head_rev
+        checked = _check_via_rev(head_rev)
+        if checked is not None:
+            return checked, None, head_rev
+        return None, "check-failed", head_rev
+    if head_rev == target_rev:
+        return 0, None, head_rev
 
-        target_ref = (
-            "FETCH_HEAD"
-            if _git_stdout(
-                ["rev-parse", "FETCH_HEAD"], cwd=repo_dir, relax_ownership=True
-            )
-            else "origin/main"
-        )
+    if is_shallow:
         merge_base = _git_stdout(
-            ["merge-base", "HEAD", target_ref],
+            ["merge-base", "HEAD", "FETCH_HEAD"],
             cwd=repo_dir,
             relax_ownership=True,
         )
         if merge_base:
-            counted = _count_commits_behind(repo_dir, target_ref)
+            counted = _count_commits_behind(repo_dir, "FETCH_HEAD")
             if counted is not None:
                 return counted, None, head_rev
         return UPDATE_AVAILABLE_NO_COUNT, None, head_rev
 
-    counted = _count_commits_behind(repo_dir, "origin/main")
+    counted = _count_commits_behind(repo_dir, "FETCH_HEAD")
     if counted is not None:
         return counted, None, head_rev
 

@@ -319,3 +319,61 @@ def test_absolute_depth_is_idempotent_when_behind(tmp_path):
     # Absolute --depth may leave count at/near target; must not grow unboundedly.
     assert c2 <= c1 + 2  # allow tiny variance; no +TARGET each time
     assert c2 <= banner._SHALLOW_HISTORY_TARGET + 5 or c2 <= 15
+
+
+def test_full_clone_successful_fetch_uses_fetch_head_when_tracking_ref_is_stale(
+    tmp_path,
+):
+    """A narrowed fetch refspec must not make stale origin/main authoritative."""
+    upstream = _build_linear_upstream(tmp_path / "upstream", n_commits=4)
+    clone = tmp_path / "clone"
+    _git(
+        tmp_path,
+        "clone",
+        f"file://{upstream.resolve()}",
+        clone.name,
+    )
+    old_head = _git(clone, "rev-parse", "HEAD").stdout.strip()
+    assert _git(clone, "rev-parse", "origin/main").stdout.strip() == old_head
+
+    # Keep a valid but deliberately narrowed tracking refspec.  An explicit
+    # `fetch origin main` updates FETCH_HEAD while leaving origin/main stale.
+    _git(clone, "config", "remote.origin.fetch", "+refs/heads/other:refs/remotes/origin/other")
+    _write_commit(upstream, "README", "new-upstream-tip\n")
+
+    behind, err, rev = banner._check_via_local_git(clone)
+
+    assert err is None
+    assert rev == old_head
+    assert behind == 1
+    assert _git(clone, "rev-parse", "origin/main").stdout.strip() == old_head
+    assert _git(clone, "rev-parse", "FETCH_HEAD").stdout.strip() != old_head
+
+
+def test_unknown_shallow_state_never_runs_unbounded_fetch(tmp_path, monkeypatch):
+    """A failed shallow probe is unknown, not permission for a plain fetch."""
+    repo = _build_linear_upstream(tmp_path / "repo", n_commits=2)
+    original_stdout = banner._git_stdout
+    original_run = banner._git_run
+    fetch_calls = []
+
+    def fake_stdout(args, **kwargs):
+        if args == ["rev-parse", "--is-shallow-repository"]:
+            return None
+        return original_stdout(args, **kwargs)
+
+    def recording_run(args, **kwargs):
+        if args and args[0] == "fetch":
+            fetch_calls.append(args)
+        return original_run(args, **kwargs)
+
+    monkeypatch.setattr(banner, "_git_stdout", fake_stdout)
+    monkeypatch.setattr(banner, "_git_run", recording_run)
+    monkeypatch.setattr(banner, "_ls_remote_main_sha", lambda *_args, **_kwargs: "f" * 40)
+
+    behind, err, rev = banner._check_via_local_git(repo)
+
+    assert rev == _git(repo, "rev-parse", "HEAD").stdout.strip()
+    assert behind == banner.UPDATE_AVAILABLE_NO_COUNT
+    assert err is None
+    assert fetch_calls == []
