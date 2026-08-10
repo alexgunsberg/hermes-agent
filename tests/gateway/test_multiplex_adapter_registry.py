@@ -284,7 +284,7 @@ class TestSecondaryProfileConfigHandling:
         runner.adapters = {}
         runner._profile_adapters = {}
 
-        async def fake_start_one(profile_name, profile_home, claimed):
+        async def fake_start_one(profile_name, profile_home, claimed, **kwargs):
             if profile_name == "bad":
                 from gateway.run import SecondaryPortBindingConfigError
                 raise SecondaryPortBindingConfigError("bad enables webhook")
@@ -328,7 +328,7 @@ class TestSecondaryProfileConfigHandling:
         runner.adapters = {}
         runner._profile_adapters = {}
 
-        async def fake_start_one(profile_name, profile_home, claimed):
+        async def fake_start_one(profile_name, profile_home, claimed, **kwargs):
             raise MultiplexConfigError(
                 f"Profile '{profile_name}' enables open policy without allow-all opt-in"
             )
