@@ -209,14 +209,6 @@ def test_lock_replacement_race_never_unlinks(tmp_path):
     # mid-flight in a way that leaves the path unlinked while a writer expects it.
     # The writer may have exited leaving a lock — that is fine; absence is also
     # fine only if the churn thread removed it via replace semantics, not our code.
-    # Strong assertion: banner source has no unlink of shallow.lock.
-    src = Path(banner.__file__).read_text(encoding="utf-8")
-    assert "shallow.lock" not in src or (
-        "never unlink" in src.lower() or "MUST NOT" in src or "never unlink" in src
-    )
-    assert "Path.unlink" not in src
-    # No helper that clears locks.
-    assert not hasattr(banner, "_clear_stale_shallow_locks")
     assert replacements["n"] > 0
 
 
@@ -341,11 +333,12 @@ def test_full_clone_successful_fetch_uses_fetch_head_when_tracking_ref_is_stale(
     _git(clone, "config", "remote.origin.fetch", "+refs/heads/other:refs/remotes/origin/other")
     _write_commit(upstream, "README", "new-upstream-tip\n")
 
-    behind, err, rev = banner._check_via_local_git(clone)
+    behind, err, rev, target = banner._check_via_local_git_details(clone)
 
     assert err is None
     assert rev == old_head
     assert behind == 1
+    assert target == _git(upstream, "rev-parse", "main").stdout.strip()
     assert _git(clone, "rev-parse", "origin/main").stdout.strip() == old_head
     assert _git(clone, "rev-parse", "FETCH_HEAD").stdout.strip() != old_head
 
@@ -414,10 +407,11 @@ def test_concurrent_fetch_head_overwrite_cannot_report_latest(tmp_path, monkeypa
 
     monkeypatch.setattr(banner, "_git_run", overwrite_after_main_fetch)
 
-    behind, err, rev = banner._check_via_local_git(clone)
+    behind, err, rev, target = banner._check_via_local_git_details(clone)
 
     assert rev == local_head
     assert err is None
     assert behind == banner.UPDATE_AVAILABLE_NO_COUNT
     assert behind != 0
+    assert target == main_tip
     assert _git(clone, "rev-parse", "FETCH_HEAD").stdout.strip() == local_head

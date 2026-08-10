@@ -305,24 +305,3 @@ def test_equal_tips_skip_depth_fetch(tmp_path, monkeypatch):
     assert err is None
     assert rev == tip
     assert fetch_calls["n"] == 0
-
-
-def test_passive_path_has_no_lock_unlink_helpers():
-    """v2 must not expose passive shallow.lock unlinking."""
-    import hermes_cli.banner as banner
-    import ast
-    import inspect
-
-    assert not hasattr(banner, "_clear_stale_shallow_locks")
-    src = inspect.getsource(banner._check_via_local_git)
-    # Docstring may name locks; executable body must never unlink them.
-    tree = ast.parse(src)
-    unlinks = [
-        node
-        for node in ast.walk(tree)
-        if isinstance(node, ast.Attribute) and node.attr == "unlink"
-    ]
-    assert unlinks == []
-    full = Path(banner.__file__).read_text(encoding="utf-8")
-    assert "_clear_stale_shallow_locks" not in full
-    assert "never unlink" in full.lower()

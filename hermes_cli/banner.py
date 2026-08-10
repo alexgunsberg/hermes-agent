@@ -347,12 +347,14 @@ def repo_install_writable(repo_dir: Path) -> bool:
         return False
 
 
-def _check_via_local_git(
+def _check_via_local_git_details(
     repo_dir: Path,
-) -> tuple[Optional[int], Optional[str], Optional[str]]:
+) -> tuple[Optional[int], Optional[str], Optional[str], Optional[str]]:
     """Count commits behind origin/main in a local checkout.
 
-    Returns ``(behind, error_code, current_revision)``.
+    Returns ``(behind, error_code, current_revision, upstream_revision)``.
+    ``upstream_revision`` is the exact immutable object used for the result,
+    never a later probe or mutable tracking ref.
 
     Safety contract for passive update checks:
       * never unlink ``shallow.lock`` / ``index.lock`` / ``HEAD.lock`` /
@@ -375,7 +377,7 @@ def _check_via_local_git(
     head_err = _classify_git_stderr(head.stderr if head else None)
 
     if not head_rev:
-        return None, head_err or "check-failed", None
+        return None, head_err or "check-failed", None, None
 
     origin = _git_run(
         ["remote", "get-url", "origin"], cwd=repo_dir, relax_ownership=True
@@ -387,12 +389,12 @@ def _check_via_local_git(
     )
 
     if _is_official_ssh_remote(origin_url):
-        checked = _check_via_rev(head_rev)
-        if checked is None:
-            return None, "offline", head_rev
-        if checked == UPDATE_AVAILABLE_NO_COUNT:
-            return 1, None, head_rev
-        return checked, None, head_rev
+        upstream_tip = _ls_remote_main_sha(_UPSTREAM_REPO_URL)
+        if upstream_tip is None:
+            return None, "offline", head_rev, None
+        if upstream_tip == head_rev:
+            return 0, None, head_rev, upstream_tip
+        return UPDATE_AVAILABLE_NO_COUNT, None, head_rev, upstream_tip
 
     shallow_state = _git_stdout(
         ["rev-parse", "--is-shallow-repository"],
@@ -417,15 +419,15 @@ def _check_via_local_git(
     if upstream_tip is None and origin_url and origin_url != _UPSTREAM_REPO_URL:
         upstream_tip = _ls_remote_main_sha(_UPSTREAM_REPO_URL)
     if upstream_tip is not None and upstream_tip == head_rev:
-        return 0, None, head_rev
+        return 0, None, head_rev, upstream_tip
 
     if is_shallow is None:
         if upstream_tip is not None:
-            return UPDATE_AVAILABLE_NO_COUNT, None, head_rev
+            return UPDATE_AVAILABLE_NO_COUNT, None, head_rev, upstream_tip
         checked = _check_via_rev(head_rev)
         if checked is not None:
-            return checked, None, head_rev
-        return None, "check-failed", head_rev
+            return checked, None, head_rev, None
+        return None, "check-failed", head_rev, None
 
     fetch_ok = False
     fetch_error: Optional[str] = None
@@ -462,12 +464,12 @@ def _check_via_local_git(
         # ls-remote tip probe (already computed) or a fresh official compare.
         if upstream_tip is not None:
             if upstream_tip == head_rev:
-                return 0, None, head_rev
-            return UPDATE_AVAILABLE_NO_COUNT, None, head_rev
+                return 0, None, head_rev, upstream_tip
+            return UPDATE_AVAILABLE_NO_COUNT, None, head_rev, upstream_tip
         checked = _check_via_rev(head_rev)
         if checked is not None:
-            return checked, None, head_rev
-        return None, fetch_error or "offline", head_rev
+            return checked, None, head_rev, None
+        return None, fetch_error or "offline", head_rev, None
 
     # Capture FETCH_HEAD once, validate it against the read-only main-tip probe,
     # then use the immutable object ID for every graph operation.  FETCH_HEAD
@@ -479,10 +481,11 @@ def _check_via_local_git(
     if not target_rev or upstream_tip is None or target_rev != upstream_tip:
         # Missing or contradictory evidence must never report "latest".  The
         # earlier equal-tip path already returned 0, so unknown count is the
-        # conservative truthful result here.
-        return UPDATE_AVAILABLE_NO_COUNT, None, head_rev
+        # conservative truthful result here. The probed SHA remains the exact
+        # provenance for that conservative result.
+        return UPDATE_AVAILABLE_NO_COUNT, None, head_rev, upstream_tip
     if head_rev == target_rev:
-        return 0, None, head_rev
+        return 0, None, head_rev, target_rev
 
     if is_shallow:
         merge_base = _git_stdout(
@@ -493,21 +496,29 @@ def _check_via_local_git(
         if merge_base:
             counted = _count_commits_behind(repo_dir, target_rev)
             if counted is not None:
-                return counted, None, head_rev
-        return UPDATE_AVAILABLE_NO_COUNT, None, head_rev
+                return counted, None, head_rev, target_rev
+        return UPDATE_AVAILABLE_NO_COUNT, None, head_rev, target_rev
 
     counted = _count_commits_behind(repo_dir, target_rev)
     if counted is not None:
-        return counted, None, head_rev
+        return counted, None, head_rev, target_rev
 
     # Count failed (missing origin/main ref, etc.) — last-resort SHA compare.
     if upstream_tip is not None:
         behind = 0 if head_rev == upstream_tip else UPDATE_AVAILABLE_NO_COUNT
-        return behind, None, head_rev
+        return behind, None, head_rev, upstream_tip
     checked = _check_via_rev(head_rev)
     if checked is not None:
-        return checked, None, head_rev
-    return None, "check-failed", head_rev
+        return checked, None, head_rev, None
+    return None, "check-failed", head_rev, None
+
+
+def _check_via_local_git(
+    repo_dir: Path,
+) -> tuple[Optional[int], Optional[str], Optional[str]]:
+    """Compatibility wrapper returning the historical three-field result."""
+    behind, error_code, current_revision, _ = _check_via_local_git_details(repo_dir)
+    return behind, error_code, current_revision
 
 
 def check_for_updates_details() -> Dict[str, Optional[object]]:
@@ -583,21 +594,12 @@ def check_for_updates_details() -> Dict[str, Optional[object]]:
             error_code = None
         else:
             repo_writable = repo_install_writable(repo_dir)
-            behind, error_code, current_revision = _check_via_local_git(repo_dir)
-            if behind not in (None, 0):
-                origin_url = _git_stdout(
-                    ["remote", "get-url", "origin"],
-                    cwd=repo_dir,
-                    relax_ownership=True,
-                )
-                remote_for_ls = origin_url or _UPSTREAM_REPO_URL
-                upstream_revision = _ls_remote_main_sha(remote_for_ls)
-                if (
-                    upstream_revision is None
-                    and origin_url
-                    and origin_url != _UPSTREAM_REPO_URL
-                ):
-                    upstream_revision = _ls_remote_main_sha(_UPSTREAM_REPO_URL)
+            (
+                behind,
+                error_code,
+                current_revision,
+                upstream_revision,
+            ) = _check_via_local_git_details(repo_dir)
             if behind is None and error_code:
                 if error_code == "git-ownership":
                     message = (
