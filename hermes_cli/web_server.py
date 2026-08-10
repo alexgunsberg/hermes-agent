@@ -4200,18 +4200,22 @@ async def update_hermes():
     }
 
 
-def _recent_upstream_commits(n: int = 20) -> List[Dict[str, Any]]:
-    """Commits the local checkout is behind ``origin/main`` by, newest first.
+def _recent_upstream_commits(
+    upstream_revision: Optional[str], n: int = 20
+) -> List[Dict[str, Any]]:
+    """Commits behind an immutable upstream-main object ID, newest first.
 
-    Logs the SAME range the behind-count uses (``HEAD..origin/main`` — see
-    ``banner._check_via_local_git``), NOT the branch's ``@{upstream}``. On a
-    feature-branch checkout ``@{upstream}`` is the branch's own tip (zero
-    commits), which would leave the changelog empty even though the count is
-    non-zero. Pinning to ``origin/main`` keeps count and changelog consistent.
+    The tracking ref may remain stale under a valid narrowed fetch refspec and
+    ``FETCH_HEAD`` is shared mutable state.  Accept only the freshly probed
+    40-hex main SHA carried by ``check_for_updates_details``.
 
-    Best-effort: returns [] if not a git checkout, origin/main is unreachable,
-    or git is unavailable. Never raises into the request path.
+    Best-effort: returns [] if the SHA is invalid/unavailable, the object is not
+    present locally, or git is unavailable. Never raises into the request path.
     """
+    if not isinstance(upstream_revision, str) or not re.fullmatch(
+        r"[0-9a-fA-F]{40}", upstream_revision
+    ):
+        return []
     try:
         out = subprocess.run(
             [
@@ -4220,7 +4224,7 @@ def _recent_upstream_commits(n: int = 20) -> List[Dict[str, Any]]:
                 str(PROJECT_ROOT),
                 "log",
                 "--format=%H%x1f%s%x1f%an%x1f%ct",
-                "HEAD..origin/main",
+                f"HEAD..{upstream_revision}",
                 f"-n{int(n)}",
             ],
             capture_output=True,
@@ -4324,6 +4328,7 @@ async def check_hermes_update(force: bool = False):
         "message": None,
         "error_code": None,
         "current_revision": None,
+        "upstream_revision": None,
     }
 
     if install_method == "docker":
@@ -4349,6 +4354,7 @@ async def check_hermes_update(force: bool = False):
             "behind": None,
             "error_code": "check-failed",
             "current_revision": None,
+            "upstream_revision": None,
             "message": "Couldn't check for updates — try again later.",
             "repo_writable": repo_writable if install_method == "git" else None,
         }
@@ -4356,6 +4362,7 @@ async def check_hermes_update(force: bool = False):
     behind = details.get("behind")
     error_code = details.get("error_code")
     current_revision = details.get("current_revision")
+    upstream_revision = details.get("upstream_revision")
     detail_message = details.get("message")
     detail_writable = details.get("repo_writable")
 
@@ -4367,6 +4374,7 @@ async def check_hermes_update(force: bool = False):
     payload["behind"] = behind
     payload["error_code"] = error_code
     payload["current_revision"] = current_revision
+    payload["upstream_revision"] = upstream_revision
 
     if behind is None:
         if error_code:
@@ -4395,7 +4403,9 @@ async def check_hermes_update(force: bool = False):
         # remote update overlay can show "what's changed". git only;
         # best-effort (empty list on any failure).
         if install_method == "git":
-            payload["commits"] = await asyncio.to_thread(_recent_upstream_commits)
+            payload["commits"] = await asyncio.to_thread(
+                _recent_upstream_commits, upstream_revision
+            )
 
     return payload
 

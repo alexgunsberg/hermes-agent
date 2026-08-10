@@ -790,6 +790,7 @@ class TestUpdateCheckEndpoint:
                 "behind": 5,
                 "error_code": None,
                 "current_revision": "abc123",
+                "upstream_revision": "a" * 40,
                 "message": None,
                 "repo_writable": True,
             },
@@ -815,6 +816,33 @@ class TestUpdateCheckEndpoint:
         assert body["can_apply"] is True
         assert body.get("error_code") in (None, "")
         assert body.get("current_revision") == "abc123"
+        assert body.get("upstream_revision") == "a" * 40
+
+    def test_recent_commits_uses_only_validated_immutable_sha(self, monkeypatch):
+        import hermes_cli.web_server as ws
+
+        calls = []
+
+        class Result:
+            returncode = 0
+            stdout = "b" * 40 + "\x1fsummary\x1fauthor\x1f1\n"
+
+        def fake_run(argv, **kwargs):
+            calls.append(argv)
+            return Result()
+
+        monkeypatch.setattr(ws.subprocess, "run", fake_run)
+        target = "a" * 40
+
+        rows = ws._recent_upstream_commits(target)
+
+        assert rows and rows[0]["summary"] == "summary"
+        assert f"HEAD..{target}" in calls[0]
+        assert "HEAD..origin/main" not in calls[0]
+
+        before = len(calls)
+        assert ws._recent_upstream_commits("origin/main") == []
+        assert len(calls) == before
 
     def test_managed_runtime_dashboard_is_not_applyable(self, monkeypatch):
         import hermes_cli.web_server as ws

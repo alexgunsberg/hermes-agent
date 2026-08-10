@@ -517,6 +517,7 @@ def check_for_updates_details() -> Dict[str, Optional[object]]:
       - behind: int | None (null only on true failure / N/A)
       - error_code: str | None (set when behind is null due to a failed check)
       - current_revision: str | None
+      - upstream_revision: freshly probed immutable main-tip SHA when known
       - message: str | None
       - repo_writable: bool | None (git installs only)
     """
@@ -550,6 +551,7 @@ def check_for_updates_details() -> Dict[str, Optional[object]]:
                     "behind": cached.get("behind"),
                     "error_code": cached.get("error_code"),
                     "current_revision": cached.get("current_revision"),
+                    "upstream_revision": cached.get("upstream_revision"),
                     "message": cached.get("message"),
                     "repo_writable": cached.get("repo_writable"),
                 }
@@ -559,6 +561,7 @@ def check_for_updates_details() -> Dict[str, Optional[object]]:
     behind: Optional[int] = None
     error_code: Optional[str] = None
     current_revision: Optional[str] = embedded_rev
+    upstream_revision: Optional[str] = None
     message: Optional[str] = None
     repo_writable: Optional[bool] = None
 
@@ -581,6 +584,20 @@ def check_for_updates_details() -> Dict[str, Optional[object]]:
         else:
             repo_writable = repo_install_writable(repo_dir)
             behind, error_code, current_revision = _check_via_local_git(repo_dir)
+            if behind not in (None, 0):
+                origin_url = _git_stdout(
+                    ["remote", "get-url", "origin"],
+                    cwd=repo_dir,
+                    relax_ownership=True,
+                )
+                remote_for_ls = origin_url or _UPSTREAM_REPO_URL
+                upstream_revision = _ls_remote_main_sha(remote_for_ls)
+                if (
+                    upstream_revision is None
+                    and origin_url
+                    and origin_url != _UPSTREAM_REPO_URL
+                ):
+                    upstream_revision = _ls_remote_main_sha(_UPSTREAM_REPO_URL)
             if behind is None and error_code:
                 if error_code == "git-ownership":
                     message = (
@@ -610,6 +627,7 @@ def check_for_updates_details() -> Dict[str, Optional[object]]:
                     "ver": VERSION,
                     "error_code": error_code,
                     "current_revision": current_revision,
+                    "upstream_revision": upstream_revision,
                     "message": message,
                     "repo_writable": repo_writable,
                 }
@@ -623,6 +641,7 @@ def check_for_updates_details() -> Dict[str, Optional[object]]:
         "behind": behind,
         "error_code": error_code,
         "current_revision": current_revision,
+        "upstream_revision": upstream_revision,
         "message": message,
         "repo_writable": repo_writable,
     }
