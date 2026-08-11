@@ -779,6 +779,7 @@ class TestUpdateCheckEndpoint:
     def test_git_install_reports_behind_count(self, monkeypatch):
         import hermes_cli.web_server as ws
 
+        monkeypatch.setattr(ws, "_dashboard_local_update_managed_externally", lambda: False)
         monkeypatch.setattr(ws, "detect_install_method", lambda *a, **k: "git")
         # Stub the shared checker so the contract is deterministic (no network).
         import hermes_cli.banner as banner
@@ -803,12 +804,29 @@ class TestUpdateCheckEndpoint:
         # git/pip installs can apply the update in place from the dashboard.
         assert body["can_apply"] is True
 
+    def test_docker_install_is_explicitly_not_applicable(self, monkeypatch):
+        import hermes_cli.web_server as ws
 
+        # Canonical containers are externally managed, but the API must retain
+        # the more specific Docker contract and guidance.
+        monkeypatch.delenv("HERMES_RUNTIME_ROOT", raising=False)
+        monkeypatch.setattr(ws, "_dashboard_local_update_managed_externally", lambda: True)
+        monkeypatch.setattr(ws, "detect_install_method", lambda *a, **k: "docker")
+
+        body = self.client.get("/api/hermes/update/check").json()
+
+        assert body["install_method"] == "docker"
+        assert body["behind"] is None
+        assert body["update_available"] is False
+        assert body["can_apply"] is False
+        assert body["error_code"] == "update-check-not-applicable"
+        assert body["message"]
 
     def test_managed_runtime_dashboard_is_not_applyable(self, monkeypatch):
         import hermes_cli.web_server as ws
+        import hermes_cli.banner as banner
 
-        monkeypatch.setattr(ws, "_dashboard_local_update_managed_externally", lambda: True)
+        monkeypatch.setenv("HERMES_RUNTIME_ROOT", "/managed/hermes-runtime")
         monkeypatch.setattr(
             ws,
             "detect_install_method",
@@ -816,15 +834,109 @@ class TestUpdateCheckEndpoint:
                 "managed runtime update check should not probe install method"
             ),
         )
+        monkeypatch.setattr(banner, "check_for_updates", lambda: 7)
 
         body = self.client.get("/api/hermes/update/check").json()
         assert body["install_method"] == "managed-runtime"
         assert body["can_apply"] is False
-        assert body["update_available"] is False
-        assert body["behind"] is None
+        assert body["update_available"] is True
+        assert body["behind"] == 7
         assert "managed outside this dashboard" in body["message"]
 
+    def test_explicit_runtime_root_marks_dashboard_as_externally_managed(
+        self, monkeypatch
+    ):
+        import hermes_cli.web_server as ws
 
+        monkeypatch.setenv("HERMES_RUNTIME_ROOT", "/managed/hermes-runtime")
+
+        assert ws._dashboard_local_update_managed_externally() is True
+
+    def test_failed_update_check_has_stable_error_code(self, monkeypatch):
+        import hermes_cli.banner as banner
+        import hermes_cli.web_server as ws
+
+        monkeypatch.setattr(ws, "_dashboard_local_update_managed_externally", lambda: False)
+        monkeypatch.setattr(ws, "detect_install_method", lambda *a, **k: "git")
+        monkeypatch.setattr(banner, "check_for_updates", lambda: None)
+
+        body = self.client.get("/api/hermes/update/check").json()
+
+        assert body["behind"] is None
+        assert body["update_available"] is False
+        assert body["error_code"] == "update-check-failed"
+
+    def test_update_check_omits_unbound_commit_enrichment(self, monkeypatch):
+        """A truthful count must not be paired with a separately resolved range."""
+        import hermes_cli.banner as banner
+        import hermes_cli.web_server as ws
+
+        monkeypatch.setattr(ws, "_dashboard_local_update_managed_externally", lambda: False)
+        monkeypatch.setattr(ws, "detect_install_method", lambda *a, **k: "git")
+        monkeypatch.setattr(banner, "check_for_updates", lambda: 2)
+        monkeypatch.setattr(
+            ws,
+            "_recent_upstream_commits",
+            lambda *a, **k: pytest.fail("unbound changelog range must not be read"),
+        )
+
+        body = self.client.get("/api/hermes/update/check").json()
+
+        assert body["behind"] == 2
+        assert body["update_available"] is True
+        assert "commits" not in body
+
+
+
+
+    def test_post_update_refuses_current_or_failed_status(self, monkeypatch):
+        import hermes_cli.banner as banner
+        import hermes_cli.web_server as ws
+
+        monkeypatch.delenv("HERMES_RUNTIME_ROOT", raising=False)
+        monkeypatch.setattr(ws, "_dashboard_local_update_managed_externally", lambda: False)
+        monkeypatch.setattr(ws, "detect_install_method", lambda *a, **k: "git")
+        ws._ACTION_PROCS.pop("hermes-update", None)
+        monkeypatch.setattr(
+            ws,
+            "_spawn_hermes_action",
+            lambda *a, **k: pytest.fail("unavailable update must not spawn"),
+        )
+
+        for behind, error in (
+            (0, "dashboard_update_not_available"),
+            (None, "dashboard_update_check_failed"),
+        ):
+            monkeypatch.setattr(banner, "check_for_updates", lambda value=behind: value)
+            response = self.client.post("/api/hermes/update")
+            assert response.status_code == 200
+            assert response.json()["ok"] is False
+            assert response.json()["error"] == error
+
+    def test_post_update_spawns_only_when_available(self, monkeypatch):
+        import hermes_cli.banner as banner
+        import hermes_cli.web_server as ws
+
+        monkeypatch.delenv("HERMES_RUNTIME_ROOT", raising=False)
+        monkeypatch.setattr(ws, "_dashboard_local_update_managed_externally", lambda: False)
+        monkeypatch.setattr(ws, "detect_install_method", lambda *a, **k: "git")
+        monkeypatch.setattr(banner, "check_for_updates", lambda: 2)
+        ws._ACTION_PROCS.pop("hermes-update", None)
+        calls = []
+
+        class Proc:
+            pid = 4242
+
+        def spawn(args, name, **kwargs):
+            calls.append((args, name, kwargs))
+            return Proc()
+
+        monkeypatch.setattr(ws, "_spawn_hermes_action", spawn)
+        response = self.client.post("/api/hermes/update")
+
+        assert response.status_code == 200
+        assert response.json()["ok"] is True
+        assert calls and calls[0][:2] == (["update"], "hermes-update")
 
 
 class TestDebugShareEndpoint:

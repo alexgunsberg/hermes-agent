@@ -2307,6 +2307,10 @@ def _default_hermes_root_is_opt_data() -> bool:
 def _dashboard_local_update_managed_externally() -> bool:
     """Return true when the dashboard should not offer ``hermes update``.
 
+    An explicit runtime root means an external selector owns activation. The
+    dashboard may inspect that checkout for update status, but must not mutate
+    it through the built-in updater.
+
     Containerized dashboards are updated by the outer launcher/image, not by an
     in-browser local update action. Keep this dashboard capability separate
     from install-method detection: manual git/pip installs inside containers can
@@ -2319,6 +2323,8 @@ def _dashboard_local_update_managed_externally() -> bool:
     externally managed unless their apply path is proven safe inside the
     running container filesystem.
     """
+    if os.environ.get("HERMES_RUNTIME_ROOT", "").strip():
+        return True
     if _default_hermes_root_is_opt_data():
         return True
     try:
@@ -4315,9 +4321,8 @@ async def update_hermes():
     """Kick off ``hermes update`` in the background."""
     if _dashboard_local_update_managed_externally():
         message = (
-            "Hermes updates are managed outside this dashboard in "
-            "containerized environments. The built-in local updater is "
-            "disabled here."
+            "Hermes updates are managed outside this dashboard. "
+            "The built-in local updater is disabled here."
         )
         _record_completed_action("hermes-update", message, exit_code=1)
         return {
@@ -4366,6 +4371,39 @@ async def update_hermes():
         if action_id:
             response["action_id"] = action_id
         return response
+
+    try:
+        from hermes_cli.banner import check_for_updates
+
+        try:
+            (get_hermes_home() / ".update_check").unlink()
+        except OSError:
+            pass
+        behind = await asyncio.to_thread(check_for_updates)
+    except Exception:
+        _log.exception("Pre-apply update check failed")
+        behind = None
+
+    if behind is None:
+        message = "Update status could not be checked successfully; no update was started."
+        _record_completed_action("hermes-update", message, exit_code=1)
+        return {
+            "ok": False,
+            "pid": None,
+            "name": "hermes-update",
+            "error": "dashboard_update_check_failed",
+            "message": message,
+        }
+    if behind == 0:
+        message = "Hermes is already up to date; no update was started."
+        _record_completed_action("hermes-update", message, exit_code=1)
+        return {
+            "ok": False,
+            "pid": None,
+            "name": "hermes-update",
+            "error": "dashboard_update_not_available",
+            "message": message,
+        }
 
     action_id = secrets.token_hex(16)
     try:
@@ -4459,40 +4497,41 @@ async def check_hermes_update(force: bool = False):
                    user must update out-of-band
         update_command: the recommended command for this install method
         message: human-readable guidance for non-applyable methods
-        commits: for git installs that are behind, a list of the commits
-                 the local checkout is behind upstream by — each
-                 {sha, summary, author, at}. Absent/empty otherwise. The
-                 desktop's remote update overlay renders this as "what's
-                 changed". Additive: existing consumers ignore it.
+        error_code: stable machine-readable code when the check fails; absent
+                    after a successful check
     """
-    if _dashboard_local_update_managed_externally():
-        return {
-            "install_method": "managed-runtime",
-            "current_version": __version__,
-            "behind": None,
-            "update_available": False,
-            "can_apply": False,
-            "update_command": "managed outside dashboard",
-            "message": (
-                "Hermes updates are managed outside this dashboard in "
-                "containerized environments."
-            ),
-        }
-
-    install_method = detect_install_method(PROJECT_ROOT)
-    update_command = recommended_update_command_for_method(install_method)
+    explicit_runtime_root = bool(os.environ.get("HERMES_RUNTIME_ROOT", "").strip())
+    if explicit_runtime_root:
+        managed_externally = True
+        install_method = "managed-runtime"
+        update_command = "managed outside dashboard"
+    else:
+        detected_install_method = detect_install_method(PROJECT_ROOT)
+        managed_externally = _dashboard_local_update_managed_externally()
+        # Preserve Docker's more specific out-of-band update contract even
+        # though canonical containers are also externally managed.
+        if detected_install_method == "docker":
+            install_method = "docker"
+            update_command = recommended_update_command_for_method(install_method)
+        elif managed_externally:
+            install_method = "managed-runtime"
+            update_command = "managed outside dashboard"
+        else:
+            install_method = detected_install_method
+            update_command = recommended_update_command_for_method(install_method)
 
     payload: Dict[str, Any] = {
         "install_method": install_method,
         "current_version": __version__,
         "behind": None,
         "update_available": False,
-        "can_apply": install_method == "git",
+        "can_apply": not managed_externally and install_method == "git",
         "update_command": update_command,
         "message": None,
     }
 
     if install_method == "docker":
+        payload["error_code"] = "update-check-not-applicable"
         payload["message"] = format_docker_update_message()
         return payload
 
@@ -4515,16 +4554,22 @@ async def check_hermes_update(force: bool = False):
 
     payload["behind"] = behind
     if behind is None:
+        payload["error_code"] = "update-check-failed"
         payload["message"] = "Couldn't reach the update source — try again later."
+        if managed_externally:
+            payload["message"] += " Hermes updates are managed outside this dashboard."
     elif behind == 0:
         payload["message"] = "You're on the latest version."
+        if managed_externally:
+            payload["message"] += " Hermes updates are managed outside this dashboard."
     else:
         payload["update_available"] = True
-        # Enrich with the actual commits we're behind by, so the desktop's
-        # remote update overlay can show "what's changed". git only;
-        # best-effort (empty list on any failure).
-        if install_method == "git":
-            payload["commits"] = await asyncio.to_thread(_recent_upstream_commits)
+        if managed_externally:
+            payload["message"] = "Update available; Hermes updates are managed outside this dashboard."
+        # Do not reconstruct a changelog from mutable HEAD/origin/main after the
+        # count's immutable snapshot has been released. The count remains
+        # authoritative; commit enrichment is optional and therefore omitted
+        # until the checker can return its exact endpoint SHA pair.
 
     return payload
 

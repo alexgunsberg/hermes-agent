@@ -9,6 +9,7 @@ import shutil
 import subprocess
 import threading
 import time
+import uuid
 from pathlib import Path
 from urllib.parse import urlparse
 from hermes_constants import get_hermes_home
@@ -141,20 +142,42 @@ UPDATE_AVAILABLE_NO_COUNT = -1
 _UPSTREAM_REPO_URL = "https://github.com/NousResearch/hermes-agent.git"
 _OFFICIAL_REPO_CANONICAL = "github.com/nousresearch/hermes-agent"
 
+# Absolute (idempotent) depth used to recover exact recent counts in installer
+# clones. This stays bounded and preserves the shallow boundary; it never uses
+# relative ``--deepen`` or downloads the full repository history.
+_SHALLOW_HISTORY_TARGET = 200
+
 
 def _canonical_github_remote(url: str | None) -> str:
-    """Return ``host/owner/repo`` for common GitHub remote URL forms."""
+    """Return ``host/owner/repo`` only for explicit HTTPS/SSH GitHub URLs."""
     if not url:
         return ""
     value = url.strip()
-    if value.startswith("git@github.com:"):
+    lower_value = value.lower()
+    if lower_value.startswith("git@github.com:"):
         value = "github.com/" + value[len("git@github.com:"):]
-    elif value.startswith("ssh://git@github.com/"):
+    elif lower_value.startswith("ssh://git@github.com/"):
         value = "github.com/" + value[len("ssh://git@github.com/"):]
     else:
         parsed = urlparse(value)
-        if parsed.netloc and parsed.path:
-            value = f"{parsed.netloc}{parsed.path}"
+        try:
+            port = parsed.port
+        except ValueError:
+            return ""
+        if (
+            parsed.scheme.lower() != "https"
+            or parsed.netloc.lower() not in {"github.com", "github.com:443"}
+            or (parsed.hostname or "").lower() != "github.com"
+            or parsed.username
+            or parsed.password
+            or port not in (None, 443)
+            or parsed.params
+            or parsed.query
+            or parsed.fragment
+            or not parsed.path
+        ):
+            return ""
+        value = f"github.com{parsed.path}"
     value = value.strip().rstrip("/")
     if value.endswith(".git"):
         value = value[:-4]
@@ -172,6 +195,47 @@ def _is_official_ssh_remote(url: str | None) -> bool:
     return _is_ssh_remote(url) and _canonical_github_remote(url) == _OFFICIAL_REPO_CANONICAL
 
 
+def _is_official_remote(url: str | None) -> bool:
+    return _canonical_github_remote(url) == _OFFICIAL_REPO_CANONICAL
+
+
+_REPOSITORY_SELECTING_GIT_ENV = (
+    "GIT_DIR",
+    "GIT_WORK_TREE",
+    "GIT_COMMON_DIR",
+    "GIT_INDEX_FILE",
+    "GIT_OBJECT_DIRECTORY",
+    "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+    "GIT_PREFIX",
+    "GIT_CEILING_DIRECTORIES",
+    "GIT_NAMESPACE",
+    "GIT_SHALLOW_FILE",
+    "GIT_GRAFT_FILE",
+    "GIT_REPLACE_REF_BASE",
+    "GIT_NO_REPLACE_OBJECTS",
+    "GIT_QUARANTINE_PATH",
+    "GIT_IMPLICIT_WORK_TREE",
+    "GIT_DISCOVERY_ACROSS_FILESYSTEM",
+)
+
+
+def _sanitized_git_env() -> dict[str, str]:
+    """Return the process environment without ambient repository selection."""
+    env = os.environ.copy()
+    for key in _REPOSITORY_SELECTING_GIT_ENV:
+        env.pop(key, None)
+    # Process-level config can still rewrite origins through
+    # ``url.*.insteadOf``. Remove every config carrier and ignore system/global
+    # config; update checks need only local repository config and public access.
+    for key in list(env):
+        if key == "GIT_CONFIG" or key == "GIT_CONFIG_PARAMETERS" or key.startswith("GIT_CONFIG_"):
+            env.pop(key, None)
+    env["GIT_CONFIG_NOSYSTEM"] = "1"
+    env["GIT_CONFIG_SYSTEM"] = os.devnull
+    env["GIT_CONFIG_GLOBAL"] = os.devnull
+    return env
+
+
 def _git_stdout(args: list[str], *, cwd: Path, timeout: int = 5) -> Optional[str]:
     try:
         result = subprocess.run(
@@ -185,6 +249,7 @@ def _git_stdout(args: list[str], *, cwd: Path, timeout: int = 5) -> Optional[str
             errors="replace",
             timeout=timeout,
             cwd=str(cwd),
+            env=_sanitized_git_env(),
         )
     except Exception:
         return None
@@ -204,6 +269,7 @@ def _check_via_rev(local_rev: str) -> Optional[int]:
             ["git", "ls-remote", _UPSTREAM_REPO_URL, "refs/heads/main"],
             capture_output=True, text=True, encoding="utf-8", errors="replace",
             timeout=10,
+            env=_sanitized_git_env(),
         )
     except Exception:
         return None
@@ -215,73 +281,102 @@ def _check_via_rev(local_rev: str) -> Optional[int]:
     return 0 if upstream_rev == local_rev else UPDATE_AVAILABLE_NO_COUNT
 
 
+def _fetch_main_snapshot(repo_dir: Path, *, bounded: bool) -> Optional[tuple[str, str]]:
+    """Fetch origin/main into a unique ref and return its immutable commit ID."""
+    snapshot_ref = f"refs/hermes/update-check/{uuid.uuid4().hex}"
+    fetch_args = ["git", "fetch", "--quiet"]
+    if bounded:
+        fetch_args += ["--depth", str(_SHALLOW_HISTORY_TARGET)]
+    fetch_args += ["origin", f"main:{snapshot_ref}"]
+    try:
+        result = subprocess.run(
+            fetch_args,
+            capture_output=True,
+            timeout=30 if bounded else 10,
+            cwd=str(repo_dir),
+            env=_sanitized_git_env(),
+        )
+    except Exception:
+        _delete_snapshot_ref(repo_dir, snapshot_ref)
+        return None
+    if result.returncode != 0:
+        _delete_snapshot_ref(repo_dir, snapshot_ref)
+        return None
+
+    target_rev = _git_stdout(
+        ["rev-parse", "--verify", f"{snapshot_ref}^{{commit}}"],
+        cwd=repo_dir,
+    )
+    if not target_rev:
+        _delete_snapshot_ref(repo_dir, snapshot_ref)
+        return None
+    return target_rev, snapshot_ref
+
+
+def _delete_snapshot_ref(repo_dir: Path, snapshot_ref: str) -> None:
+    """Best-effort cleanup after all graph operations have consumed a snapshot."""
+    try:
+        subprocess.run(
+            ["git", "update-ref", "-d", snapshot_ref],
+            capture_output=True,
+            timeout=5,
+            cwd=str(repo_dir),
+            env=_sanitized_git_env(),
+        )
+    except Exception:
+        pass
+
+
 def _check_via_local_git(repo_dir: Path) -> Optional[int]:
-    """Count commits behind origin/main in a local checkout."""
+    """Count commits behind the fetched origin/main snapshot."""
     origin_url = _git_stdout(["remote", "get-url", "origin"], cwd=repo_dir)
     if _is_official_ssh_remote(origin_url):
         head_rev = _git_stdout(["rev-parse", "HEAD"], cwd=repo_dir)
         checked = _check_via_rev(head_rev) if head_rev else None
-        if checked == UPDATE_AVAILABLE_NO_COUNT:
-            return 1
         return checked
 
-    # Installer checkouts are shallow (`git clone --depth 1`). On a shallow
-    # clone the history stops at a single commit, so a plain `git fetch` would
-    # unshallow the repo (dragging in the whole history) and
-    # `rev-list --count HEAD..origin/main` would report a huge bogus "behind"
-    # number (e.g. "12492 commits behind"). Detect shallow up front: fetch with
-    # --depth 1 to preserve the boundary and compare tip SHAs instead of
-    # counting. Full clones (developers, Docker dev images) keep the exact
-    # count path unchanged. Mirrors the desktop fix in apps/desktop/electron/main.cjs.
+    # Installer checkouts are shallow (`git clone --depth 1`). A plain fetch can
+    # unshallow the repo and download the whole history. A failed/unsupported
+    # shallow-state probe is not evidence of a full clone, so it also takes the
+    # absolute bounded-depth path.
     shallow = _git_stdout(["rev-parse", "--is-shallow-repository"], cwd=repo_dir)
-    is_shallow = shallow == "true"
+    bounded = shallow != "false"
+    head_rev = _git_stdout(["rev-parse", "HEAD"], cwd=repo_dir)
+    if not head_rev:
+        return None
 
+    snapshot = _fetch_main_snapshot(repo_dir, bounded=bounded)
+    if snapshot is None:
+        # A bounded checkout may still compare its immutable local tip to the
+        # official remote tip without trusting a stale FETCH_HEAD. Never change
+        # identity to the hard-coded official repo for forks/missing origins.
+        # Full clones fail closed rather than counting against a stale ref.
+        return _check_via_rev(head_rev) if bounded and _is_official_remote(origin_url) else None
+
+    target_rev, snapshot_ref = snapshot
     try:
-        # Scope the fetch to the one branch the behind-count compares against.
-        # An unscoped ``git fetch origin`` transfers every remote head (~1,400
-        # on this repo — measured 3.0 s vs 0.55 s scoped) and can burn the full
-        # 10 s timeout on slow links. ``cmd_update`` already scopes its fetch
-        # for the same reason. Modern git updates the ``origin/main`` tracking
-        # ref on a scoped fetch, so the ``HEAD..origin/main`` count below is
-        # unaffected; the shallow path compares against FETCH_HEAD, which a
-        # scoped fetch also updates.
-        fetch_args = ["git", "fetch", "origin", "main"]
-        if is_shallow:
-            fetch_args += ["--depth", "1"]
-        fetch_args.append("--quiet")
-        subprocess.run(
-            fetch_args,
-            capture_output=True, timeout=10,
-            cwd=str(repo_dir),
-        )
-    except Exception:
-        pass  # Offline or timeout — use stale refs, that's fine
+        if head_rev == target_rev:
+            return 0
 
-    if is_shallow:
-        # No history to count across the shallow boundary. `origin/main` may not
-        # be a tracking ref in a `clone --depth 1`, so prefer FETCH_HEAD (just
-        # updated by the fetch above) and fall back to origin/main.
-        head_rev = _git_stdout(["rev-parse", "HEAD"], cwd=repo_dir)
-        target_rev = (
-            _git_stdout(["rev-parse", "FETCH_HEAD"], cwd=repo_dir)
-            or _git_stdout(["rev-parse", "origin/main"], cwd=repo_dir)
-        )
-        if not head_rev or not target_rev:
-            return None
-        return 0 if head_rev == target_rev else UPDATE_AVAILABLE_NO_COUNT
+        if bounded:
+            # Report the exact count when the bounded fetch includes the merge
+            # base; otherwise retain the truthful unknown-count sentinel.
+            if _git_stdout(["merge-base", head_rev, target_rev], cwd=repo_dir):
+                count = _git_stdout(
+                    ["rev-list", "--count", f"{head_rev}..{target_rev}"],
+                    cwd=repo_dir,
+                )
+                if count and count.isdigit():
+                    return int(count)
+            return UPDATE_AVAILABLE_NO_COUNT
 
-    try:
-        result = subprocess.run(
-            ["git", "rev-list", "--count", "HEAD..origin/main"],
-            capture_output=True, text=True, encoding="utf-8", errors="replace",
-            timeout=5,
-            cwd=str(repo_dir),
+        count = _git_stdout(
+            ["rev-list", "--count", f"{head_rev}..{target_rev}"],
+            cwd=repo_dir,
         )
-        if result.returncode == 0:
-            return int(result.stdout.strip())
-    except Exception:
-        pass
-    return None
+        return int(count) if count and count.isdigit() else None
+    finally:
+        _delete_snapshot_ref(repo_dir, snapshot_ref)
 
 
 def check_for_updates() -> Optional[int]:
@@ -297,18 +392,27 @@ def check_for_updates() -> Optional[int]:
     """
     hermes_home = get_hermes_home()
     cache_file = hermes_home / ".update_check"
-    embedded_rev = os.environ.get("HERMES_REVISION") or None
+    runtime_root = os.environ.get("HERMES_RUNTIME_ROOT", "").strip()
+    # An explicit managed selector is the runtime identity. It wins over a
+    # packaged HERMES_REVISION and remains fail-closed when invalid.
+    embedded_rev = None if runtime_root else (os.environ.get("HERMES_REVISION") or None)
+    repo_dir = _resolve_repo_dir() if runtime_root or not embedded_rev else None
+    repo_identity = str(repo_dir) if repo_dir is not None else None
 
-    # Docker images have no working tree to count commits against — the
-    # published image excludes `.git` (see .dockerignore) and sets no
-    # HERMES_REVISION (that's nix-only). Returning None makes both the Rich
-    # banner (build_welcome_banner) and the Ink badge (branding.tsx, guarded
-    # on `typeof === 'number' && > 0`) show nothing. The dashboard's REST
-    # `/api/hermes/update/check` endpoint short-circuits docker the same way
-    # (web_server.py); mirror that here so the banner/TUI surfaces agree.
+    # An explicit selector is authoritative. If it cannot be validated, fail
+    # before consulting caches from older releases that carried no repo key.
+    if runtime_root and repo_dir is None:
+        return None
+
+    # Docker images normally have no working tree to count commits against —
+    # the published image excludes `.git` (see .dockerignore) and sets no
+    # HERMES_REVISION (that's nix-only). A validated HERMES_RUNTIME_ROOT is an
+    # authoritative managed checkout, though, even when imports come from a
+    # package tree stamped as docker; only short-circuit when no checkout was
+    # resolved. The dashboard endpoint applies the same runtime-root policy.
     try:
         from hermes_cli.config import detect_install_method, get_project_root
-        if detect_install_method(get_project_root()) == "docker":
+        if repo_dir is None and detect_install_method(get_project_root()) == "docker":
             return None
     except Exception:
         pass
@@ -323,6 +427,7 @@ def check_for_updates() -> Optional[int]:
                 now - cached.get("ts", 0) < _UPDATE_CHECK_CACHE_SECONDS
                 and cached.get("rev") == embedded_rev
                 and cached.get("ver") == VERSION
+                and cached.get("repo") == repo_identity
             ):
                 return cached.get("behind")
     except Exception:
@@ -331,13 +436,7 @@ def check_for_updates() -> Optional[int]:
     if embedded_rev:
         behind = _check_via_rev(embedded_rev)
     else:
-        # Prefer the running code's location over the profile-scoped path.
-        # $HERMES_HOME/hermes-agent/ may be a stale copy from --clone-all;
-        # Path(__file__) always resolves to the actual installed checkout.
-        repo_dir = Path(__file__).parent.parent.resolve()
-        if not (repo_dir / ".git").exists():
-            repo_dir = hermes_home / "hermes-agent"
-        if not (repo_dir / ".git").exists():
+        if repo_dir is None:
             # No git checkout and no embedded revision — can't determine
             # update status. This is the Docker path (already short-circuited
             # above) or an unsupported install without a source tree.
@@ -347,7 +446,15 @@ def check_for_updates() -> Optional[int]:
 
     try:
         cache_file.write_text(
-            json.dumps({"ts": now, "behind": behind, "rev": embedded_rev, "ver": VERSION}),
+            json.dumps(
+                {
+                    "ts": now,
+                    "behind": behind,
+                    "rev": embedded_rev,
+                    "ver": VERSION,
+                    "repo": repo_identity,
+                }
+            ),
             encoding="utf-8",
         )
     except Exception:
@@ -356,18 +463,45 @@ def check_for_updates() -> Optional[int]:
     return behind
 
 
+def _validated_worktree_root(candidate: Path) -> Optional[Path]:
+    """Return candidate only when Git identifies that exact path as a worktree root."""
+    try:
+        resolved = candidate.resolve()
+    except (OSError, RuntimeError):
+        return None
+
+    top_level = _git_stdout(["rev-parse", "--show-toplevel"], cwd=resolved)
+    if not top_level:
+        return None
+    try:
+        return resolved if Path(top_level).resolve() == resolved else None
+    except (OSError, RuntimeError):
+        return None
+
+
 def _resolve_repo_dir() -> Optional[Path]:
     """Return the active Hermes git checkout, or None if this isn't a git install.
 
-    Prefers the running code's location over the profile-scoped path
-    because ``$HERMES_HOME/hermes-agent/`` may be a stale copy carried
-    over by ``--clone-all``.
+    Managed installs can import Hermes from a packaged ``site-packages`` tree
+    while ``HERMES_RUNTIME_ROOT`` selects the authoritative checkout. Treat
+    that explicit runtime identity as fail-closed; only when it is unset try
+    the running source location and then the profile-scoped fallback (which may
+    be stale after ``--clone-all``).
     """
-    repo_dir = Path(__file__).parent.parent.resolve()
-    if not (repo_dir / ".git").exists():
-        hermes_home = get_hermes_home()
-        repo_dir = hermes_home / "hermes-agent"
-    return repo_dir if (repo_dir / ".git").exists() else None
+    runtime_root = os.environ.get("HERMES_RUNTIME_ROOT", "").strip()
+    if runtime_root:
+        return _validated_worktree_root(Path(runtime_root).expanduser())
+
+    candidates = [
+        Path(__file__).parent.parent,
+        get_hermes_home() / "hermes-agent",
+    ]
+
+    for candidate in candidates:
+        resolved = _validated_worktree_root(candidate)
+        if resolved is not None:
+            return resolved
+    return None
 
 
 def _git_short_hash(repo_dir: Path, rev: str) -> Optional[str]:
@@ -381,6 +515,7 @@ def _git_short_hash(repo_dir: Path, rev: str) -> Optional[str]:
             errors="replace",
             timeout=5,
             cwd=str(repo_dir),
+            env=_sanitized_git_env(),
         )
     except Exception:
         return None
@@ -458,6 +593,7 @@ def _compute_git_banner_state(repo_dir: Optional[Path] = None) -> Optional[dict]
             errors="replace",
             timeout=5,
             cwd=str(repo_dir),
+            env=_sanitized_git_env(),
         )
         if result.returncode == 0:
             ahead = int((result.stdout or "0").strip() or "0")
@@ -496,6 +632,7 @@ def get_latest_release_tag(repo_dir: Optional[Path] = None) -> Optional[tuple]:
             errors="replace",
             timeout=3,
             cwd=str(repo_dir),
+            env=_sanitized_git_env(),
         )
     except Exception:
         _latest_release_cache = ()
